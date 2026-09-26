@@ -28,6 +28,9 @@ PROP_MARKET_MAP = {
     "passing_yards": "player_pass_yds",
     "rushing_yards": "player_rush_yds",
     "receiving_yards": "player_reception_yds",
+    "passing_tds": "player_pass_tds",
+    "rushing_tds": "player_rush_tds",
+    "receiving_tds": "player_reception_tds",
 }
 
 # Home city for each team's stadium, used to look up game-day weather via
