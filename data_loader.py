@@ -206,26 +206,44 @@ def load_prop_lines(api_key: str):
         except Exception:
             continue
 
-        for bookmaker in event_odds.get("bookmakers", []):
-            for market in bookmaker.get("markets", []):
-                market_key = market.get("key")
-                for outcome in market.get("outcomes", []):
-                    player_name = outcome.get("description")
-                    if player_name is None:
-                        continue
-                    if market_key == ANYTIME_TD_MARKET:
-                        price = outcome.get("price")
-                        if price is None:
+        # This parsing loop used to sit outside any try/except. It's reading
+        # the shape of a third-party API response, and one event with an
+        # unexpected/malformed payload (a market with no outcomes, a price
+        # that isn't a plain number, etc.) would raise uncaught and crash
+        # the whole page - this function runs at the top of every page
+        # load, so that took the entire app down, not just this feature.
+        # Skipping just the one bad event keeps everything else working.
+        try:
+            for bookmaker in event_odds.get("bookmakers", []):
+                for market in bookmaker.get("markets", []):
+                    market_key = market.get("key")
+                    for outcome in market.get("outcomes", []):
+                        player_name = outcome.get("description")
+                        if player_name is None:
                             continue
-                        td_rows.append({"player": player_name, "implied_prob": _implied_probability(price)})
-                    else:
-                        # Each player prop market has two outcomes (Over/Under)
-                        # per player; we only need the line itself, which is
-                        # the same for both, so keep the first one seen.
-                        point = outcome.get("point")
-                        if point is None:
-                            continue
-                        prop_rows.append({"player": player_name, "market": market_key, "point": point})
+                        if market_key == ANYTIME_TD_MARKET:
+                            price = outcome.get("price")
+                            if price is None:
+                                continue
+                            try:
+                                implied = _implied_probability(float(price))
+                            except (TypeError, ValueError):
+                                continue
+                            td_rows.append({"player": player_name, "implied_prob": implied})
+                        else:
+                            # Each player prop market has two outcomes (Over/Under)
+                            # per player; we only need the line itself, which is
+                            # the same for both, so keep the first one seen.
+                            point = outcome.get("point")
+                            if point is None:
+                                continue
+                            try:
+                                point = float(point)
+                            except (TypeError, ValueError):
+                                continue
+                            prop_rows.append({"player": player_name, "market": market_key, "point": point})
+        except Exception:
+            continue
         # Stop once we've pulled odds for every scheduled event this call found
 
     if prop_rows:

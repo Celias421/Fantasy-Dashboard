@@ -105,7 +105,15 @@ def _get_prop_lines_with_timestamp():
     dev/testing) it would otherwise be wiped and force an immediate
     re-pull no matter what the ttl says. Persisting to disk means the
     24-hour window survives restarts, not just page reloads."""
-    props_df, td_df = load_prop_lines(ODDS_API_KEY)
+    try:
+        props_df, td_df = load_prop_lines(ODDS_API_KEY)
+    except Exception:
+        # Belt-and-suspenders: load_prop_lines is written to never raise,
+        # but this function runs at the top of every single page load, so
+        # if some future edge case slips through anyway, showing "no prop
+        # lines today" beats crashing the whole app for everyone.
+        props_df = pd.DataFrame(columns=["player", "market", "point"])
+        td_df = pd.DataFrame(columns=["player", "implied_prob"])
     return props_df, td_df, datetime.datetime.now()
 
 
