@@ -10,7 +10,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from config import CURRENT_SEASON, PROP_MARKET_MAP, TEAM_CITY, INDOOR_ROOF_STATES
+from config import CURRENT_SEASON, PROP_MARKET_MAP, TEAM_CITY, INDOOR_ROOF_STATES, ODDS_API_SAFETY_BUFFER
 from data_loader import (
     load_starter_stats, load_player_meta, load_team_meta, load_defense_ranks, load_schedule,
     load_current_injuries, load_prop_lines, geocode_city, load_game_weather,
@@ -105,8 +105,9 @@ def _get_prop_lines_with_timestamp():
     dev/testing) it would otherwise be wiped and force an immediate
     re-pull no matter what the ttl says. Persisting to disk means the
     24-hour window survives restarts, not just page reloads."""
+    empty_quota = {"remaining": None, "used": None, "skipped": False}
     try:
-        props_df, td_df = load_prop_lines(ODDS_API_KEY)
+        props_df, td_df, quota = load_prop_lines(ODDS_API_KEY)
     except Exception:
         # Belt-and-suspenders: load_prop_lines is written to never raise,
         # but this function runs at the top of every single page load, so
@@ -114,11 +115,12 @@ def _get_prop_lines_with_timestamp():
         # lines today" beats crashing the whole app for everyone.
         props_df = pd.DataFrame(columns=["player", "market", "point"])
         td_df = pd.DataFrame(columns=["player", "implied_prob"])
-    return props_df, td_df, datetime.datetime.now()
+        quota = empty_quota
+    return props_df, td_df, quota, datetime.datetime.now()
 
 
 def get_prop_lines() -> pd.DataFrame:
-    df, _, _ = _get_prop_lines_with_timestamp()
+    df, _, _, _ = _get_prop_lines_with_timestamp()
     return df
 
 
@@ -126,13 +128,22 @@ def get_anytime_td_odds() -> pd.DataFrame:
     """player -> implied_prob (0-100): the market's implied chance a
     player scores any touchdown this week. See load_prop_lines for why
     this is kept separate from get_prop_lines()."""
-    _, td_df, _ = _get_prop_lines_with_timestamp()
+    _, td_df, _, _ = _get_prop_lines_with_timestamp()
     return td_df
 
 
 def get_prop_lines_updated_at() -> datetime.datetime:
-    _, _, updated_at = _get_prop_lines_with_timestamp()
+    _, _, _, updated_at = _get_prop_lines_with_timestamp()
     return updated_at
+
+
+def get_odds_api_quota() -> dict:
+    """{"remaining": int|None, "used": int|None, "skipped": bool} - the
+    Odds API's own usage-credit counters as of the last refresh, plus
+    whether that refresh skipped pulling odds to protect the safety
+    buffer (see ODDS_API_SAFETY_BUFFER in config.py)."""
+    _, _, quota, _ = _get_prop_lines_with_timestamp()
+    return quota
 
 
 @st.cache_data(ttl=3600 * 24 * 30)  # a city's coordinates never change
@@ -569,9 +580,18 @@ if not ODDS_API_KEY:
     st.info("No prop odds API key configured yet - card deltas will show \"No prop line\" until one is added. See README for setup.", icon="ℹ️")
 else:
     prop_updated_at = get_prop_lines_updated_at()
+    quota = get_odds_api_quota()
     refresh_col1, refresh_col2 = st.columns([3, 1])
     with refresh_col1:
         st.caption(f"Prop lines last pulled: {prop_updated_at.strftime('%a %-I:%M %p')} (auto-refreshes once a day to conserve API quota)")
+        if quota["remaining"] is not None:
+            st.caption(f"🔑 Odds API quota: {quota['remaining']:,} credits remaining ({quota['used']:,} used this billing period)")
+        if quota["skipped"]:
+            st.warning(
+                f"Skipped pulling prop odds this refresh to protect the {ODDS_API_SAFETY_BUFFER:,}-credit safety buffer "
+                "- quota was running too low. Prop lines will show as unavailable until the next refresh has enough headroom.",
+                icon="⚠️",
+            )
     with refresh_col2:
         if st.button("🔄 Refresh prop lines now", use_container_width=True):
             _get_prop_lines_with_timestamp.clear()

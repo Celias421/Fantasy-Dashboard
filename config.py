@@ -36,6 +36,14 @@ DB_PATH = "data/fantasy.db"
 # season average the same way.
 ANYTIME_TD_MARKET = "player_anytime_td"
 
+# Safety margin, in Odds API usage credits, to always keep in reserve.
+# Before spending anything on player-prop odds, the app checks the
+# quota-remaining count the API reports and skips pulling odds entirely
+# if doing so would eat into this buffer - protects against ever running
+# the account down to zero, at the cost of that day's refresh being empty
+# instead (it'll try again on the next cached refresh, up to 24h later).
+ODDS_API_SAFETY_BUFFER = 500
+
 PROP_MARKET_MAP = {
     "passing_yards": "player_pass_yds",
     "rushing_yards": "player_rush_yds",

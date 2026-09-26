@@ -13,7 +13,10 @@ import requests
 import nflreadpy as nfl
 import pandas as pd
 
-from config import SEASONS, CURRENT_SEASON, STARTERS_PER_POSITION, PROP_MARKET_MAP, ANYTIME_TD_MARKET
+from config import (
+    SEASONS, CURRENT_SEASON, STARTERS_PER_POSITION, PROP_MARKET_MAP,
+    ANYTIME_TD_MARKET, ODDS_API_SAFETY_BUFFER,
+)
 
 KEEP_COLUMNS = [
     "player_display_name", "position", "team", "opponent_team",
@@ -152,8 +155,27 @@ def _implied_probability(american_odds: float) -> float:
     return (-american_odds) / (-american_odds + 100.0)
 
 
+def _quota_from_headers(resp) -> dict:
+    """Pull the Odds API's own quota-tracking headers off a response.
+    These are the source of truth for usage - the API tells us directly
+    how many credits are left and how many we've used since the last
+    monthly reset, so there's no need to keep our own running estimate
+    (which could drift out of sync with reality)."""
+    remaining = resp.headers.get("x-requests-remaining")
+    used = resp.headers.get("x-requests-used")
+    try:
+        remaining = int(remaining) if remaining is not None else None
+    except ValueError:
+        remaining = None
+    try:
+        used = int(used) if used is not None else None
+    except ValueError:
+        used = None
+    return {"remaining": remaining, "used": used}
+
+
 def load_prop_lines(api_key: str):
-    """Current player prop lines from The Odds API: (props_df, td_df).
+    """Current player prop lines from The Odds API: (props_df, td_df, quota).
 
     props_df covers the point-value markets in PROP_MARKET_MAP (yards,
     passing TDs) with columns [player, market, point] - the season
@@ -165,17 +187,33 @@ def load_prop_lines(api_key: str):
     so it can't be compared to a season average the same way and is kept
     apart from props_df on purpose.
 
-    Both come from the same API calls (one per event), so pulling this
-    extra market doesn't cost any additional requests - just a few more
-    credits per event since the markets list is longer.
+    quota is {"remaining": int|None, "used": int|None, "skipped": bool} -
+    "remaining"/"used" come straight from the API's own response headers
+    (the authoritative source), and "skipped" is True if we deliberately
+    didn't pull odds this cycle because there wasn't enough quota headroom.
+
+    Both prop markets and the TD market come from the same API calls (one
+    per event), so pulling the extra market doesn't cost any additional
+    requests - just a few more credits per event since the markets list
+    is longer. Each event's odds call costs (markets requested) x (regions
+    requested) credits, per The Odds API's own pricing - with 5 markets
+    and 1 region that's 5 credits per game.
+
+    Before spending anything on odds, this checks the quota remaining
+    after the (cheap/free) events listing call. If pulling odds for every
+    event found would use up more than ODDS_API_SAFETY_BUFFER credits of
+    headroom, it skips the odds pulls entirely for this cycle rather than
+    risk running the account down to zero - the next cached refresh (up
+    to 24h later) will try again.
 
     Returns two empty DataFrames (never raises) if the key is missing,
     invalid, or the API is unreachable - callers should treat missing
     prop data as normal, not a crash."""
     prop_columns = ["player", "market", "point"]
     td_columns = ["player", "implied_prob"]
+    empty_quota = {"remaining": None, "used": None, "skipped": False}
     if not api_key:
-        return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns)
+        return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns), empty_quota
 
     try:
         events_resp = requests.get(
@@ -185,10 +223,21 @@ def load_prop_lines(api_key: str):
         )
         events_resp.raise_for_status()
         events = events_resp.json()
+        quota = _quota_from_headers(events_resp)
     except Exception:
-        return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns)
+        return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns), empty_quota
 
-    markets = ",".join(list(PROP_MARKET_MAP.values()) + [ANYTIME_TD_MARKET])
+    markets_list = list(PROP_MARKET_MAP.values()) + [ANYTIME_TD_MARKET]
+    markets = ",".join(markets_list)
+
+    # Pre-flight safety check: estimate the worst-case cost of pulling odds
+    # for every event we found, and skip entirely if that would eat into
+    # the safety buffer. Worst case = every market present for every event.
+    estimated_cost = len(events) * len(markets_list)
+    if quota["remaining"] is not None and quota["remaining"] - estimated_cost < ODDS_API_SAFETY_BUFFER:
+        quota["skipped"] = True
+        return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns), quota
+
     prop_rows = []
     td_rows = []
     for event in events:
@@ -203,8 +252,16 @@ def load_prop_lines(api_key: str):
             )
             odds_resp.raise_for_status()
             event_odds = odds_resp.json()
+            quota = _quota_from_headers(odds_resp)
         except Exception:
             continue
+
+        # Mid-loop safety check too, in case the pre-flight estimate was
+        # off (e.g. more markets came back per event than expected) - stop
+        # pulling further events rather than let the buffer get eaten into.
+        if quota["remaining"] is not None and quota["remaining"] < ODDS_API_SAFETY_BUFFER:
+            quota["skipped"] = True
+            break
 
         # This parsing loop used to sit outside any try/except. It's reading
         # the shape of a third-party API response, and one event with an
@@ -262,7 +319,7 @@ def load_prop_lines(api_key: str):
     else:
         td = pd.DataFrame(columns=td_columns)
 
-    return props, td
+    return props, td, quota
 
 
 def geocode_city(city: str):
