@@ -24,13 +24,23 @@ DB_PATH = "data/fantasy.db"
 # Maps our internal stat column names to The Odds API's player-prop
 # market keys, for the positions where that stat is the primary one.
 # Only stats with a mapping here get a prop-line comparison on cards.
+# NOTE: rushing_tds/receiving_tds are deliberately NOT mapped - The Odds
+# API doesn't offer them as separate Over/Under lines. Rushing and
+# receiving touchdowns only show up bundled into "anytime touchdown
+# scorer" (a yes/no market, not a point value), which doesn't fit this
+# app's point-vs-average comparison. player_pass_tds is real and works.
+# The one real market that DOES cover rushing/receiving touchdowns: a
+# yes/no "does this player score at all" market with betting odds, not a
+# point value - handled separately from PROP_MARKET_MAP (see
+# load_prop_lines / get_anytime_td_odds) since it can't be compared to a
+# season average the same way.
+ANYTIME_TD_MARKET = "player_anytime_td"
+
 PROP_MARKET_MAP = {
     "passing_yards": "player_pass_yds",
     "rushing_yards": "player_rush_yds",
     "receiving_yards": "player_reception_yds",
     "passing_tds": "player_pass_tds",
-    "rushing_tds": "player_rush_tds",
-    "receiving_tds": "player_reception_tds",
 }
 
 # Home city for each team's stadium, used to look up game-day weather via

@@ -13,7 +13,7 @@ import requests
 import nflreadpy as nfl
 import pandas as pd
 
-from config import SEASONS, CURRENT_SEASON, STARTERS_PER_POSITION, PROP_MARKET_MAP
+from config import SEASONS, CURRENT_SEASON, STARTERS_PER_POSITION, PROP_MARKET_MAP, ANYTIME_TD_MARKET
 
 KEEP_COLUMNS = [
     "player_display_name", "position", "team", "opponent_team",
@@ -129,24 +129,53 @@ def load_current_injuries() -> pd.DataFrame:
     """The most recent week's official NFL injury report: status
     (Out / Doubtful / Questionable), primary injury, and practice
     participation. Sourced from nflverse's copy of the official reports
-    teams submit - not scraped, not social media."""
+    teams submit - not scraped, not social media. Covers every player on
+    a report, not just tracked starters - the Injuries page uses that
+    fuller view."""
     inj = nfl.load_injuries([CURRENT_SEASON]).to_pandas()
     if inj.empty:
         return inj
     latest_week = inj["week"].max()
     latest = inj[inj["week"] == latest_week].copy()
     latest = latest.rename(columns={"full_name": "player"})
-    return latest[["player", "team", "week", "report_status", "report_primary_injury", "practice_status"]]
+    cols = ["player", "team", "position", "week", "report_status", "report_primary_injury", "practice_status"]
+    return latest[[c for c in cols if c in latest.columns]]
 
 
-def load_prop_lines(api_key: str) -> pd.DataFrame:
-    """Current player prop lines from The Odds API, for the markets in
-    PROP_MARKET_MAP. Returns an empty DataFrame (never raises) if the key
-    is missing, invalid, or the API is unreachable - callers should treat
-    missing prop data as normal, not a crash."""
-    columns = ["player", "market", "point"]
+def _implied_probability(american_odds: float) -> float:
+    """Convert American odds (e.g. -140, +150) to an implied probability
+    (0-1). This is the sportsbook's priced-in probability INCLUDING their
+    margin/vig - it will always run a bit higher than the "true" chance,
+    but it's the standard, honest way to turn odds into a percentage."""
+    if american_odds >= 0:
+        return 100.0 / (american_odds + 100.0)
+    return (-american_odds) / (-american_odds + 100.0)
+
+
+def load_prop_lines(api_key: str):
+    """Current player prop lines from The Odds API: (props_df, td_df).
+
+    props_df covers the point-value markets in PROP_MARKET_MAP (yards,
+    passing TDs) with columns [player, market, point] - the season
+    average gets compared directly against these.
+
+    td_df covers ANYTIME_TD_MARKET separately, with columns
+    [player, implied_prob] (0-100, averaged across bookmakers) - this is
+    a yes/no "does this player score" market priced as odds, not a line,
+    so it can't be compared to a season average the same way and is kept
+    apart from props_df on purpose.
+
+    Both come from the same API calls (one per event), so pulling this
+    extra market doesn't cost any additional requests - just a few more
+    credits per event since the markets list is longer.
+
+    Returns two empty DataFrames (never raises) if the key is missing,
+    invalid, or the API is unreachable - callers should treat missing
+    prop data as normal, not a crash."""
+    prop_columns = ["player", "market", "point"]
+    td_columns = ["player", "implied_prob"]
     if not api_key:
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns)
 
     try:
         events_resp = requests.get(
@@ -157,10 +186,11 @@ def load_prop_lines(api_key: str) -> pd.DataFrame:
         events_resp.raise_for_status()
         events = events_resp.json()
     except Exception:
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns)
 
-    markets = ",".join(PROP_MARKET_MAP.values())
-    rows = []
+    markets = ",".join(list(PROP_MARKET_MAP.values()) + [ANYTIME_TD_MARKET])
+    prop_rows = []
+    td_rows = []
     for event in events:
         event_id = event.get("id")
         if not event_id:
@@ -180,22 +210,41 @@ def load_prop_lines(api_key: str) -> pd.DataFrame:
             for market in bookmaker.get("markets", []):
                 market_key = market.get("key")
                 for outcome in market.get("outcomes", []):
-                    # Each player prop market has two outcomes (Over/Under)
-                    # per player; we only need the line itself, which is
-                    # the same for both, so keep the first one seen.
                     player_name = outcome.get("description")
-                    point = outcome.get("point")
-                    if player_name is None or point is None:
+                    if player_name is None:
                         continue
-                    rows.append({"player": player_name, "market": market_key, "point": point})
+                    if market_key == ANYTIME_TD_MARKET:
+                        price = outcome.get("price")
+                        if price is None:
+                            continue
+                        td_rows.append({"player": player_name, "implied_prob": _implied_probability(price)})
+                    else:
+                        # Each player prop market has two outcomes (Over/Under)
+                        # per player; we only need the line itself, which is
+                        # the same for both, so keep the first one seen.
+                        point = outcome.get("point")
+                        if point is None:
+                            continue
+                        prop_rows.append({"player": player_name, "market": market_key, "point": point})
         # Stop once we've pulled odds for every scheduled event this call found
-    if not rows:
-        return pd.DataFrame(columns=columns)
 
-    props = pd.DataFrame(rows)
-    # Multiple bookmakers may list the same player/market - average their lines
-    props = props.groupby(["player", "market"], as_index=False)["point"].mean()
-    return props
+    if prop_rows:
+        props = pd.DataFrame(prop_rows)
+        # Multiple bookmakers may list the same player/market - average their lines
+        props = props.groupby(["player", "market"], as_index=False)["point"].mean()
+    else:
+        props = pd.DataFrame(columns=prop_columns)
+
+    if td_rows:
+        td = pd.DataFrame(td_rows)
+        # Multiple bookmakers may list the same player - average their
+        # implied probabilities (not the raw odds, which don't average sensibly)
+        td = td.groupby("player", as_index=False)["implied_prob"].mean()
+        td["implied_prob"] = (td["implied_prob"] * 100).round(1)
+    else:
+        td = pd.DataFrame(columns=td_columns)
+
+    return props, td
 
 
 def geocode_city(city: str):

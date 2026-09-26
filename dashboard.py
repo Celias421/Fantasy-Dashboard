@@ -105,16 +105,25 @@ def _get_prop_lines_with_timestamp():
     dev/testing) it would otherwise be wiped and force an immediate
     re-pull no matter what the ttl says. Persisting to disk means the
     24-hour window survives restarts, not just page reloads."""
-    return load_prop_lines(ODDS_API_KEY), datetime.datetime.now()
+    props_df, td_df = load_prop_lines(ODDS_API_KEY)
+    return props_df, td_df, datetime.datetime.now()
 
 
 def get_prop_lines() -> pd.DataFrame:
-    df, _ = _get_prop_lines_with_timestamp()
+    df, _, _ = _get_prop_lines_with_timestamp()
     return df
 
 
+def get_anytime_td_odds() -> pd.DataFrame:
+    """player -> implied_prob (0-100): the market's implied chance a
+    player scores any touchdown this week. See load_prop_lines for why
+    this is kept separate from get_prop_lines()."""
+    _, td_df, _ = _get_prop_lines_with_timestamp()
+    return td_df
+
+
 def get_prop_lines_updated_at() -> datetime.datetime:
-    _, updated_at = _get_prop_lines_with_timestamp()
+    _, _, updated_at = _get_prop_lines_with_timestamp()
     return updated_at
 
 
@@ -340,25 +349,66 @@ def matchup_rank_color(rank: int, max_rank: int = 32) -> str:
     return "rgb(143,214,168)"
 
 
-def pill_badge_html(label: str, color: str, tag: str = "div") -> str:
+def pill_badge_html(label: str, color: str, tag: str = "div", title: str | None = None) -> str:
     """Shared dark-pill styling (.matchup-badge CSS) for any small colored
-    label - matchup difficulty, weather risk, etc. - so every gradient
-    badge in the app looks like the same design language instead of each
-    feature inventing its own."""
-    return f'<{tag} class="matchup-badge" style="color:{color};">{label}</{tag}>'
+    label - matchup difficulty, weather risk, anytime-TD odds, etc. - so
+    every gradient badge in the app looks like the same design language
+    instead of each feature inventing its own. `title` becomes a native
+    hover tooltip explaining what the number means - hovering on desktop
+    shows it; on mobile (no hover) the badge's own label text still has
+    to carry the meaning on its own, which is why every badge spells out
+    a word, not just a bare number."""
+    title_attr = f' title="{title}"' if title else ""
+    return f'<{tag} class="matchup-badge" style="color:{color};"{title_attr}>{label}</{tag}>'
 
 
 def matchup_badge_html(label: str, rank: int, tag: str = "div") -> str:
     """The full matchup-badge markup, colored by how tough the matchup
     is (matchup_rank_color). One place so cards, Deep Dive, and Prop
     Comparator all render the badge identically."""
-    return pill_badge_html(label, matchup_rank_color(rank), tag)
+    title = "Opponent's defensive rank this season against this stat/position: #1 = toughest, #32 = easiest."
+    return pill_badge_html(label, matchup_rank_color(rank), tag, title=title)
 
 
 def weather_risk_badge_html(label: str, risk_pct: float, tag: str = "div") -> str:
     """Same pill styling as matchup_badge_html, colored green (calm) to
     red (high wind/rain risk) instead of by defensive rank."""
-    return pill_badge_html(label, severity_color(risk_pct), tag)
+    title = "Rough 0-100 severity score from forecasted wind speed and rain chance - higher means more likely to affect passing/kicking."
+    return pill_badge_html(label, severity_color(risk_pct), tag, title=title)
+
+
+def probability_color(pct: float) -> str:
+    """Soft red (0%, unlikely) -> yellow -> soft green (100%, likely).
+    Same pastel style and stops as matchup_rank_color, oriented so a
+    HIGH number reads as green - matching how people expect a
+    probability to read (unlike severity_color, where high is bad)."""
+    t = min(max(pct, 0.0), 100.0) / 100.0
+    stops = [(0.0, (255, 107, 107)), (0.5, (255, 209, 102)), (1.0, (143, 214, 168))]
+    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+        if t0 <= t <= t1:
+            local_t = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+            r = round(c0[0] + (c1[0] - c0[0]) * local_t)
+            g = round(c0[1] + (c1[1] - c0[1]) * local_t)
+            b = round(c0[2] + (c1[2] - c0[2]) * local_t)
+            return f"rgb({r},{g},{b})"
+    return "rgb(143,214,168)"
+
+
+def anytime_td_badge_html(pct: float, tag: str = "div") -> str:
+    """'Anytime TD: NN%' badge, colored by how likely (red=unlikely,
+    green=likely). The percentage is the betting market's IMPLIED
+    probability - averaged across bookmakers, and it INCLUDES the book's
+    built-in margin (vig), so it will always read a little higher than
+    the "true" chance. It's the market's number, not a Prop Shop
+    projection - spelled out here and in the on-page caption so it's
+    never confused with the avg-vs-line deltas on yardage props."""
+    title = (
+        "Betting market's implied probability (averaged across bookmakers) that this player scores "
+        "any touchdown this week. Includes the sportsbook's margin, so it runs a bit high vs. true odds. "
+        "Not a Prop Shop projection."
+    )
+    label = f"🎯 Anytime TD: {pct:.0f}%"
+    return pill_badge_html(label, probability_color(pct), tag, title=title)
 
 
 def _matchup_label(team: str, position: str, stat: str, next_opp_map: pd.DataFrame, defense_ranks: pd.DataFrame):
@@ -401,6 +451,7 @@ def build_player_summary(view: pd.DataFrame, sort_stat: str) -> pd.DataFrame:
     Center tabs so both always render players the same way."""
     injuries = get_injuries()
     prop_lines = get_prop_lines()
+    anytime_td = get_anytime_td_odds()
     defense_ranks = get_defense_ranks()
     next_opp_map = build_next_opponent_map(get_schedule())
     prop_market = PROP_MARKET_MAP.get(sort_stat)
@@ -420,6 +471,14 @@ def build_player_summary(view: pd.DataFrame, sort_stat: str) -> pd.DataFrame:
                 prop_line = float(match["point"].iloc[0])
         has_prop = prop_line is not None
         delta = (avg - prop_line) if has_prop else 0.0
+
+        # Anytime-TD odds: separate from the point-value props above -
+        # a market-implied percentage, not a line to compare to an average.
+        td_odds_pct = None
+        if not anytime_td.empty:
+            td_match = anytime_td[anytime_td["player"] == player]
+            if not td_match.empty:
+                td_odds_pct = float(td_match["implied_prob"].iloc[0])
 
         # Matchup rank: how tough is the upcoming opponent against this position/stat?
         matchup_result = _matchup_label(team, position, sort_stat, next_opp_map, defense_ranks)
@@ -447,6 +506,7 @@ def build_player_summary(view: pd.DataFrame, sort_stat: str) -> pd.DataFrame:
             "prop_line": prop_line,
             "has_prop": has_prop,
             "delta": delta,
+            "td_odds_pct": td_odds_pct,
             "matchup_label": matchup_label,
             "matchup_rank": matchup_rank,
             "injury_label": injury_label,
@@ -470,6 +530,8 @@ def render_player_cards(summary_df: pd.DataFrame, sort_stat: str, cols_per_row: 
                 badges = f'<div class="consistency-badge">Consistency: {p["consistency"]}</div>'
                 if pd.notna(p.get("matchup_label")):
                     badges += matchup_badge_html(p["matchup_label"], int(p["matchup_rank"]))
+                if pd.notna(p.get("td_odds_pct")):
+                    badges += anytime_td_badge_html(p["td_odds_pct"])
                 if pd.notna(p.get("injury_label")):
                     badges += f'<div class="injury-badge">{p["injury_label"]}</div>'
 
@@ -538,8 +600,8 @@ def team_logo_html(team, px: int = 20) -> str:
         f'onerror="this.style.display=\'none\'"/>'
     )
 
-tab_overview, tab_deep_dive, tab_props, tab_game, tab_matchups = st.tabs(
-    ["📋 Overview", "🔍 Player Deep Dive", "🎯 Prop Comparator", "🏟️ Game Center", "🗓️ Matchups"]
+tab_overview, tab_deep_dive, tab_props, tab_game, tab_injuries, tab_matchups = st.tabs(
+    ["📋 Overview", "🔍 Player Deep Dive", "🎯 Prop Comparator", "🏟️ Game Center", "🩹 Injuries", "🗓️ Matchups"]
 )
 
 if st.session_state.pop("show_jump_toast", False):
@@ -592,6 +654,11 @@ with tab_overview:
         st.info("No players match the current filters, or the season hasn't started yet.")
     else:
         st.caption(f"{len(summary_df)} players — {CURRENT_SEASON} season, ranked by {sort_stat.replace('_', ' ')}")
+        st.caption(
+            "Badge key: matchup badges show the upcoming opponent's defensive rank (color: red = toughest, "
+            "green = easiest). 🎯 Anytime TD is the betting market's implied chance this player scores any "
+            "touchdown this week — a market probability, not a Prop Shop projection. Hover a badge for details."
+        )
         render_player_cards(summary_df, sort_stat, cols_per_row=4)
 
 # ---------------- Player Deep Dive (full history) ----------------
@@ -613,6 +680,10 @@ with tab_deep_dive:
             if matchup_result:
                 matchup_text, matchup_rank = matchup_result
                 st.markdown(matchup_badge_html(matchup_text, matchup_rank, tag="span"), unsafe_allow_html=True)
+            td_odds = get_anytime_td_odds()
+            td_match = td_odds[td_odds["player"] == info["player"]] if not td_odds.empty else td_odds
+            if not td_match.empty:
+                st.markdown(anytime_td_badge_html(float(td_match["implied_prob"].iloc[0]), tag="span"), unsafe_allow_html=True)
 
         metrics_source = pdf_current if not pdf_current.empty else pdf_full
         avg, last, trend, consistency = compute_summary(metrics_source, "fantasy_points_ppr")
@@ -816,6 +887,10 @@ with tab_props:
     if not prop_pdf.empty:
         prop_team = prop_pdf["team"].iloc[0]
         st.markdown(f"{team_logo_html(prop_team, px=22)}**{position} · {prop_team}**", unsafe_allow_html=True)
+        prop_td_odds = get_anytime_td_odds()
+        prop_td_match = prop_td_odds[prop_td_odds["player"] == prop_player] if not prop_td_odds.empty else prop_td_odds
+        if not prop_td_match.empty:
+            st.markdown(anytime_td_badge_html(float(prop_td_match["implied_prob"].iloc[0]), tag="span"), unsafe_allow_html=True)
 
     with c2:
         prop_stat = st.selectbox("Stat", available_stats, key="prop_stat") if available_stats else None
@@ -987,6 +1062,75 @@ with tab_game:
                     st.info("No tracked starters with data for this team yet.")
                 else:
                     render_player_cards(team_summary, sort_stat, cols_per_row=2)
+
+# ---------------- Injuries (full league injury report) ----------------
+with tab_injuries:
+    st.subheader("Injury Report")
+
+    all_injuries = get_injuries()
+    if all_injuries.empty:
+        st.info("No injury report available yet this week.")
+    else:
+        st.caption(
+            f"Every player on the official NFL injury report for week {int(all_injuries['week'].iloc[0])} "
+            f"({CURRENT_SEASON} season) - not just tracked starters, so you can catch handcuffs and "
+            "breakout candidates too. Sourced from nflverse's copy of the official team-submitted reports."
+        )
+
+        STATUS_EMOJI = {"Out": "🔴", "Doubtful": "🟠", "Questionable": "🟡", "Injured Reserve": "🔴", "IR": "🔴"}
+        STATUS_ORDER = {"Out": 0, "Doubtful": 1, "Questionable": 2}
+
+        inj_df = all_injuries.copy()
+        inj_df["status_rank"] = inj_df["report_status"].map(STATUS_ORDER).fillna(3)
+        tracked_players = set(current_season_df["player"].unique())
+        inj_df["Tracked"] = inj_df["player"].isin(tracked_players).map({True: "✅", False: ""})
+        inj_df["Team Logo"] = inj_df["team"].map(team_logos)
+        inj_df["Status"] = inj_df["report_status"].apply(
+            lambda s: f"{STATUS_EMOJI.get(s, '⚪')} {s}" if pd.notna(s) else "—"
+        )
+
+        ic1, ic2, ic3 = st.columns(3)
+        with ic1:
+            team_opts = sorted(inj_df["team"].dropna().unique())
+            team_pick = st.multiselect("Team", team_opts, key="injury_team_filter")
+        with ic2:
+            status_opts = sorted(inj_df["report_status"].dropna().unique())
+            status_pick = st.multiselect("Status", status_opts, default=status_opts, key="injury_status_filter")
+        with ic3:
+            if "position" in inj_df.columns:
+                pos_opts = sorted(inj_df["position"].dropna().unique())
+                pos_pick = st.multiselect("Position", pos_opts, key="injury_position_filter")
+            else:
+                pos_pick = []
+
+        filtered_inj = inj_df[inj_df["report_status"].isin(status_pick)] if status_pick else inj_df
+        if team_pick:
+            filtered_inj = filtered_inj[filtered_inj["team"].isin(team_pick)]
+        if pos_pick:
+            filtered_inj = filtered_inj[filtered_inj["position"].isin(pos_pick)]
+        filtered_inj = filtered_inj.sort_values(["status_rank", "team", "player"])
+
+        if filtered_inj.empty:
+            st.info("No players match the current filters.")
+        else:
+            st.caption(f"{len(filtered_inj)} players")
+            display_cols = ["Tracked", "player", "Team Logo", "team"]
+            if "position" in filtered_inj.columns:
+                display_cols.append("position")
+            display_cols += ["Status", "report_primary_injury", "practice_status"]
+            rename_map = {
+                "player": "Player", "team": "Team", "position": "Pos",
+                "report_primary_injury": "Injury", "practice_status": "Practice",
+            }
+            shown = filtered_inj[display_cols].rename(columns=rename_map)
+            st.dataframe(
+                shown, use_container_width=True, hide_index=True,
+                column_config={"Team Logo": st.column_config.ImageColumn(" ", width="small")},
+            )
+            st.caption(
+                "🔴 Out  🟠 Doubtful  🟡 Questionable  ⚪ other designation (e.g. Probable). "
+                "✅ Tracked = one of this app's auto-tracked starters."
+            )
 
 # ---------------- Matchups (game lines, spreads, totals, weather) ----------------
 with tab_matchups:
