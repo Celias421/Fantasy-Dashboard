@@ -13,7 +13,7 @@ import streamlit as st
 from config import CURRENT_SEASON, PROP_MARKET_MAP, TEAM_CITY, INDOOR_ROOF_STATES, ODDS_API_SAFETY_BUFFER
 from data_loader import (
     load_starter_stats, load_player_meta, load_team_meta, load_defense_ranks, load_schedule,
-    load_current_injuries, load_prop_lines, geocode_city, load_game_weather,
+    load_current_injuries, load_prop_lines_with_cache, geocode_city, load_game_weather,
     load_all_seasons_schedule,
 )
 
@@ -104,23 +104,32 @@ def _get_prop_lines_with_timestamp():
     so every time the app is stopped and restarted (common during local
     dev/testing) it would otherwise be wiped and force an immediate
     re-pull no matter what the ttl says. Persisting to disk means the
-    24-hour window survives restarts, not just page reloads."""
+    24-hour window survives restarts, not just page reloads.
+
+    The actual "don't call the API more than once a day" guarantee now
+    lives one layer deeper, in load_prop_lines_with_cache's own on-disk
+    timestamp file - that one survives even Streamlit resetting THIS
+    cache due to a code change, which is exactly what kept happening
+    while this feature was being built. This decorator is just a fast
+    path so a normal page rerun doesn't even need to re-read that file."""
     empty_quota = {"remaining": None, "used": None, "skipped": False}
     try:
-        props_df, td_df, quota = load_prop_lines(ODDS_API_KEY)
+        props_df, td_df, quota, pulled_at, stale = load_prop_lines_with_cache(ODDS_API_KEY)
     except Exception:
-        # Belt-and-suspenders: load_prop_lines is written to never raise,
-        # but this function runs at the top of every single page load, so
-        # if some future edge case slips through anyway, showing "no prop
-        # lines today" beats crashing the whole app for everyone.
+        # Belt-and-suspenders: load_prop_lines_with_cache is written to
+        # never raise, but this function runs at the top of every single
+        # page load, so if some future edge case slips through anyway,
+        # showing "no prop lines today" beats crashing the whole app.
         props_df = pd.DataFrame(columns=["player", "market", "point"])
         td_df = pd.DataFrame(columns=["player", "implied_prob"])
         quota = empty_quota
-    return props_df, td_df, quota, datetime.datetime.now()
+        pulled_at = datetime.datetime.now()
+        stale = False
+    return props_df, td_df, quota, pulled_at, stale
 
 
 def get_prop_lines() -> pd.DataFrame:
-    df, _, _, _ = _get_prop_lines_with_timestamp()
+    df, _, _, _, _ = _get_prop_lines_with_timestamp()
     return df
 
 
@@ -128,12 +137,12 @@ def get_anytime_td_odds() -> pd.DataFrame:
     """player -> implied_prob (0-100): the market's implied chance a
     player scores any touchdown this week. See load_prop_lines for why
     this is kept separate from get_prop_lines()."""
-    _, td_df, _, _ = _get_prop_lines_with_timestamp()
+    _, td_df, _, _, _ = _get_prop_lines_with_timestamp()
     return td_df
 
 
 def get_prop_lines_updated_at() -> datetime.datetime:
-    _, _, _, updated_at = _get_prop_lines_with_timestamp()
+    _, _, _, updated_at, _ = _get_prop_lines_with_timestamp()
     return updated_at
 
 
@@ -142,8 +151,15 @@ def get_odds_api_quota() -> dict:
     Odds API's own usage-credit counters as of the last refresh, plus
     whether that refresh skipped pulling odds to protect the safety
     buffer (see ODDS_API_SAFETY_BUFFER in config.py)."""
-    _, _, quota, _ = _get_prop_lines_with_timestamp()
+    _, _, quota, _, _ = _get_prop_lines_with_timestamp()
     return quota
+
+
+def get_prop_lines_are_stale() -> bool:
+    """True if what's showing is a fallback to the last known good pull
+    (because a fresh one was skipped or failed), not today's actual pull."""
+    _, _, _, _, stale = _get_prop_lines_with_timestamp()
+    return stale
 
 
 @st.cache_data(ttl=3600 * 24 * 30)  # a city's coordinates never change
@@ -581,15 +597,16 @@ if not ODDS_API_KEY:
 else:
     prop_updated_at = get_prop_lines_updated_at()
     quota = get_odds_api_quota()
+    is_stale = get_prop_lines_are_stale()
     refresh_col1, refresh_col2 = st.columns([3, 1])
     with refresh_col1:
         st.caption(f"Prop lines last pulled: {prop_updated_at.strftime('%a %-I:%M %p')} (auto-refreshes once a day to conserve API quota)")
         if quota["remaining"] is not None:
             st.caption(f"🔑 Odds API quota: {quota['remaining']:,} credits remaining ({quota['used']:,} used this billing period)")
-        if quota["skipped"]:
+        if is_stale:
             st.warning(
-                f"Skipped pulling prop odds this refresh to protect the {ODDS_API_SAFETY_BUFFER:,}-credit safety buffer "
-                "- quota was running too low. Prop lines will show as unavailable until the next refresh has enough headroom.",
+                f"Couldn't get a fresh pull this cycle (quota safety buffer or a temporary API hiccup) - showing the last "
+                f"known odds from {prop_updated_at.strftime('%a %-I:%M %p')} instead of nothing. Will try again next refresh.",
                 icon="⚠️",
             )
     with refresh_col2:

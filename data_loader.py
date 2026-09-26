@@ -9,6 +9,10 @@ project (not scraped from a website), so it's reliable and not subject
 to bot-blocking.
 """
 
+import datetime
+import json
+import os
+
 import requests
 import nflreadpy as nfl
 import pandas as pd
@@ -17,6 +21,17 @@ from config import (
     SEASONS, CURRENT_SEASON, STARTERS_PER_POSITION, PROP_MARKET_MAP,
     ANYTIME_TD_MARKET, ODDS_API_SAFETY_BUFFER,
 )
+
+# Where the last successful prop-lines pull is saved on disk, independent
+# of Streamlit's own st.cache_data cache. Streamlit's cache resets whenever
+# the cached function's source code changes - which happened repeatedly
+# during this feature's development and forced a fresh API pull on every
+# code push, even though nothing about "how old is the data" had changed.
+# This file's timestamp is the real source of truth for that question, so
+# it survives code changes and app restarts (though not a brand new
+# Streamlit Cloud deploy, which rebuilds the filesystem from scratch - see
+# load_prop_lines_with_cache).
+PROP_LINES_CACHE_PATH = "data/prop_lines_cache.json"
 
 KEEP_COLUMNS = [
     "player_display_name", "position", "team", "opponent_team",
@@ -320,6 +335,91 @@ def load_prop_lines(api_key: str):
         td = pd.DataFrame(columns=td_columns)
 
     return props, td, quota
+
+
+def _read_prop_lines_cache_file():
+    """Best-effort read of the on-disk prop-lines cache file. Returns None
+    if it doesn't exist yet (first run, or after a fresh deploy) or is
+    unreadable/corrupt - callers treat that exactly like "no cache yet",
+    never a crash."""
+    try:
+        with open(PROP_LINES_CACHE_PATH, "r") as f:
+            raw = json.load(f)
+        return {
+            "props_df": pd.DataFrame(raw["props"]),
+            "td_df": pd.DataFrame(raw["td"]),
+            "quota": raw["quota"],
+            "pulled_at": datetime.datetime.fromisoformat(raw["pulled_at"]),
+        }
+    except Exception:
+        return None
+
+
+def _write_prop_lines_cache_file(props_df: pd.DataFrame, td_df: pd.DataFrame, quota: dict, pulled_at: datetime.datetime) -> None:
+    """Best-effort write. If this fails (e.g. a read-only filesystem) we
+    just lose the cross-restart fallback for this cycle - degraded, not
+    fatal, since load_prop_lines_with_cache still works, it'll just call
+    the API a bit more than ideal until a write succeeds."""
+    try:
+        os.makedirs(os.path.dirname(PROP_LINES_CACHE_PATH), exist_ok=True)
+        payload = {
+            "props": props_df.to_dict(orient="records"),
+            "td": td_df.to_dict(orient="records"),
+            "quota": quota,
+            "pulled_at": pulled_at.isoformat(),
+        }
+        with open(PROP_LINES_CACHE_PATH, "w") as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
+
+
+def load_prop_lines_with_cache(api_key: str):
+    """Same data as load_prop_lines(), but pulls from the Odds API at most
+    once every 24 hours no matter what - even across app restarts and
+    even if Streamlit's own st.cache_data cache gets reset by a code
+    change (its cache key is tied to the cached function's source, so
+    every code edit forces an immediate re-pull under that alone - this
+    is what repeatedly burned API quota while this feature was being
+    built). It works by keeping its own on-disk, timestamp-based cache
+    file that doesn't care whether the code changed - only how old the
+    last successful pull actually is.
+
+    Returns (props_df, td_df, quota, pulled_at, stale):
+    - pulled_at: when this data was actually fetched from the API (not
+      necessarily just now - could be from the on-disk cache).
+    - stale: True if this is a fallback to the last known good pull,
+      served because a fresh pull was skipped (quota safety buffer) or
+      failed outright, even though it's past the normal 24h window -
+      showing yesterday's real odds beats showing nothing.
+
+    Caveat: this cache file lives on the app's running container, not in
+    the git repo, so a brand new Streamlit Cloud deploy starts with no
+    file and will always cost one fresh pull the first time it's opened
+    after that deploy - no caching strategy can avoid that, since a new
+    deploy is a brand new filesystem. This only guarantees the "at most
+    once a day" behavior within a running deployment."""
+    cached = _read_prop_lines_cache_file()
+    now = datetime.datetime.now()
+
+    if cached and (now - cached["pulled_at"]) < datetime.timedelta(hours=24):
+        return cached["props_df"], cached["td_df"], cached["quota"], cached["pulled_at"], False
+
+    props_df, td_df, quota = load_prop_lines(api_key)
+
+    # Only fall back to the stale cache when the fresh attempt didn't
+    # really tell us anything new: either it was deliberately skipped to
+    # protect the quota buffer, or the initial events call itself failed
+    # (quota["remaining"] stays None only when that call errored, given we
+    # do have a key - a successful pull that legitimately found zero
+    # events, e.g. a bye week, still reports a real remaining count and
+    # should be trusted and cached as current, not treated as a failure).
+    fresh_pull_uninformative = quota.get("skipped") or (bool(api_key) and quota.get("remaining") is None)
+    if cached and fresh_pull_uninformative:
+        return cached["props_df"], cached["td_df"], cached["quota"], cached["pulled_at"], True
+
+    _write_prop_lines_cache_file(props_df, td_df, quota, now)
+    return props_df, td_df, quota, now, False
 
 
 def geocode_city(city: str):
