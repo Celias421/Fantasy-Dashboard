@@ -82,60 +82,76 @@ def inject_css() -> None:
         background: {BG};
     }}
 
+    /* ---- Global type scale -------------------------------------------
+       This app is used on laptop/desktop monitors, not phones, so text
+       leans larger than Streamlit's own (phone-friendly) defaults across
+       the board - body copy, labels, buttons - rather than the other way
+       around. Tabs and headshots/logos get their own, bigger bump below. */
+    html, body {{ font-size: 17px; }}
+    [data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li,
+    [data-testid="stMarkdownContainer"] span {{
+        font-size: 1rem;
+    }}
+    [data-testid="stWidgetLabel"] p, label {{
+        font-size: 1rem !important;
+    }}
+    .stSelectbox div, .stMultiSelect div, .stTextInput input, .stNumberInput input {{
+        font-size: 0.95rem;
+    }}
+
     /* ---- This app's own component classes ----------------------------- */
     .player-card {{
         background: {SURFACE};
         border: 1px solid {LINE};
         border-radius: 12px;
-        padding: 14px 16px;
+        padding: 18px 20px;
         margin-bottom: 14px;
         box-shadow: 0 2px 8px rgba(0,0,0,0.35);
     }}
     .player-card img {{ border-radius: 50%; object-fit: cover; }}
-    .stat-big {{ font-size: 26px; font-weight: 700; margin-top: 6px; color: {INK};
+    .stat-big {{ font-size: 32px; font-weight: 700; margin-top: 8px; color: {INK};
                  font-variant-numeric: tabular-nums; }}
-    .stat-label {{ font-size: 12px; color: {SUB}; letter-spacing: .02em; text-transform: uppercase; }}
-    .delta-up {{ color: {ACCENT}; font-weight: 600; }}
-    .delta-down {{ color: {BAD}; font-weight: 600; }}
-    .delta-flat {{ color: {SUB}; font-weight: 600; }}
+    .stat-label {{ font-size: 13px; color: {SUB}; letter-spacing: .02em; text-transform: uppercase; }}
+    .delta-up {{ color: {ACCENT}; font-weight: 600; font-size: 15px; }}
+    .delta-down {{ color: {BAD}; font-weight: 600; font-size: 15px; }}
+    .delta-flat {{ color: {SUB}; font-weight: 600; font-size: 15px; }}
     .consistency-badge {{
-        display: inline-block; font-size: 11px; padding: 3px 9px;
+        display: inline-block; font-size: 13px; padding: 4px 11px;
         border-radius: 10px; margin-top: 6px; margin-right: 4px;
         background: {SURFACE_2}; color: {SUB}; border: 1px solid {LINE};
     }}
     .matchup-badge {{
-        display: inline-block; font-size: 11px; padding: 3px 9px;
+        display: inline-block; font-size: 13px; padding: 4px 11px;
         border-radius: 10px; margin-top: 6px; margin-right: 4px;
         background: {SURFACE_2}; border: 1px solid {LINE};
         font-family: "IBM Plex Mono", monospace; letter-spacing: .01em;
         /* text color is set inline per-badge, gradient by matchup difficulty */
     }}
     .injury-badge {{
-        display: inline-block; font-size: 11px; padding: 3px 9px;
+        display: inline-block; font-size: 13px; padding: 4px 11px;
         border-radius: 10px; margin-top: 6px; margin-right: 4px;
         background: {BAD_SOFT}; color: {BAD}; border: 1px solid rgba(229,72,77,.3);
     }}
 
     /* ---- Header / masthead --------------------------------------------- */
-    /* Logo is a transparent-background wordmark (no full-bleed artwork to
-       preserve), so it's centered at a fixed, comfortable height rather
-       than stretched to the page's full width - reads as a clean masthead
-       instead of an oversized banner. */
+    /* Logo is a transparent-background wordmark, centered and sized to
+       read clearly as a masthead on a desktop monitor - big enough to
+       anchor the page without needing to crop or distort the artwork. */
     .tps-header {{
-        padding: 10px 0 6px;
+        padding: 14px 0 8px;
         margin-bottom: 4px;
         display: flex;
         justify-content: center;
     }}
     .tps-header img {{
         display: block;
-        height: 150px;
+        height: 260px;
         width: auto;
         max-width: 100%;
         object-fit: contain;
     }}
     @media (max-width: 640px) {{
-        .tps-header img {{ height: 90px; }}
+        .tps-header img {{ height: 120px; }}
     }}
     .tps-tagline {{ color: {SUB}; font-size: 13px; margin: -2px 0 14px 2px; letter-spacing: .01em; }}
     .tps-divider {{
@@ -148,6 +164,8 @@ def inject_css() -> None:
         border-radius: 8px;
         border: 1px solid {LINE};
         font-weight: 600;
+        font-size: 15px;
+        padding: 10px 18px;
         transition: border-color .15s ease, transform .05s ease;
     }}
     .stButton > button:hover, .stFormSubmitButton > button:hover {{
@@ -180,7 +198,10 @@ def inject_css() -> None:
         flex: 1 1 0;
         justify-content: center;
         font-weight: 600; color: {SUB};
-        padding: 10px 14px;
+        padding: 16px 16px;
+    }}
+    [data-testid="stTabs"] button[role="tab"] p {{
+        font-size: 18px !important;
     }}
     [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {{
         color: {INK};
@@ -203,8 +224,11 @@ def inject_css() -> None:
         border-radius: 999px; padding: 4px; display: inline-flex; width: fit-content;
     }}
     div[data-testid="stRadio"] label {{
-        border-radius: 999px !important; padding: 6px 16px !important; margin: 0 !important;
+        border-radius: 999px !important; padding: 9px 20px !important; margin: 0 !important;
         transition: background .15s ease;
+    }}
+    div[data-testid="stRadio"] label p {{
+        font-size: 16px !important;
     }}
     div[data-testid="stRadio"] label:has(input:checked) {{
         background: {ACCENT};
@@ -216,10 +240,14 @@ def inject_css() -> None:
     /* ---- Metrics --------------------------------------------------------- */
     [data-testid="stMetric"] {{
         background: {SURFACE}; border: 1px solid {LINE}; border-radius: 10px;
-        padding: 14px 16px;
+        padding: 16px 18px;
     }}
     [data-testid="stMetricValue"] {{
         color: {ACCENT}; font-variant-numeric: tabular-nums;
+        font-size: 2.3rem !important;
+    }}
+    [data-testid="stMetricLabel"] p {{
+        font-size: 15px !important;
     }}
 
     /* ---- Dataframes / tables ----------------------------------------------- */
@@ -262,6 +290,12 @@ def inject_css() -> None:
     }}
     [data-testid="stMultiSelectTagsContainer"] [data-tag] span {{
         color: {ACCENT} !important;
+        font-size: 14px !important;
+    }}
+
+    /* ---- Captions -------------------------------------------------------- */
+    [data-testid="stCaptionContainer"] p {{
+        font-size: 14px !important;
     }}
     </style>
     """, unsafe_allow_html=True)

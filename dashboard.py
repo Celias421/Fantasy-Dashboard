@@ -550,8 +550,8 @@ def render_player_cards(summary_df: pd.DataFrame, sort_stat: str, cols_per_row: 
         cols = st.columns(cols_per_row)
         for col, (_, p) in zip(cols, chunk.iterrows()):
             with col:
-                photo = sized_headshot(p["headshot_url"], 96) if pd.notna(p["headshot_url"]) else ""
-                img_tag = f'<img src="{photo}" width="96" height="96" onerror="this.style.display=\'none\'"/>' if photo else ""
+                photo = sized_headshot(p["headshot_url"], 132) if pd.notna(p["headshot_url"]) else ""
+                img_tag = f'<img src="{photo}" width="132" height="132" onerror="this.style.display=\'none\'"/>' if photo else ""
 
                 badges = f'<div class="consistency-badge">Consistency: {p["consistency"]}</div>'
                 if pd.notna(p.get("matchup_label")):
@@ -591,18 +591,25 @@ else:
     prop_updated_at = get_prop_lines_updated_at()
     quota = get_odds_api_quota()
     is_stale = get_prop_lines_are_stale()
-    refresh_col1, refresh_col2 = st.columns([3, 1])
+    refresh_col1, refresh_col2, refresh_col3 = st.columns([1, 3, 1])
+    quota_text = (
+        f"🔑 Odds API quota: {quota['remaining']:,} credits remaining ({quota['used']:,} used this billing period)"
+        if quota["remaining"] is not None else "Odds API quota info not available."
+    )
     with refresh_col1:
-        st.caption(f"Prop lines last pulled: {prop_updated_at.strftime('%a %-I:%M %p')} (auto-refreshes once a day to conserve API quota)")
-        if quota["remaining"] is not None:
-            st.caption(f"🔑 Odds API quota: {quota['remaining']:,} credits remaining ({quota['used']:,} used this billing period)")
+        theme.info_popover(
+            f"**Prop lines last pulled:** {prop_updated_at.strftime('%a %-I:%M %p')} (auto-refreshes once a day "
+            f"to conserve API quota).\n\n{quota_text}",
+            label="🔑 Prop line status",
+        )
+    with refresh_col2:
         if is_stale:
             st.warning(
                 f"Couldn't get a fresh pull this cycle (quota safety buffer or a temporary API hiccup) - showing the last "
                 f"known odds from {prop_updated_at.strftime('%a %-I:%M %p')} instead of nothing. Will try again next refresh.",
                 icon="⚠️",
             )
-    with refresh_col2:
+    with refresh_col3:
         if st.button("🔄 Refresh prop lines now", use_container_width=True):
             _get_prop_lines_with_timestamp.clear()
             st.rerun()
@@ -624,7 +631,7 @@ current_season_df = merged[merged["season"] == CURRENT_SEASON]
 team_logos = get_team_meta().set_index("team_abbr")["team_logo_espn"]
 
 
-def team_logo_html(team, px: int = 20) -> str:
+def team_logo_html(team, px: int = 30) -> str:
     """Small inline team logo, or an empty string if the team's unknown
     or has no logo on file - used wherever a team abbreviation is shown
     (cards, Deep Dive, Game Center, Prop Comparator) so a team is a quick
@@ -979,7 +986,19 @@ def render_lineup_tab():
             "opponent_plain": "Next opp", "proj_points": "Proj", "season_avg": "Szn avg",
             "matchup_rank": "Opp rank", "injury_status": "Injury", "note": "Note",
         }),
-        use_container_width=True, hide_index=True,
+        use_container_width=True, hide_index=True, row_height=38,
+        column_config={
+            "Start": st.column_config.TextColumn(width="small"),
+            "Player": st.column_config.TextColumn(width=200),
+            "Pos": st.column_config.TextColumn(width="small"),
+            "Team": st.column_config.TextColumn(width="small"),
+            "Next opp": st.column_config.TextColumn(width=220),
+            "Proj": st.column_config.NumberColumn(width="small"),
+            "Szn avg": st.column_config.NumberColumn(width="small"),
+            "Opp rank": st.column_config.NumberColumn(width="small"),
+            "Injury": st.column_config.TextColumn(width=140),
+            "Note": st.column_config.TextColumn(width=200),
+        },
     )
 
 
@@ -1075,10 +1094,10 @@ if tab_side == "🏈 Fantasy Lineups":
             c1, c2 = st.columns([1, 4])
             with c1:
                 if pd.notna(info.get("headshot_url")):
-                    st.image(sized_headshot(info["headshot_url"], 140), width=140)
+                    st.image(sized_headshot(info["headshot_url"], 220), width=220)
             with c2:
-                st.markdown(f"#### {info['player']}")
-                st.markdown(f"**{team_logo_html(info['team'], px=24)}{info['position']} · {info['team']}**", unsafe_allow_html=True)
+                st.markdown(f"### {info['player']}")
+                st.markdown(f"##### {team_logo_html(info['team'], px=36)}{info['position']} · {info['team']}", unsafe_allow_html=True)
                 matchup_result = get_matchup_label(info["team"], info["position"], "fantasy_points_ppr")
                 if matchup_result:
                     matchup_text, matchup_rank = matchup_result
@@ -1161,10 +1180,10 @@ if tab_side == "🏈 Fantasy Lineups":
                     st.subheader(f"3-Week Rolling Average ({CURRENT_SEASON})")
                     rolling = pdf_current[numeric_cols].rolling(3, min_periods=1).mean()
                     rolling.insert(0, "week", pdf_current["week"].values)
-                    st.dataframe(rolling.set_index("week"), use_container_width=True)
+                    st.dataframe(rolling.set_index("week"), use_container_width=True, row_height=38)
 
                 with st.expander("Full weekly stats (all seasons)"):
-                    st.dataframe(pdf_full.drop(columns=["period"]), use_container_width=True)
+                    st.dataframe(pdf_full.drop(columns=["period"]), use_container_width=True, row_height=38)
 
         else:
             col_a, col_b = st.columns(2)
@@ -1270,9 +1289,9 @@ if tab_side == "🏈 Fantasy Lineups":
                     )
 
                 with st.expander(f"Full weekly stats — {player_a}"):
-                    st.dataframe(pdf_a_full.drop(columns=["period"]), use_container_width=True)
+                    st.dataframe(pdf_a_full.drop(columns=["period"]), use_container_width=True, row_height=38)
                 with st.expander(f"Full weekly stats — {player_b}"):
-                    st.dataframe(pdf_b_full.drop(columns=["period"]), use_container_width=True)
+                    st.dataframe(pdf_b_full.drop(columns=["period"]), use_container_width=True, row_height=38)
 
     # ---------------- Injuries (full league injury report) ----------------
     with tab_injuries:
@@ -1340,8 +1359,17 @@ if tab_side == "🏈 Fantasy Lineups":
                 }
                 shown = filtered_inj[display_cols].rename(columns=rename_map)
                 st.dataframe(
-                    shown, use_container_width=True, hide_index=True,
-                    column_config={"Team Logo": st.column_config.ImageColumn(" ", width="small")},
+                    shown, use_container_width=True, hide_index=True, row_height=44,
+                    column_config={
+                        "Tracked": st.column_config.TextColumn(width="small"),
+                        "Player": st.column_config.TextColumn(width=200),
+                        "Team Logo": st.column_config.ImageColumn(" ", width=70),
+                        "Team": st.column_config.TextColumn(width="small"),
+                        "Pos": st.column_config.TextColumn(width="small"),
+                        "Status": st.column_config.TextColumn(width=140),
+                        "Injury": st.column_config.TextColumn(width=180),
+                        "Practice": st.column_config.TextColumn(width=240),
+                    },
                 )
                 st.caption(
                     "🔴 Out  🟠 Doubtful  🟡 Questionable  ⚪ other designation (e.g. Probable). "
@@ -1478,21 +1506,31 @@ if tab_side == "🏈 Fantasy Lineups":
                 "Implied Away", "Implied Home", "Roof", "Weather", "Weather Risk", "Result",
             ]
             column_config = {
-                "Away Logo": st.column_config.ImageColumn(" ", width="large"),
-                "Home Logo": st.column_config.ImageColumn(" ", width="large"),
+                "Kickoff": st.column_config.TextColumn(width=150),
+                "Away Logo": st.column_config.ImageColumn(" ", width=80),
+                "Away": st.column_config.TextColumn(width="small"),
+                "Home Logo": st.column_config.ImageColumn(" ", width=80),
+                "Home": st.column_config.TextColumn(width="small"),
+                "Spread": st.column_config.TextColumn(width="small"),
+                "Total": st.column_config.TextColumn(width="small"),
+                "Implied Away": st.column_config.TextColumn(width="small"),
+                "Implied Home": st.column_config.TextColumn(width="small"),
+                "Roof": st.column_config.TextColumn(width=100),
+                "Weather": st.column_config.TextColumn(width=160),
                 "Weather Risk": st.column_config.ProgressColumn(
-                    "Weather Risk", min_value=0, max_value=100, format="%.0f%%",
+                    "Weather Risk", min_value=0, max_value=100, format="%.0f%%", width=130,
                     help="Rough wind/rain severity score - higher means more likely to affect passing and kicking.",
                 ),
+                "Result": st.column_config.TextColumn(width=140),
             }
 
             if group_by_day:
                 for day in matchups_df.sort_values("gameday")["day_name"].unique():
                     day_df = matchups_df[matchups_df["day_name"] == day]
                     st.markdown(f"**{day}**")
-                    st.dataframe(day_df[display_cols], use_container_width=True, hide_index=True, column_config=column_config)
+                    st.dataframe(day_df[display_cols], use_container_width=True, hide_index=True, column_config=column_config, row_height=50)
             else:
-                st.dataframe(matchups_df[display_cols], use_container_width=True, hide_index=True, column_config=column_config)
+                st.dataframe(matchups_df[display_cols], use_container_width=True, hide_index=True, column_config=column_config, row_height=50)
 
             _, mm_info_col = st.columns([5, 1])
             with mm_info_col:
@@ -1537,7 +1575,7 @@ else:
 
         if not prop_pdf.empty:
             prop_team = prop_pdf["team"].iloc[0]
-            st.markdown(f"{team_logo_html(prop_team, px=22)}**{position} · {prop_team}**", unsafe_allow_html=True)
+            st.markdown(f"##### {team_logo_html(prop_team, px=32)}{position} · {prop_team}", unsafe_allow_html=True)
             prop_td_odds = get_anytime_td_odds()
             prop_td_match = prop_td_odds[prop_td_odds["player"] == prop_player] if not prop_td_odds.empty else prop_td_odds
             if not prop_td_match.empty:
@@ -1616,7 +1654,7 @@ else:
                 prop_pdf["matchup"] = prop_pdf.get("opponent_team", "")
 
             display = prop_pdf[["week", "matchup", prop_stat, "result"]].rename(columns={prop_stat: "actual"})
-            st.dataframe(display, use_container_width=True, hide_index=True)
+            st.dataframe(display, use_container_width=True, hide_index=True, row_height=38)
             st.caption(
                 f"Matchup rank is out of 32, based on {CURRENT_SEASON} season totals allowed to that position "
                 "(#1 = toughest defense, #32 = easiest)."
@@ -1711,8 +1749,8 @@ else:
             for col, team, opponent, home_away_label in [(col_away, away, home, "Away"), (col_home, home, away, "Home")]:
                 with col:
                     st.markdown(
-                        f"### {team_logo_html(team, px=32)}{team} "
-                        f"<span style='font-size:13px; color:#999; font-weight:400;'>({home_away_label})</span>",
+                        f"### {team_logo_html(team, px=44)}{team} "
+                        f"<span style='font-size:15px; color:#999; font-weight:400;'>({home_away_label})</span>",
                         unsafe_allow_html=True,
                     )
                     note = matchup_note(team, opponent)
