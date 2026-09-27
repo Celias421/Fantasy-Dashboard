@@ -316,49 +316,17 @@ def add_matchup_display(df: pd.DataFrame, home_away_lookup: pd.DataFrame) -> pd.
     return df
 
 
-def format_gametime(gametime) -> str:
-    """'HH:MM' (24h, Eastern) -> '1:00 PM'. Just the time, with no
-    weekday/date attached - used where the date is already shown
-    separately (the Matchups table's own Kickoff column, game-picker
-    labels) so the time isn't duplicated with format_kickoff()'s
-    "Sun 1:00 PM" form."""
-    if not gametime or pd.isna(gametime):
-        return ""
-    try:
-        return pd.Timestamp(f"2000-01-01 {gametime}").strftime("%-I:%M %p")
-    except (ValueError, TypeError):
-        return ""
-
-
-def format_kickoff(gameday, gametime) -> str:
-    """'gameday' (a date) and 'gametime' (a "HH:MM", 24h Eastern string) -
-    nflverse's schedule keeps them as two separate columns - combined into
-    one short label like "Sun 1:00 PM". Returns "" if either piece is
-    missing (a game far enough out that a time hasn't been set yet)."""
-    if pd.isna(gameday) or not gametime or pd.isna(gametime):
-        return ""
-    try:
-        ts = pd.Timestamp(f"{pd.Timestamp(gameday).strftime('%Y-%m-%d')} {gametime}")
-    except (ValueError, TypeError):
-        return ""
-    return ts.strftime("%a %-I:%M %p")
-
-
 def build_next_opponent_map(schedule: pd.DataFrame) -> pd.DataFrame:
-    """team -> next scheduled opponent + week + home/away + kickoff time,
-    based on games not yet played. Kickoff comes along for the ride so
-    every matchup label built from this map (cards, badges, lineup rows,
-    roster comparison) can show "Sun 1:00 PM" alongside the opponent
-    instead of just the week number."""
+    """team -> next scheduled opponent + week + home/away, based on games
+    not yet played."""
     upcoming = schedule[schedule["home_score"].isna()].sort_values("gameday")
     rows = []
     for _, g in upcoming.iterrows():
-        kickoff = format_kickoff(g.get("gameday"), g.get("gametime"))
-        rows.append((g["home_team"], g["away_team"], g["week"], True, kickoff))
-        rows.append((g["away_team"], g["home_team"], g["week"], False, kickoff))
+        rows.append((g["home_team"], g["away_team"], g["week"], True))
+        rows.append((g["away_team"], g["home_team"], g["week"], False))
     if not rows:
-        return pd.DataFrame(columns=["team", "opponent", "week", "is_home", "kickoff"])
-    next_opp = pd.DataFrame(rows, columns=["team", "opponent", "week", "is_home", "kickoff"])
+        return pd.DataFrame(columns=["team", "opponent", "week", "is_home"])
+    next_opp = pd.DataFrame(rows, columns=["team", "opponent", "week", "is_home"])
     return next_opp.drop_duplicates(subset="team", keep="first")
 
 
@@ -481,7 +449,6 @@ def _matchup_label(team: str, position: str, stat: str, next_opp_map: pd.DataFra
         return None
     opponent = opp_row["opponent"].iloc[0]
     is_home = bool(opp_row["is_home"].iloc[0])
-    kickoff = opp_row["kickoff"].iloc[0] if "kickoff" in opp_row.columns else ""
     dr = defense_ranks[(defense_ranks["position"] == position) & (defense_ranks["team"] == opponent)]
     if dr.empty:
         return None
@@ -489,8 +456,7 @@ def _matchup_label(team: str, position: str, stat: str, next_opp_map: pd.DataFra
     icon = raw_icon if plain else _icon_html(raw_icon)
     prefix = "vs" if is_home else "@"
     rank = int(dr[rank_col].iloc[0])
-    kickoff_text = f" ({kickoff})" if kickoff else ""
-    return f"{icon} {prefix} {opponent}{kickoff_text} — #{rank} toughest", rank
+    return f"{icon} {prefix} {opponent} — #{rank} toughest", rank
 
 
 def get_matchup_label(team: str, position: str, stat: str):
@@ -851,19 +817,18 @@ def compute_lineup_projections(roster_players: list) -> pd.DataFrame:
             rows.append({
                 "player": player, "position": "?", "team": "?", "opponent": None, "opponent_plain": None,
                 "season_avg": 0.0, "matchup_rank": None, "proj_points": 0.0,
-                "injury_status": None, "note": "Not tracked this season", "headshot_url": None,
+                "injury_status": None, "note": "Not tracked this season",
             })
             continue
         latest = pdf.sort_values(["season", "week"]).iloc[-1]
         position, team = latest["position"], latest["team"]
-        headshot_url = latest.get("headshot_url")
         season_avg, _, _, _ = compute_summary(pdf[pdf["season"] == CURRENT_SEASON], "fantasy_points_ppr")
 
         if team not in teams_this_week:
             rows.append({
                 "player": player, "position": position, "team": team, "opponent": None, "opponent_plain": None,
                 "season_avg": round(season_avg, 1), "matchup_rank": None, "proj_points": 0.0,
-                "injury_status": "Bye", "note": "Bye this week - not eligible to start", "headshot_url": headshot_url,
+                "injury_status": "Bye", "note": "Bye this week - not eligible to start",
             })
             continue
 
@@ -886,7 +851,7 @@ def compute_lineup_projections(roster_players: list) -> pd.DataFrame:
             "opponent": matchup[0] if matchup else None,
             "opponent_plain": matchup_plain[0] if matchup_plain else None,
             "season_avg": round(season_avg, 1), "matchup_rank": rank, "proj_points": proj,
-            "injury_status": inj_status, "note": note, "headshot_url": headshot_url,
+            "injury_status": inj_status, "note": note,
         })
     return pd.DataFrame(rows)
 
@@ -984,24 +949,9 @@ def render_lineup_tab():
         # True in Python - a plain "if row['injury_status']" check would
         # print the literal word "nan" for every healthy player.
         inj = f" · {row['injury_status']}" if pd.notna(row["injury_status"]) else ""
-
-        photo = sized_headshot(row["headshot_url"], 104) if pd.notna(row.get("headshot_url")) else ""
-        img_tag = (
-            f'<img src="{photo}" width="104" height="104" style="border-radius:50%; object-fit:cover; flex-shrink:0;" '
-            f'onerror="this.style.display=\'none\'"/>' if photo else ""
-        )
         st.markdown(
-            f"""
-            <div class="player-card" style="display:flex; align-items:center; gap:16px;">
-                {img_tag}
-                <div>
-                    <div style="font-size:13px; color:{theme.SUB}; text-transform:uppercase; letter-spacing:.03em;">{slot_label}</div>
-                    <div style="font-size:19px; font-weight:700;">{row['player']} <span style="font-weight:400; color:{theme.SUB};">({team_logo_html(row['team'])}{row['team']})</span></div>
-                    <div style="margin-top:4px;">{badge}</div>
-                    <div style="margin-top:4px; color:{theme.SUB};">Proj <b style="color:{theme.INK};">{row['proj_points']}</b> pts · season avg {row['season_avg']}{inj}</div>
-                </div>
-            </div>
-            """,
+            f"**{slot_label}** — {row['player']} ({row['team']}) {badge}  \n"
+            f"Proj **{row['proj_points']}** pts · season avg {row['season_avg']}{inj}",
             unsafe_allow_html=True,
         )
 
@@ -1042,7 +992,7 @@ def render_lineup_tab():
             "Player": st.column_config.TextColumn(width=200),
             "Pos": st.column_config.TextColumn(width="small"),
             "Team": st.column_config.TextColumn(width="small"),
-            "Next opp": st.column_config.TextColumn(width=270),
+            "Next opp": st.column_config.TextColumn(width=220),
             "Proj": st.column_config.NumberColumn(width="small"),
             "Szn avg": st.column_config.NumberColumn(width="small"),
             "Opp rank": st.column_config.NumberColumn(width="small"),
@@ -1433,11 +1383,7 @@ if tab_side == "🏈 Fantasy Lineups":
 
         schedule_all = get_schedule().copy()
         schedule_all["gameday_fmt"] = pd.to_datetime(schedule_all["gameday"]).dt.strftime("%a %-m/%-d")
-        schedule_all["gametime_fmt"] = schedule_all["gametime"].apply(format_gametime) if "gametime" in schedule_all.columns else ""
-        schedule_all["game_label"] = (
-            schedule_all["gameday_fmt"] + (" " + schedule_all["gametime_fmt"]).where(schedule_all["gametime_fmt"] != "", "")
-            + " — " + schedule_all["away_team"] + " @ " + schedule_all["home_team"]
-        )
+        schedule_all["game_label"] = schedule_all["gameday_fmt"] + " — " + schedule_all["away_team"] + " @ " + schedule_all["home_team"]
         # team_logos/team_logo_html are defined once near the top of the file
         # (right after current_season_df) and reused everywhere a team shows up.
 
@@ -1497,7 +1443,7 @@ if tab_side == "🏈 Fantasy Lineups":
                 rows.append({
                     "day_name": pd.Timestamp(g["gameday"]).day_name() if pd.notna(g.get("gameday")) else "TBD",
                     "gameday": g.get("gameday"),
-                    "Kickoff": (g.get("gameday_fmt", "") + (" " + g["gametime_fmt"] if g.get("gametime_fmt") else "")).strip(),
+                    "Kickoff": g.get("gameday_fmt", ""),
                     "Away Logo": team_logos.get(away),
                     "Away": away,
                     "Home Logo": team_logos.get(home),
@@ -1560,7 +1506,7 @@ if tab_side == "🏈 Fantasy Lineups":
                 "Implied Away", "Implied Home", "Roof", "Weather", "Weather Risk", "Result",
             ]
             column_config = {
-                "Kickoff": st.column_config.TextColumn(width=175),
+                "Kickoff": st.column_config.TextColumn(width=150),
                 "Away Logo": st.column_config.ImageColumn(" ", width=80),
                 "Away": st.column_config.TextColumn(width="small"),
                 "Home Logo": st.column_config.ImageColumn(" ", width=80),
@@ -1724,11 +1670,7 @@ else:
         schedule = get_schedule()
         schedule = schedule.copy()
         schedule["gameday_fmt"] = pd.to_datetime(schedule["gameday"]).dt.strftime("%a %-m/%-d")
-        schedule["gametime_fmt"] = schedule["gametime"].apply(format_gametime) if "gametime" in schedule.columns else ""
-        schedule["game_label"] = (
-            schedule["gameday_fmt"] + (" " + schedule["gametime_fmt"]).where(schedule["gametime_fmt"] != "", "")
-            + " — " + schedule["away_team"] + " @ " + schedule["home_team"]
-        )
+        schedule["game_label"] = schedule["gameday_fmt"] + " — " + schedule["away_team"] + " @ " + schedule["home_team"]
 
         upcoming = schedule[schedule["home_score"].isna()]
         default_week = int(upcoming["week"].min()) if not upcoming.empty else int(schedule["week"].max())
@@ -1771,9 +1713,6 @@ else:
 
             gm1, gm2, gm3, gm4 = st.columns(4)
             gm1.metric("Matchup", f"{away} @ {home}")
-            kickoff_full = format_kickoff(game_row.get("gameday"), game_row.get("gametime"))
-            if kickoff_full:
-                gm1.caption(f"Kickoff: {kickoff_full}")
             if pd.notna(game_row.get("spread_line")):
                 fav = home if game_row["spread_line"] < 0 else away
                 gm2.metric("Spread", f"{fav} {-abs(game_row['spread_line']):.1f}")
