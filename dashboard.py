@@ -2284,9 +2284,16 @@ else:
         # that are often close to each other.
         edge_chart_df = edge_df.head(10).copy()
         edge_chart_df["label"] = edge_chart_df["player"] + " — " + edge_chart_df["stat"]
+        # edge_df is already sorted by |edge| descending (line ~2279), so the
+        # bar order just needs to follow that same label order - a plain list
+        # sort, rather than alt.EncodingSortField(op="abs"), which Vega-Lite's
+        # schema rejects (op only accepts real aggregation ops like "sum"/
+        # "mean", not "abs"; this raised a live SchemaValidationError once real
+        # prop-line data populated this chart).
+        edge_label_order = edge_chart_df["label"].tolist()
         edge_bar = alt.Chart(edge_chart_df).mark_bar(cornerRadiusEnd=4, size=18).encode(
             x=alt.X("edge:Q", title="Edge (season avg − prop line)"),
-            y=alt.Y("label:N", sort=alt.EncodingSortField(field="edge", op="abs", order="descending"), title=None),
+            y=alt.Y("label:N", sort=edge_label_order, title=None),
             color=alt.Color(
                 "direction:N", title=None,
                 scale=alt.Scale(domain=["▲ Over", "▼ Under"], range=["#4CAF50", "#F44336"]),
