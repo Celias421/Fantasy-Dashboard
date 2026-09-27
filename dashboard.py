@@ -12,6 +12,8 @@ import pandas as pd
 import streamlit as st
 
 import roster_store
+import slip_parser
+import slip_store
 import theme
 from config import CURRENT_SEASON, PROP_MARKET_MAP, TEAM_CITY, INDOOR_ROOF_STATES, ODDS_API_SAFETY_BUFFER
 from data_loader import (
@@ -316,17 +318,49 @@ def add_matchup_display(df: pd.DataFrame, home_away_lookup: pd.DataFrame) -> pd.
     return df
 
 
+def format_gametime(gametime) -> str:
+    """'HH:MM' (24h, Eastern) -> '1:00 PM'. Just the time, with no
+    weekday/date attached - used where the date is already shown
+    separately (the Matchups table's own Kickoff column, game-picker
+    labels) so the time isn't duplicated with format_kickoff()'s
+    "Sun 1:00 PM" form."""
+    if not gametime or pd.isna(gametime):
+        return ""
+    try:
+        return pd.Timestamp(f"2000-01-01 {gametime}").strftime("%-I:%M %p")
+    except (ValueError, TypeError):
+        return ""
+
+
+def format_kickoff(gameday, gametime) -> str:
+    """'gameday' (a date) and 'gametime' (a "HH:MM", 24h Eastern string) -
+    nflverse's schedule keeps them as two separate columns - combined into
+    one short label like "Sun 1:00 PM". Returns "" if either piece is
+    missing (a game far enough out that a time hasn't been set yet)."""
+    if pd.isna(gameday) or not gametime or pd.isna(gametime):
+        return ""
+    try:
+        ts = pd.Timestamp(f"{pd.Timestamp(gameday).strftime('%Y-%m-%d')} {gametime}")
+    except (ValueError, TypeError):
+        return ""
+    return ts.strftime("%a %-I:%M %p")
+
+
 def build_next_opponent_map(schedule: pd.DataFrame) -> pd.DataFrame:
-    """team -> next scheduled opponent + week + home/away, based on games
-    not yet played."""
+    """team -> next scheduled opponent + week + home/away + kickoff time,
+    based on games not yet played. Kickoff comes along for the ride so
+    every matchup label built from this map (cards, badges, lineup rows,
+    roster comparison) can show "Sun 1:00 PM" alongside the opponent
+    instead of just the week number."""
     upcoming = schedule[schedule["home_score"].isna()].sort_values("gameday")
     rows = []
     for _, g in upcoming.iterrows():
-        rows.append((g["home_team"], g["away_team"], g["week"], True))
-        rows.append((g["away_team"], g["home_team"], g["week"], False))
+        kickoff = format_kickoff(g.get("gameday"), g.get("gametime"))
+        rows.append((g["home_team"], g["away_team"], g["week"], True, kickoff))
+        rows.append((g["away_team"], g["home_team"], g["week"], False, kickoff))
     if not rows:
-        return pd.DataFrame(columns=["team", "opponent", "week", "is_home"])
-    next_opp = pd.DataFrame(rows, columns=["team", "opponent", "week", "is_home"])
+        return pd.DataFrame(columns=["team", "opponent", "week", "is_home", "kickoff"])
+    next_opp = pd.DataFrame(rows, columns=["team", "opponent", "week", "is_home", "kickoff"])
     return next_opp.drop_duplicates(subset="team", keep="first")
 
 
@@ -449,6 +483,7 @@ def _matchup_label(team: str, position: str, stat: str, next_opp_map: pd.DataFra
         return None
     opponent = opp_row["opponent"].iloc[0]
     is_home = bool(opp_row["is_home"].iloc[0])
+    kickoff = opp_row["kickoff"].iloc[0] if "kickoff" in opp_row.columns else ""
     dr = defense_ranks[(defense_ranks["position"] == position) & (defense_ranks["team"] == opponent)]
     if dr.empty:
         return None
@@ -456,7 +491,8 @@ def _matchup_label(team: str, position: str, stat: str, next_opp_map: pd.DataFra
     icon = raw_icon if plain else _icon_html(raw_icon)
     prefix = "vs" if is_home else "@"
     rank = int(dr[rank_col].iloc[0])
-    return f"{icon} {prefix} {opponent} — #{rank} toughest", rank
+    kickoff_text = f" ({kickoff})" if kickoff else ""
+    return f"{icon} {prefix} {opponent}{kickoff_text} — #{rank} toughest", rank
 
 
 def get_matchup_label(team: str, position: str, stat: str):
@@ -817,18 +853,19 @@ def compute_lineup_projections(roster_players: list) -> pd.DataFrame:
             rows.append({
                 "player": player, "position": "?", "team": "?", "opponent": None, "opponent_plain": None,
                 "season_avg": 0.0, "matchup_rank": None, "proj_points": 0.0,
-                "injury_status": None, "note": "Not tracked this season",
+                "injury_status": None, "note": "Not tracked this season", "headshot_url": None,
             })
             continue
         latest = pdf.sort_values(["season", "week"]).iloc[-1]
         position, team = latest["position"], latest["team"]
+        headshot_url = latest.get("headshot_url")
         season_avg, _, _, _ = compute_summary(pdf[pdf["season"] == CURRENT_SEASON], "fantasy_points_ppr")
 
         if team not in teams_this_week:
             rows.append({
                 "player": player, "position": position, "team": team, "opponent": None, "opponent_plain": None,
                 "season_avg": round(season_avg, 1), "matchup_rank": None, "proj_points": 0.0,
-                "injury_status": "Bye", "note": "Bye this week - not eligible to start",
+                "injury_status": "Bye", "note": "Bye this week - not eligible to start", "headshot_url": headshot_url,
             })
             continue
 
@@ -851,7 +888,7 @@ def compute_lineup_projections(roster_players: list) -> pd.DataFrame:
             "opponent": matchup[0] if matchup else None,
             "opponent_plain": matchup_plain[0] if matchup_plain else None,
             "season_avg": round(season_avg, 1), "matchup_rank": rank, "proj_points": proj,
-            "injury_status": inj_status, "note": note,
+            "injury_status": inj_status, "note": note, "headshot_url": headshot_url,
         })
     return pd.DataFrame(rows)
 
@@ -949,9 +986,24 @@ def render_lineup_tab():
         # True in Python - a plain "if row['injury_status']" check would
         # print the literal word "nan" for every healthy player.
         inj = f" · {row['injury_status']}" if pd.notna(row["injury_status"]) else ""
+
+        photo = sized_headshot(row["headshot_url"], 104) if pd.notna(row.get("headshot_url")) else ""
+        img_tag = (
+            f'<img src="{photo}" width="104" height="104" style="border-radius:50%; object-fit:cover; flex-shrink:0;" '
+            f'onerror="this.style.display=\'none\'"/>' if photo else ""
+        )
         st.markdown(
-            f"**{slot_label}** — {row['player']} ({row['team']}) {badge}  \n"
-            f"Proj **{row['proj_points']}** pts · season avg {row['season_avg']}{inj}",
+            f"""
+            <div class="player-card" style="display:flex; align-items:center; gap:16px;">
+                {img_tag}
+                <div>
+                    <div style="font-size:13px; color:{theme.SUB}; text-transform:uppercase; letter-spacing:.03em;">{slot_label}</div>
+                    <div style="font-size:19px; font-weight:700;">{row['player']} <span style="font-weight:400; color:{theme.SUB};">({team_logo_html(row['team'])}{row['team']})</span></div>
+                    <div style="margin-top:4px;">{badge}</div>
+                    <div style="margin-top:4px; color:{theme.SUB};">Proj <b style="color:{theme.INK};">{row['proj_points']}</b> pts · season avg {row['season_avg']}{inj}</div>
+                </div>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
 
@@ -992,7 +1044,7 @@ def render_lineup_tab():
             "Player": st.column_config.TextColumn(width=200),
             "Pos": st.column_config.TextColumn(width="small"),
             "Team": st.column_config.TextColumn(width="small"),
-            "Next opp": st.column_config.TextColumn(width=220),
+            "Next opp": st.column_config.TextColumn(width=270),
             "Proj": st.column_config.NumberColumn(width="small"),
             "Szn avg": st.column_config.NumberColumn(width="small"),
             "Opp rank": st.column_config.NumberColumn(width="small"),
@@ -1013,8 +1065,8 @@ if tab_side == "🏈 Fantasy Lineups":
         ["📋 Overview", "🔍 Player Deep Dive", "🩹 Injuries", "🗓️ Matchups", "👥 My Rosters", "🏆 Lineup Optimizer"]
     )
 else:
-    tab_props, tab_game = st.tabs(
-        ["🎯 Prop Comparator", "🏟️ Game Center"]
+    tab_props, tab_game, tab_slips = st.tabs(
+        ["🎯 Prop Comparator", "🏟️ Game Center", "🧾 Bet Slip Tracker"]
     )
 
 if st.session_state.pop("show_jump_toast", False):
@@ -1383,7 +1435,11 @@ if tab_side == "🏈 Fantasy Lineups":
 
         schedule_all = get_schedule().copy()
         schedule_all["gameday_fmt"] = pd.to_datetime(schedule_all["gameday"]).dt.strftime("%a %-m/%-d")
-        schedule_all["game_label"] = schedule_all["gameday_fmt"] + " — " + schedule_all["away_team"] + " @ " + schedule_all["home_team"]
+        schedule_all["gametime_fmt"] = schedule_all["gametime"].apply(format_gametime) if "gametime" in schedule_all.columns else ""
+        schedule_all["game_label"] = (
+            schedule_all["gameday_fmt"] + (" " + schedule_all["gametime_fmt"]).where(schedule_all["gametime_fmt"] != "", "")
+            + " — " + schedule_all["away_team"] + " @ " + schedule_all["home_team"]
+        )
         # team_logos/team_logo_html are defined once near the top of the file
         # (right after current_season_df) and reused everywhere a team shows up.
 
@@ -1443,7 +1499,7 @@ if tab_side == "🏈 Fantasy Lineups":
                 rows.append({
                     "day_name": pd.Timestamp(g["gameday"]).day_name() if pd.notna(g.get("gameday")) else "TBD",
                     "gameday": g.get("gameday"),
-                    "Kickoff": g.get("gameday_fmt", ""),
+                    "Kickoff": (g.get("gameday_fmt", "") + (" " + g["gametime_fmt"] if g.get("gametime_fmt") else "")).strip(),
                     "Away Logo": team_logos.get(away),
                     "Away": away,
                     "Home Logo": team_logos.get(home),
@@ -1506,7 +1562,7 @@ if tab_side == "🏈 Fantasy Lineups":
                 "Implied Away", "Implied Home", "Roof", "Weather", "Weather Risk", "Result",
             ]
             column_config = {
-                "Kickoff": st.column_config.TextColumn(width=150),
+                "Kickoff": st.column_config.TextColumn(width=175),
                 "Away Logo": st.column_config.ImageColumn(" ", width=80),
                 "Away": st.column_config.TextColumn(width="small"),
                 "Home Logo": st.column_config.ImageColumn(" ", width=80),
@@ -1670,7 +1726,11 @@ else:
         schedule = get_schedule()
         schedule = schedule.copy()
         schedule["gameday_fmt"] = pd.to_datetime(schedule["gameday"]).dt.strftime("%a %-m/%-d")
-        schedule["game_label"] = schedule["gameday_fmt"] + " — " + schedule["away_team"] + " @ " + schedule["home_team"]
+        schedule["gametime_fmt"] = schedule["gametime"].apply(format_gametime) if "gametime" in schedule.columns else ""
+        schedule["game_label"] = (
+            schedule["gameday_fmt"] + (" " + schedule["gametime_fmt"]).where(schedule["gametime_fmt"] != "", "")
+            + " — " + schedule["away_team"] + " @ " + schedule["home_team"]
+        )
 
         upcoming = schedule[schedule["home_score"].isna()]
         default_week = int(upcoming["week"].min()) if not upcoming.empty else int(schedule["week"].max())
@@ -1713,6 +1773,9 @@ else:
 
             gm1, gm2, gm3, gm4 = st.columns(4)
             gm1.metric("Matchup", f"{away} @ {home}")
+            kickoff_full = format_kickoff(game_row.get("gameday"), game_row.get("gametime"))
+            if kickoff_full:
+                gm1.caption(f"Kickoff: {kickoff_full}")
             if pd.notna(game_row.get("spread_line")):
                 fav = home if game_row["spread_line"] < 0 else away
                 gm2.metric("Spread", f"{fav} {-abs(game_row['spread_line']):.1f}")
@@ -1763,4 +1826,189 @@ else:
                         st.info("No tracked starters with data for this team yet.")
                     else:
                         render_player_cards(team_summary, sort_stat, cols_per_row=2)
+
+    # ---------------- Bet Slip Tracker (OCR-assisted manual entry) ----------------
+    with tab_slips:
+        st.subheader("Bet Slip Tracker")
+        cap_col, info_col = st.columns([5, 1])
+        with cap_col:
+            st.caption("Drop a bet-slip screenshot to pre-fill the form below, then review and save - builds a running history for performance tracking.")
+        with info_col:
+            theme.info_popover(
+                "**How the auto-fill works:** the screenshot is read with local OCR (no API key, no cost, "
+                "nothing uploaded anywhere) and matched against common sportsbook-app wording to guess the "
+                "sportsbook, bet type, odds, stake, payout, and individual legs. OCR on stylized app "
+                "screenshots is never perfect - always double-check the fields (and the raw text it found, "
+                "in the expander) before saving. The image itself isn't kept; only what you save from the "
+                "form below is stored.",
+                label="ℹ️ How this works",
+            )
+
+        if slip_store.using_local_fallback(st.secrets):
+            err = slip_store.last_connection_error()
+            st.warning(
+                "Google Sheets isn't configured yet, so bet slips are being saved to this app's local disk "
+                "instead - that storage does NOT survive the next code deploy. See README to set up the "
+                "Sheets connection before relying on this for real."
+                + (f"\n\n**Reason:** `{err}`" if err else ""),
+                icon="⚠️",
+            )
+
+        st.markdown("#### Add a bet slip")
+        uploaded = st.file_uploader(
+            "Drop a bet-slip screenshot (or click to browse)",
+            type=["png", "jpg", "jpeg", "webp"], key="slip_upload",
+        )
+
+        parsed = {"sportsbook": "Other", "bet_type": "Single", "stake": 0.0, "potential_payout": 0.0, "odds": "", "legs": []}
+        if uploaded is not None:
+            with st.spinner("Reading the screenshot..."):
+                ocr_text = slip_parser.ocr_image_to_text(uploaded.getvalue())
+            if ocr_text.strip():
+                parsed = slip_parser.parse_slip_text(ocr_text)
+                st.success("Read the screenshot - check the fields below before saving (OCR isn't perfect).", icon="✅")
+                with st.expander("Raw text OCR found (for double-checking)"):
+                    st.text(ocr_text)
+            else:
+                st.warning("Couldn't read any text from that image - fill in the fields manually below.", icon="⚠️")
+
+        with st.form("slip_entry_form", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                slip_date = st.date_input("Date placed", value=datetime.date.today())
+                sb_index = slip_store.SPORTSBOOKS.index(parsed["sportsbook"]) if parsed["sportsbook"] in slip_store.SPORTSBOOKS else len(slip_store.SPORTSBOOKS) - 1
+                sportsbook = st.selectbox("Sportsbook", slip_store.SPORTSBOOKS, index=sb_index)
+            with c2:
+                bt_index = slip_store.BET_TYPES.index(parsed["bet_type"]) if parsed["bet_type"] in slip_store.BET_TYPES else 0
+                bet_type = st.selectbox("Bet type", slip_store.BET_TYPES, index=bt_index)
+                odds = st.text_input("Odds (American, e.g. +450 or -110)", value=parsed["odds"])
+            with c3:
+                stake = st.number_input("Stake ($)", min_value=0.0, value=float(parsed["stake"]), step=1.0)
+                potential_payout = st.number_input("Potential payout ($)", min_value=0.0, value=float(parsed["potential_payout"]), step=1.0)
+
+            legs_text = st.text_area(
+                "Legs (one per line)", value="\n".join(parsed["legs"]),
+                placeholder="Josh Allen Over 249.5 Passing Yards\nCeeDee Lamb Anytime TD",
+                height=120,
+            )
+            notes = st.text_input("Notes (optional)")
+            submitted = st.form_submit_button("💾 Save slip", type="primary")
+            if submitted:
+                if stake <= 0:
+                    st.error("Enter a stake before saving.")
+                else:
+                    new_slip = {
+                        "id": str(uuid.uuid4()),
+                        "date": slip_date.isoformat(),
+                        "sportsbook": sportsbook,
+                        "bet_type": bet_type,
+                        "legs": [l.strip() for l in legs_text.splitlines() if l.strip()],
+                        "odds": odds.strip(),
+                        "stake": stake,
+                        "potential_payout": potential_payout,
+                        "result": "Pending",
+                        "actual_payout": 0.0,
+                        "notes": notes.strip(),
+                    }
+                    ok, msg = slip_store.save_slip(st.secrets, new_slip)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+        st.divider()
+        st.subheader("Slip history & performance")
+
+        slips = slip_store.load_slips(st.secrets)
+        if not slips:
+            st.info("No bet slips tracked yet - add your first one above.")
+        else:
+            hist_df = pd.DataFrame(slips)
+
+            def _profit(row):
+                if row["result"] == "Won":
+                    return row["actual_payout"] - row["stake"]
+                if row["result"] == "Lost":
+                    return -row["stake"]
+                if row["result"] == "Cashed Out":
+                    return row["actual_payout"] - row["stake"]
+                return 0.0  # Pending or Push
+
+            hist_df["profit"] = hist_df.apply(_profit, axis=1)
+            settled = hist_df[hist_df["result"].isin(["Won", "Lost"])]
+            total_staked = hist_df["stake"].sum()
+            total_profit = hist_df["profit"].sum()
+            win_rate = (settled["result"] == "Won").mean() * 100 if not settled.empty else None
+            roi = (total_profit / total_staked * 100) if total_staked else 0.0
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total staked", f"${total_staked:,.2f}")
+            m2.metric("Total profit/loss", f"${total_profit:,.2f}")
+            m3.metric("Win rate", f"{win_rate:.0f}%" if win_rate is not None else "—")
+            m3.caption(f"{len(settled)} settled bet(s)" if not settled.empty else "No settled bets yet")
+            m4.metric("ROI", f"{roi:.1f}%")
+
+            settled_sorted = hist_df[hist_df["result"].isin(["Won", "Lost", "Cashed Out"])].sort_values("date").copy()
+            if not settled_sorted.empty:
+                settled_sorted["cumulative_profit"] = settled_sorted["profit"].cumsum()
+                profit_chart = alt.Chart(settled_sorted).mark_line(point=True, color=theme.ACCENT).encode(
+                    x=alt.X("date:T", title="Date"),
+                    y=alt.Y("cumulative_profit:Q", title="Cumulative profit ($)"),
+                    tooltip=["date", "sportsbook", "result", alt.Tooltip("profit:Q", format="$.2f"), alt.Tooltip("cumulative_profit:Q", format="$.2f", title="Running total")],
+                ).properties(height=240)
+                st.altair_chart(profit_chart, use_container_width=True)
+
+            st.markdown("#### Update results")
+            st.caption("Change a slip's result (and actual payout, once it's settled) as bets play out, then save.")
+            edit_df = hist_df[[
+                "id", "date", "sportsbook", "bet_type", "legs", "odds",
+                "stake", "potential_payout", "result", "actual_payout", "notes",
+            ]].copy()
+            edit_df["legs"] = edit_df["legs"].apply(lambda l: "; ".join(l) if isinstance(l, list) else "")
+
+            edited = st.data_editor(
+                edit_df,
+                use_container_width=True, hide_index=True, key="slip_editor", row_height=40,
+                column_order=["date", "sportsbook", "bet_type", "legs", "odds", "stake", "potential_payout", "result", "actual_payout", "notes"],
+                column_config={
+                    "id": st.column_config.TextColumn(disabled=True),
+                    "date": st.column_config.TextColumn(disabled=True, width="small"),
+                    "sportsbook": st.column_config.TextColumn(disabled=True, width="small"),
+                    "bet_type": st.column_config.TextColumn(disabled=True, width="small"),
+                    "legs": st.column_config.TextColumn(disabled=True, width=280),
+                    "odds": st.column_config.TextColumn(disabled=True, width="small"),
+                    "stake": st.column_config.NumberColumn(disabled=True, width="small", format="$%.2f"),
+                    "potential_payout": st.column_config.NumberColumn(disabled=True, width="small", format="$%.2f", label="Potential"),
+                    "result": st.column_config.SelectboxColumn(options=slip_store.RESULTS, width="small"),
+                    "actual_payout": st.column_config.NumberColumn(width="small", format="$%.2f", label="Actual payout"),
+                    "notes": st.column_config.TextColumn(disabled=True, width=180),
+                },
+            )
+
+            if st.button("💾 Save result updates"):
+                by_id = {s["id"]: s for s in slips}
+                changed = 0
+                for _, row in edited.iterrows():
+                    original = by_id.get(row["id"])
+                    if original is None:
+                        continue
+                    if row["result"] != original["result"] or float(row["actual_payout"]) != float(original["actual_payout"]):
+                        original["result"] = row["result"]
+                        original["actual_payout"] = float(row["actual_payout"])
+                        slip_store.save_slip(st.secrets, original)
+                        changed += 1
+                if changed:
+                    st.success(f"Updated {changed} slip(s).")
+                    st.rerun()
+                else:
+                    st.info("No changes to save.")
+
+            with st.expander("Delete a slip"):
+                slip_labels = {s["id"]: f"{s['date']} · {s['sportsbook']} · {s['bet_type']} · ${s['stake']:.2f} · {s['result']}" for s in slips}
+                del_id = st.selectbox("Slip", list(slip_labels.keys()), format_func=lambda i: slip_labels[i], key="slip_delete_pick")
+                if st.button("🗑️ Delete this slip"):
+                    slip_store.delete_slip(st.secrets, del_id)
+                    st.success("Deleted.")
+                    st.rerun()
 
