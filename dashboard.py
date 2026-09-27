@@ -991,7 +991,7 @@ def render_lineup_tab():
 
 
 tab_side = st.radio(
-    "Site section", ["🏈 Fantasy Lineups", "🎯 Prop Bets"],
+    "Site section", ["🏈 Fantasy Lineups", "🎯 Prop Bets", "🔥 Hot Picks"],
     horizontal=True, key="site_side", label_visibility="collapsed",
 )
 st.divider()
@@ -1000,10 +1000,12 @@ if tab_side == "🏈 Fantasy Lineups":
     tab_overview, tab_deep_dive, tab_injuries, tab_matchups, tab_rosters, tab_lineup = st.tabs(
         ["📋 Overview", "🔍 Player Deep Dive", "🩹 Injuries", "🗓️ Matchups", "👥 My Rosters", "🏆 Lineup Optimizer"]
     )
-else:
+elif tab_side == "🎯 Prop Bets":
     tab_props, tab_firsttd, tab_game, tab_slips = st.tabs(
         ["🎯 Prop Comparator", "🥇 First TD", "🏟️ Game Center", "🧾 Bet Slip Tracker"]
     )
+# 🔥 Hot Picks has no sub-tabs of its own - it's one combined scouting page,
+# rendered further down in its own `elif tab_side == "🔥 Hot Picks":` branch.
 
 if st.session_state.pop("show_jump_toast", False):
     # Set by the Matchups tab's "Open in Game Center" button (see
@@ -1556,7 +1558,7 @@ if tab_side == "🏈 Fantasy Lineups":
     # ---------------- Lineup Optimizer ----------------
     with tab_lineup:
         render_lineup_tab()
-else:
+elif tab_side == "🎯 Prop Bets":
     # ---------------- Prop Comparator (current season only) ----------------
     with tab_props:
         st.subheader("Player Prop Line Comparator")
@@ -2103,10 +2105,181 @@ else:
                     slip_store.delete_slip(st.secrets, del_id)
                     st.success("Deleted.")
                     st.rerun()
+else:
+    # ---------------- Hot Picks (league-wide scouting view) ----------------
+    # One combined page, not sub-tabs - three curated leaderboards built
+    # from the exact same live data (and the exact same helper functions:
+    # compute_summary, _matchup_label, get_prop_lines, get_anytime_td_odds,
+    # get_first_td_odds) as the rest of the site, so a "hot pick" here is
+    # never a separate/stale computation from what the Overview or First TD
+    # tabs would tell you about the same player.
+    st.subheader("🔥 Hot Picks")
+    st.caption(
+        "A league-wide scouting view, refreshed from the same live data as the rest of the site: the biggest "
+        "prop-line edges, the best touchdown-scoring chances, and the safest high-floor + favorable-matchup "
+        "plays. Every number here is explained in more depth on its own tab elsewhere in the app."
+    )
 
+    hp1, hp2 = st.columns(2)
+    with hp1:
+        hot_positions = st.multiselect(
+            "Position", ["QB", "RB", "WR", "TE"], default=["QB", "RB", "WR", "TE"], key="hot_positions",
+        )
+    with hp2:
+        hot_teams = st.multiselect("Team", sorted(current_season_df["team"].dropna().unique()), default=[], key="hot_teams")
 
-# Runs after the Fantasy Lineups / Prop Bets if-else above completes, so
-# this shows once at the true bottom of the page on every tab and every
-# sub-tab, regardless of which side is active.
+    hot_view = current_season_df[current_season_df["position"].isin(hot_positions)] if hot_positions else current_season_df
+    if hot_teams:
+        hot_view = hot_view[hot_view["team"].isin(hot_teams)]
+
+    hp_defense_ranks = get_defense_ranks()
+    hp_next_opp_map = build_next_opponent_map(get_schedule())
+    hp_prop_lines = get_prop_lines()
+    hp_anytime_td = get_anytime_td_odds()
+    hp_first_td = get_first_td_odds()
+    hp_injuries = get_injuries()
+
+    edge_rows = []
+    td_rows = []
+    matchup_rows = []
+
+    for player, pdf in hot_view.groupby("player"):
+        first_row = pdf.iloc[0]
+        team = first_row["team"]
+        position = first_row["position"]
+        headshot_url = first_row.get("headshot_url")
+        team_color = first_row.get("team_color") or "#444444"
+
+        # Skip players who are ruled Out this week for every section - a
+        # "hot pick" that literally can't take the field isn't useful,
+        # whichever of the three lists it would otherwise land on.
+        inj_row = hp_injuries[hp_injuries["player"] == player] if not hp_injuries.empty else pd.DataFrame()
+        if not inj_row.empty and inj_row["report_status"].iloc[0] == "Out":
+            continue
+
+        # ---- Biggest prop-line edge: check every stat this position has a
+        # live market for, keep whichever one has the largest |avg - line|
+        # (one row per player, not one row per stat, so a player with
+        # several tracked markets doesn't crowd out everyone else). ----
+        best_edge = None
+        for stat in PROP_STATS_BY_POSITION.get(position, []):
+            market = PROP_MARKET_MAP.get(stat)
+            if not market or stat not in pdf.columns or hp_prop_lines.empty:
+                continue
+            match = hp_prop_lines[(hp_prop_lines["player"] == player) & (hp_prop_lines["market"] == market)]
+            if match.empty:
+                continue
+            avg_val = pdf[stat].mean()
+            line_val = float(match["point"].iloc[0])
+            delta = avg_val - line_val
+            if best_edge is None or abs(delta) > abs(best_edge["delta"]):
+                best_edge = {"stat": stat, "avg": avg_val, "line": line_val, "delta": delta}
+        if best_edge:
+            edge_rows.append({
+                "player": player, "team": team, "position": position,
+                "headshot_url": headshot_url, "team_color": team_color,
+                "stat": best_edge["stat"].replace("_", " ").title(),
+                "season_avg": round(best_edge["avg"], 1),
+                "prop_line": round(best_edge["line"], 1),
+                "edge": round(best_edge["delta"], 1),
+                "direction": "▲ Over" if best_edge["delta"] > 0 else "▼ Under",
+            })
+
+        # ---- Best TD scoring chances: anytime + first TD side by side ----
+        anytime_match = hp_anytime_td[hp_anytime_td["player"] == player] if not hp_anytime_td.empty else pd.DataFrame()
+        first_match = hp_first_td[hp_first_td["player"] == player] if not hp_first_td.empty else pd.DataFrame()
+        anytime_pct = float(anytime_match["implied_prob"].iloc[0]) if not anytime_match.empty else None
+        first_pct = float(first_match["implied_prob"].iloc[0]) if not first_match.empty else None
+        if anytime_pct is not None or first_pct is not None:
+            td_rows.append({
+                "player": player, "team": team, "position": position,
+                "headshot_url": headshot_url, "team_color": team_color,
+                "anytime_td_pct": anytime_pct, "first_td_pct": first_pct,
+            })
+
+        # ---- Safe plays: High consistency + a favorable upcoming matchup ----
+        avg_fp, _, _, consistency = compute_summary(pdf, "fantasy_points_ppr")
+        # plain=True: this lands in a st.dataframe cell below, which shows
+        # HTML source literally instead of rendering it (same reasoning as
+        # add_matchup_display's separate plain-text column elsewhere).
+        matchup_result = _matchup_label(team, position, "fantasy_points_ppr", hp_next_opp_map, hp_defense_ranks, plain=True)
+        if consistency == "High" and matchup_result:
+            matchup_label, matchup_rank = matchup_result
+            matchup_rows.append({
+                "player": player, "team": team, "position": position,
+                "headshot_url": headshot_url, "team_color": team_color,
+                "matchup_label": matchup_label, "matchup_rank": matchup_rank,
+                "season_avg_ppr": round(avg_fp, 1),
+            })
+
+    section1, section2, section3 = st.columns(3)
+    section1.metric("Prop Edges Found", len(edge_rows))
+    section2.metric("TD Chances Tracked", len(td_rows))
+    section3.metric("High-Consistency Favorable Matchups", len(matchup_rows))
+    st.divider()
+
+    # ---- Section 1: Biggest Prop-Line Edges ----
+    st.markdown("##### 📈 Biggest Prop-Line Edges")
+    st.caption("Season average vs. the live sportsbook line, for whichever tracked stat shows the biggest gap for that player.")
+    if not edge_rows:
+        st.info("No live prop lines available right now to compare against - try \"Refresh prop lines now\" on the Prop Bets side.")
+    else:
+        edge_df = pd.DataFrame(edge_rows).sort_values("edge", key=abs, ascending=False).head(15)
+        edge_display = edge_df[["player", "team", "position", "stat", "season_avg", "prop_line", "edge", "direction"]].rename(columns={
+            "player": "Player", "team": "Team", "position": "Pos", "stat": "Stat",
+            "season_avg": f"{CURRENT_SEASON} Avg", "prop_line": "Prop Line", "edge": "Edge", "direction": "Direction",
+        })
+        st.dataframe(
+            edge_display, use_container_width=True, hide_index=True, row_height=38,
+            column_config={"Edge": st.column_config.NumberColumn(format="%+.1f")},
+        )
+
+    st.divider()
+
+    # ---- Section 2: Best TD Scoring Chances ----
+    st.markdown("##### 🎯 Best TD Scoring Chances")
+    st.caption("Market-implied probability (includes the sportsbook's margin) of scoring any touchdown, and specifically the first one, this week.")
+    if not td_rows:
+        st.info("No live TD odds available right now - try \"Refresh prop lines now\" on the Prop Bets side.")
+    else:
+        td_df = pd.DataFrame(td_rows)
+        td_df["_sort"] = td_df[["anytime_td_pct", "first_td_pct"]].max(axis=1, skipna=True)
+        td_df = td_df.sort_values("_sort", ascending=False).head(15)
+        td_display = td_df[["player", "team", "position", "anytime_td_pct", "first_td_pct"]].rename(columns={
+            "player": "Player", "team": "Team", "position": "Pos",
+            "anytime_td_pct": "Anytime TD %", "first_td_pct": "First TD %",
+        })
+        st.dataframe(
+            td_display, use_container_width=True, hide_index=True, row_height=38,
+            column_config={
+                "Anytime TD %": st.column_config.NumberColumn(format="%.0f%%"),
+                "First TD %": st.column_config.NumberColumn(format="%.0f%%"),
+            },
+        )
+
+    st.divider()
+
+    # ---- Section 3: Safe Plays (High Consistency + Favorable Matchup) ----
+    st.markdown("##### 🛡️ Safe Plays — High Consistency + Favorable Matchup")
+    st.caption("Reliable, low-variance scorers (season coefficient of variation under 25%) facing the easiest matchups at their position/stat.")
+    if not matchup_rows:
+        st.info("No players currently match both a High consistency rating and a favorable upcoming matchup.")
+    else:
+        matchup_df = pd.DataFrame(matchup_rows).sort_values("matchup_rank", ascending=False).head(15)
+        matchup_display = matchup_df[["player", "team", "position", "matchup_label", "season_avg_ppr"]].rename(columns={
+            "player": "Player", "team": "Team", "position": "Pos",
+            "matchup_label": "Matchup", "season_avg_ppr": f"{CURRENT_SEASON} Avg PPR",
+        })
+        st.dataframe(matchup_display, use_container_width=True, hide_index=True, row_height=38)
+
+    st.caption(
+        "All percentages and lines are live betting-market data, including the sportsbook's margin - not Prop "
+        "Shop projections. \"Edge\" and \"Matchup\" figures reuse the exact same calculations as the Overview, "
+        "Prop Comparator, and First TD tabs."
+    )
+
+# Runs after the Fantasy Lineups / Prop Bets / Hot Picks if-elif-else above
+# completes, so this shows once at the true bottom of the page on every
+# tab and every sub-tab, regardless of which side is active.
 theme.render_footer()
 
