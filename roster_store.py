@@ -13,9 +13,42 @@ Google Sheets setup is done - just without cross-redeploy persistence.
 
 import json
 import os
+import threading
 
 MAX_ROSTERS = 10
 LOCAL_FALLBACK_PATH = "data/rosters_local.json"
+
+# Hard ceiling on how long we'll wait for Google Sheets before giving up and
+# falling back to local storage. Without this, a slow/hanging network call
+# to Google's API (bad credentials, DNS hiccup, Google-side slowness) would
+# block the ENTIRE app from ever loading - which is exactly what happened on
+# the first deploy after adding this feature: the app defaults to showing
+# the Fantasy Lineups side on every load, which immediately calls into this
+# module, so a hang here is a hang for every single visitor, forever.
+_SHEETS_TIMEOUT_SECONDS = 8
+
+
+def _with_timeout(fn, *args, default=None):
+    """Runs fn(*args) on a background thread and gives up after
+    _SHEETS_TIMEOUT_SECONDS, returning `default` instead of hanging. Uses a
+    plain daemon thread (not a ThreadPoolExecutor) specifically so that if
+    the call truly never returns, the leftover thread can't block process
+    shutdown or pile up as a permanently-alive non-daemon thread - it just
+    gets abandoned and garbage collected whenever it eventually finishes."""
+    box = {}
+
+    def runner():
+        try:
+            box["result"] = fn(*args)
+        except Exception:
+            pass  # leave box empty -> caller sees the timeout/failure default
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join(timeout=_SHEETS_TIMEOUT_SECONDS)
+    if "result" not in box:
+        return default
+    return box["result"]
 
 
 def _local_load() -> list:
@@ -32,12 +65,12 @@ def _local_save(rosters: list) -> None:
         json.dump(rosters, f, indent=2)
 
 
-def _sheets_client(st_secrets):
-    """Returns an authorized gspread client + worksheet, or None if the
-    Google Sheets secrets aren't configured. Kept as a function (not
-    module-level) so it's only attempted when actually needed, and so a
-    misconfigured/missing credential never crashes app startup - the
-    local fallback silently takes over instead."""
+def _sheets_client_uncapped(st_secrets):
+    """The real logic - see _sheets_client below for why this is never
+    called directly. Can block for an arbitrary amount of time on the
+    gspread.authorize()/open_by_key() network calls if Google's API (or the
+    credentials) are slow/misconfigured; callers must go through the
+    timeout wrapper."""
     try:
         service_account_info = st_secrets.get("GOOGLE_SERVICE_ACCOUNT")
         sheet_id = st_secrets.get("ROSTER_SHEET_ID")
@@ -58,6 +91,16 @@ def _sheets_client(st_secrets):
         return worksheet
     except Exception:
         return None
+
+
+def _sheets_client(st_secrets):
+    """Returns an authorized gspread client + worksheet, or None if the
+    Google Sheets secrets aren't configured OR the connection attempt took
+    too long (see _SHEETS_TIMEOUT_SECONDS above). Kept as a function (not
+    module-level) so it's only attempted when actually needed, and so a
+    misconfigured/missing/slow credential never hangs or crashes app
+    startup - the local fallback silently takes over instead."""
+    return _with_timeout(_sheets_client_uncapped, st_secrets, default=None)
 
 
 def _sheets_load(worksheet) -> list:
@@ -88,10 +131,10 @@ def load_rosters(st_secrets) -> list:
     falls back to the local file (or an empty list on first-ever run)."""
     worksheet = _sheets_client(st_secrets)
     if worksheet is not None:
-        try:
-            return _sheets_load(worksheet)
-        except Exception:
-            pass  # fall through to local
+        rosters = _with_timeout(_sheets_load, worksheet, default=None)
+        if rosters is not None:
+            return rosters
+        # fall through to local - either the call raised or it timed out
     return _local_load()
 
 
@@ -109,11 +152,11 @@ def save_roster(st_secrets, roster_id: str, name: str, players: list) -> tuple:
 
     worksheet = _sheets_client(st_secrets)
     if worksheet is not None:
-        try:
-            _sheets_save(worksheet, rosters)
+        _FAILED = object()  # sentinel - _sheets_save's real return is None on success
+        result = _with_timeout(lambda: _sheets_save(worksheet, rosters) or True, default=_FAILED)
+        if result is not _FAILED:
             return True, "Saved."
-        except Exception:
-            pass  # fall through to local so the edit isn't lost outright
+        # fall through to local so the edit isn't lost outright
     _local_save(rosters)
     return True, "Saved locally (Google Sheets isn't configured yet - see README - so this won't survive a redeploy)."
 
@@ -122,11 +165,10 @@ def delete_roster(st_secrets, roster_id: str) -> None:
     rosters = [r for r in load_rosters(st_secrets) if r["id"] != roster_id]
     worksheet = _sheets_client(st_secrets)
     if worksheet is not None:
-        try:
-            _sheets_save(worksheet, rosters)
+        _FAILED = object()
+        result = _with_timeout(lambda: _sheets_save(worksheet, rosters) or True, default=_FAILED)
+        if result is not _FAILED:
             return
-        except Exception:
-            pass
     _local_save(rosters)
 
 
