@@ -36,6 +36,13 @@ DB_PATH = "data/fantasy.db"
 # season average the same way.
 ANYTIME_TD_MARKET = "player_anytime_td"
 
+# Same yes/no shape as ANYTIME_TD_MARKET (odds, not a line), but for
+# specifically being the FIRST player to score in the game - a much
+# narrower, more concentrated bet than "any" TD, and worth its own page
+# (see render_first_td_tab in dashboard.py) rather than folding into the
+# anytime-TD badge everywhere else.
+FIRST_TD_MARKET = "player_1st_td"
+
 # Safety margin, in Odds API usage credits, to always keep in reserve.
 # Before spending anything on player-prop odds, the app checks the
 # quota-remaining count the API reports and skips pulling odds entirely
@@ -49,6 +56,7 @@ PROP_MARKET_MAP = {
     "rushing_yards": "player_rush_yds",
     "receiving_yards": "player_reception_yds",
     "passing_tds": "player_pass_tds",
+    "receptions": "player_receptions",
 }
 
 # Home city for each team's stadium, used to look up game-day weather via
