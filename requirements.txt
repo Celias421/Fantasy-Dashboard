@@ -2,3 +2,5 @@ streamlit
 nflreadpy
 pandas
 altair
+gspread
+google-auth
