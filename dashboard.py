@@ -2231,20 +2231,41 @@ else:
     # not a close-values comparison a bar would read better. Every other
     # chart on this page is a magnitude comparison (biggest edge, highest
     # odds, best matchup), which a bar chart shows more precisely than a
-    # pie ever could - so this is deliberately the only donut here. ----
+    # pie ever could - so this is deliberately the only donut here.
+    #
+    # Clickable: an Altair point selection on the "position" field, wired
+    # through Streamlit's on_select="rerun", turns a click into a rerun with
+    # the clicked position(s) in donut_event.selection["pos_click"]. That
+    # drives the "Suggested Bets" panel just below, which pulls together
+    # whatever this player shows up as across the three sections (prop
+    # edge / TD chances / safe play) rather than a separate computation -
+    # shift/cmd-click adds another slice, clicking a selected slice again
+    # clears it (toggle=True), and clicking empty space clears the whole
+    # selection (empty=True treats "nothing selected" as "show everything"
+    # on the donut itself, which is why the opacity dims only once
+    # something IS selected). ----
+    edge_lookup = {r["player"]: r for r in edge_rows}
+    td_lookup = {r["player"]: r for r in td_rows}
+    matchup_lookup = {r["player"]: r for r in matchup_rows}
+
     all_hot_players = {}
     for row in edge_rows + td_rows + matchup_rows:
         all_hot_players[row["player"]] = row["position"]
+    selected_positions: list[str] = []
     if all_hot_players:
         position_counts = pd.Series(list(all_hot_players.values())).value_counts().reset_index()
         position_counts.columns = ["position", "count"]
-        donut = alt.Chart(position_counts).mark_arc(innerRadius=70, cornerRadius=3, padAngle=0.015).encode(
+
+        pos_click = alt.selection_point(fields=["position"], name="pos_click", toggle=True, empty=True)
+
+        donut = alt.Chart(position_counts).mark_arc(innerRadius=70, cornerRadius=3, padAngle=0.015).add_params(pos_click).encode(
             theta=alt.Theta("count:Q", stack=True),
             color=alt.Color(
                 "position:N", title="Position",
                 scale=alt.Scale(domain=list(POSITION_COLORS.keys()), range=list(POSITION_COLORS.values())),
                 legend=alt.Legend(orient="right"),
             ),
+            opacity=alt.condition(pos_click, alt.value(1), alt.value(0.35)),
             order=alt.Order("position:N", sort="ascending"),
             tooltip=[
                 alt.Tooltip("position:N", title="Position"),
@@ -2260,13 +2281,66 @@ else:
         dcol1, dcol2 = st.columns([1, 2])
         with dcol1:
             st.markdown("###### This week's Hot Picks by position")
-            st.altair_chart(donut + donut_labels, use_container_width=True)
+            donut_event = st.altair_chart(
+                donut + donut_labels,
+                use_container_width=True,
+                on_select="rerun",
+                key="hotpicks_donut",
+            )
         with dcol2:
             st.markdown("###### ")
             st.caption(
                 f"{len(all_hot_players)} unique players appear in at least one list below - "
-                "the mix shows whether this week's hot picks skew toward a particular position."
+                "the mix shows whether this week's hot picks skew toward a particular position. "
+                "**Click a slice** to see that position's suggested bets (shift-click to add "
+                "another, click it again to clear)."
             )
+
+        if donut_event and donut_event.selection:
+            selected_positions = sorted({
+                point["position"] for point in donut_event.selection.get("pos_click", [])
+                if "position" in point
+            })
+
+    if selected_positions:
+        st.markdown(f"###### 🎯 Suggested Bets — {', '.join(selected_positions)}")
+        suggestion_rows = []
+        for player, position in all_hot_players.items():
+            if position not in selected_positions:
+                continue
+            edge = edge_lookup.get(player)
+            td = td_lookup.get(player)
+            matchup = matchup_lookup.get(player)
+            source = edge or td or matchup
+            if not source:
+                continue
+            bets = []
+            if edge:
+                bets.append(
+                    f"{edge['direction']} {edge['prop_line']} {edge['stat']} "
+                    f"({CURRENT_SEASON} avg {edge['season_avg']}, edge {edge['edge']:+.1f})"
+                )
+            if td:
+                td_parts = []
+                if td["anytime_td_pct"] is not None:
+                    td_parts.append(f"Anytime TD {td['anytime_td_pct']:.0f}%")
+                if td["first_td_pct"] is not None:
+                    td_parts.append(f"First TD {td['first_td_pct']:.0f}%")
+                if td_parts:
+                    bets.append(" / ".join(td_parts))
+            if matchup:
+                bets.append(f"Safe play - {matchup['matchup_label']} matchup, {matchup['season_avg_ppr']} PPR avg")
+            suggestion_rows.append({
+                "Player": player,
+                "Pos": position,
+                "Team": source["team"],
+                "Suggested Bet(s)": " · ".join(bets) if bets else "—",
+            })
+        if suggestion_rows:
+            suggestion_df = pd.DataFrame(suggestion_rows).sort_values(["Pos", "Player"])
+            st.dataframe(suggestion_df, use_container_width=True, hide_index=True, row_height=40)
+        else:
+            st.info("No suggested bets found for that position this week.")
 
     st.divider()
 
