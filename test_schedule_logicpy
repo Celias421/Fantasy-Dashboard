@@ -1,0 +1,236 @@
+"""
+test_schedule_logic.py
+Regression tests for schedule_logic.py - pure schedule/bye-week/lineup
+logic pulled out of dashboard.py specifically so it's testable without a
+Streamlit runtime, live data, or network access (see that module's own
+docstring). Every fixture here is a small hand-built DataFrame; nothing
+in this file touches the real season data, Google Sheets, or the app.
+
+Run with: pytest tests/  (from the project root)
+"""
+
+import pandas as pd
+import pytest
+
+from schedule_logic import (
+    build_lineup_slots,
+    build_next_opponent_map,
+    format_gametime,
+    format_kickoff,
+    matchup_adjustment,
+    optimize_lineup,
+    teams_playing_this_week,
+)
+
+
+# ---- teams_playing_this_week ------------------------------------------
+
+def test_teams_playing_this_week_keeps_team_whose_game_already_finished():
+    """The Bijan Robinson bug: ATL's Thursday game already has a final
+    score while the rest of week 4 hasn't been played yet. ATL must still
+    count as playing week 4, not look like a bye."""
+    schedule = pd.DataFrame([
+        # Week 3 - fully played, should be ignored entirely.
+        {"week": 3, "gameday": "2026-09-25", "home_team": "ATL", "away_team": "CAR",
+         "home_score": 24, "away_score": 10},
+        # Week 4 - ATL's Thursday game already final...
+        {"week": 4, "gameday": "2026-10-02", "home_team": "ATL", "away_team": "TB",
+         "home_score": 20, "away_score": 17},
+        # ...but the rest of week 4 hasn't kicked off yet.
+        {"week": 4, "gameday": "2026-10-05", "home_team": "DET", "away_team": "NYJ",
+         "home_score": None, "away_score": None},
+        {"week": 4, "gameday": "2026-10-05", "home_team": "KC", "away_team": "MIA",
+         "home_score": None, "away_score": None},
+    ])
+    teams = teams_playing_this_week(schedule)
+    assert "ATL" in teams
+    assert "TB" in teams
+    assert teams == {"ATL", "TB", "DET", "NYJ", "KC", "MIA"}
+
+
+def test_teams_playing_this_week_excludes_true_bye_team():
+    """A team with no game at all in the current week (e.g. GB on a real
+    bye) must NOT show up in the set."""
+    schedule = pd.DataFrame([
+        {"week": 4, "gameday": "2026-10-05", "home_team": "DET", "away_team": "NYJ",
+         "home_score": None, "away_score": None},
+        {"week": 4, "gameday": "2026-10-05", "home_team": "KC", "away_team": "MIA",
+         "home_score": None, "away_score": None},
+    ])
+    teams = teams_playing_this_week(schedule)
+    assert "GB" not in teams
+    assert teams == {"DET", "NYJ", "KC", "MIA"}
+
+
+def test_teams_playing_this_week_empty_schedule_returns_empty_set():
+    schedule = pd.DataFrame(columns=["week", "gameday", "home_team", "away_team", "home_score", "away_score"])
+    assert teams_playing_this_week(schedule) == set()
+
+
+def test_teams_playing_this_week_all_games_played_returns_empty_set():
+    """Season's over (or every game in the sheet has a score) - there's no
+    "next" week left, so nobody is playing "this week" by this function's
+    definition."""
+    schedule = pd.DataFrame([
+        {"week": 18, "gameday": "2027-01-03", "home_team": "ATL", "away_team": "TB",
+         "home_score": 20, "away_score": 17},
+    ])
+    assert teams_playing_this_week(schedule) == set()
+
+
+# ---- build_next_opponent_map --------------------------------------------
+
+def test_build_next_opponent_map_skips_played_games_and_picks_soonest():
+    schedule = pd.DataFrame([
+        {"week": 3, "gameday": "2026-09-25", "home_team": "ATL", "away_team": "CAR",
+         "home_score": 24, "away_score": 10, "gametime": "13:00"},
+        {"week": 4, "gameday": "2026-10-05", "home_team": "ATL", "away_team": "KC",
+         "home_score": None, "away_score": None, "gametime": "13:00"},
+        {"week": 5, "gameday": "2026-10-12", "home_team": "ATL", "away_team": "MIA",
+         "home_score": None, "away_score": None, "gametime": "13:00"},
+    ])
+    next_opp = build_next_opponent_map(schedule)
+    atl_row = next_opp[next_opp["team"] == "ATL"].iloc[0]
+    assert atl_row["opponent"] == "KC"
+    assert atl_row["week"] == 4
+    assert bool(atl_row["is_home"]) is True
+
+    kc_row = next_opp[next_opp["team"] == "KC"].iloc[0]
+    assert kc_row["opponent"] == "ATL"
+    assert bool(kc_row["is_home"]) is False
+
+
+def test_build_next_opponent_map_empty_when_no_upcoming_games():
+    schedule = pd.DataFrame([
+        {"week": 3, "gameday": "2026-09-25", "home_team": "ATL", "away_team": "CAR",
+         "home_score": 24, "away_score": 10, "gametime": "13:00"},
+    ])
+    next_opp = build_next_opponent_map(schedule)
+    assert next_opp.empty
+    assert list(next_opp.columns) == ["team", "opponent", "week", "is_home", "kickoff"]
+
+
+# ---- build_lineup_slots --------------------------------------------------
+
+def test_build_lineup_slots_basic_counts_and_order():
+    settings = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1}
+    assert build_lineup_slots(settings) == ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX"]
+
+
+def test_build_lineup_slots_zero_count_is_omitted():
+    settings = {"QB": 1, "RB": 0, "WR": 3, "TE": 0, "FLEX": 2}
+    assert build_lineup_slots(settings) == ["QB", "WR", "WR", "WR", "FLEX", "FLEX"]
+
+
+def test_build_lineup_slots_missing_key_treated_as_zero():
+    # No "TE" key at all - should behave the same as TE: 0, not raise.
+    settings = {"QB": 1, "RB": 1, "WR": 1}
+    assert build_lineup_slots(settings) == ["QB", "RB", "WR"]
+
+
+# ---- matchup_adjustment --------------------------------------------------
+
+def test_matchup_adjustment_toughest_defense():
+    assert matchup_adjustment(1) == pytest.approx(0.85)
+
+
+def test_matchup_adjustment_easiest_defense():
+    assert matchup_adjustment(32) == pytest.approx(1.15)
+
+
+def test_matchup_adjustment_no_rank_is_neutral():
+    assert matchup_adjustment(None) == 1.0
+
+
+def test_matchup_adjustment_midpoint():
+    # Rank 16.5 would be the exact midpoint; use an integer rank close to
+    # it and just check it lands between the two extremes.
+    mid = matchup_adjustment(16)
+    assert 0.85 < mid < 1.15
+
+
+# ---- optimize_lineup -----------------------------------------------------
+
+def _proj_row(player, position, proj_points, injury_status=None):
+    return {"player": player, "position": position, "proj_points": proj_points, "injury_status": injury_status}
+
+
+def test_optimize_lineup_fills_flex_with_best_leftover():
+    proj_df = pd.DataFrame([
+        _proj_row("QB1", "QB", 20.0),
+        _proj_row("RB1", "RB", 18.0),
+        _proj_row("RB2", "RB", 9.0),
+        _proj_row("WR1", "WR", 15.0),
+        _proj_row("WR2", "WR", 10.0),
+        _proj_row("TE1", "TE", 8.0),
+        # Leftover RB has more points than leftover WR/TE - should win FLEX.
+        _proj_row("RB3", "RB", 11.0),
+    ])
+    slots = ["QB", "RB", "WR", "TE", "FLEX"]
+    lineup, bench, unfillable = optimize_lineup(proj_df, slots)
+
+    assert lineup["QB_0"]["player"] == "QB1"
+    assert lineup["RB_1"]["player"] == "RB1"
+    assert lineup["WR_2"]["player"] == "WR1"
+    assert lineup["TE_3"]["player"] == "TE1"
+    assert lineup["FLEX_4"]["player"] == "RB3"  # 11.0 beats WR2's 10.0
+    assert unfillable == []
+    assert "RB2" in bench["player"].values
+    assert "WR2" in bench["player"].values
+
+
+def test_optimize_lineup_excludes_out_and_bye_players():
+    proj_df = pd.DataFrame([
+        _proj_row("QB1", "QB", 25.0, injury_status="Out"),
+        _proj_row("QB2", "QB", 10.0, injury_status=None),
+        _proj_row("RB1", "RB", 20.0, injury_status="Bye"),
+        _proj_row("RB2", "RB", 5.0, injury_status=None),
+    ])
+    lineup, bench, unfillable = optimize_lineup(proj_df, ["QB", "RB"])
+
+    # Higher-scoring but Out/Bye players must be skipped entirely.
+    assert lineup["QB_0"]["player"] == "QB2"
+    assert lineup["RB_1"]["player"] == "RB2"
+    assert unfillable == []
+
+
+def test_optimize_lineup_keeps_questionable_players_eligible():
+    proj_df = pd.DataFrame([
+        _proj_row("QB1", "QB", 25.0, injury_status="Questionable"),
+    ])
+    lineup, bench, unfillable = optimize_lineup(proj_df, ["QB"])
+    assert lineup["QB_0"]["player"] == "QB1"
+
+
+def test_optimize_lineup_reports_unfillable_slot():
+    proj_df = pd.DataFrame([
+        _proj_row("QB1", "QB", 20.0),
+    ])
+    lineup, bench, unfillable = optimize_lineup(proj_df, ["QB", "RB"])
+    assert lineup["QB_0"]["player"] == "QB1"
+    assert lineup["RB_1"] is None
+    assert unfillable == ["RB"]
+
+
+# ---- format_gametime / format_kickoff ------------------------------------
+
+def test_format_gametime_basic():
+    assert format_gametime("13:00") == "1:00 PM"
+
+
+def test_format_gametime_missing_value_returns_empty_string():
+    assert format_gametime(None) == ""
+    assert format_gametime("") == ""
+    assert format_gametime(float("nan")) == ""
+
+
+def test_format_kickoff_basic():
+    assert format_kickoff("2026-10-04", "13:00") == "Sun 1:00 PM"
+
+
+def test_format_kickoff_missing_gametime_returns_empty_string():
+    assert format_kickoff("2026-10-05", None) == ""
+
+
+def test_format_kickoff_missing_gameday_returns_empty_string():
+    assert format_kickoff(None, "13:00") == ""

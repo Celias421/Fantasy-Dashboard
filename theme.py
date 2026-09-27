@@ -134,9 +134,10 @@ def inject_css() -> None:
     }}
 
     /* ---- Header / masthead --------------------------------------------- */
-    /* Logo is a transparent-background wordmark, centered and sized to
-       read clearly as a masthead on a desktop monitor - big enough to
-       anchor the page without needing to crop or distort the artwork. */
+    /* Logo is a transparent-background wordmark, stretched to span almost
+       the full page width as the main hero banner - sized by width (not a
+       fixed height) so it scales with the page and stays this dominant on
+       any desktop monitor, capped so it doesn't get absurd on ultrawides. */
     .tps-header {{
         padding: 14px 0 8px;
         margin-bottom: 4px;
@@ -145,13 +146,13 @@ def inject_css() -> None:
     }}
     .tps-header img {{
         display: block;
-        height: 260px;
-        width: auto;
-        max-width: 100%;
+        width: 94%;
+        max-width: 1700px;
+        height: auto;
         object-fit: contain;
     }}
     @media (max-width: 640px) {{
-        .tps-header img {{ height: 120px; }}
+        .tps-header img {{ width: 98%; }}
     }}
     .tps-tagline {{ color: {SUB}; font-size: 13px; margin: -2px 0 14px 2px; letter-spacing: .01em; }}
     .tps-divider {{
@@ -323,6 +324,24 @@ def render_header() -> None:
             <img src="{_logo_data_uri()}" alt="The Prop Shop" />
         </div>
         <div class="tps-divider"></div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_footer() -> None:
+    """Small credit line at the very bottom of the page - shown once,
+    after everything else has rendered, so it appears on every tab
+    regardless of which side (Fantasy Lineups / Prop Bets) or sub-tab is
+    active. Styled as a quiet, muted caption (same SUB color as the rest
+    of the app's secondary text) rather than a bold callout - a signature,
+    not another banner."""
+    st.markdown(
+        f"""
+        <div class="tps-divider" style="margin-top:32px;"></div>
+        <div style="text-align:center; color:{SUB}; font-size:12px; padding:10px 0 18px;">
+            Presented to you by: Curtis J Elias
+        </div>
         """,
         unsafe_allow_html=True,
     )
