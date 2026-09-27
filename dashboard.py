@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 import roster_store
+import theme
 from config import CURRENT_SEASON, PROP_MARKET_MAP, TEAM_CITY, INDOOR_ROOF_STATES, ODDS_API_SAFETY_BUFFER
 from data_loader import (
     load_starter_stats, load_player_meta, load_team_meta, load_defense_ranks, load_schedule,
@@ -21,36 +22,13 @@ from data_loader import (
 
 st.set_page_config(page_title="The Prop Shop", layout="wide", page_icon="🏈")
 
-st.markdown("""
-<style>
-.player-card {
-    background: #1a1c24;
-    border-radius: 12px;
-    padding: 14px 16px;
-    margin-bottom: 14px;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
-}
-.player-card img { border-radius: 50%; object-fit: cover; }
-.stat-big { font-size: 26px; font-weight: 700; margin-top: 6px; }
-.stat-label { font-size: 12px; color: #999; }
-.delta-up { color: #4CAF50; font-weight: 600; }
-.delta-down { color: #F44336; font-weight: 600; }
-.delta-flat { color: #999; font-weight: 600; }
-.consistency-badge {
-    display: inline-block; font-size: 11px; padding: 2px 8px;
-    border-radius: 10px; margin-top: 6px; margin-right: 4px; background: #2a2d3a; color: #ccc;
-}
-.matchup-badge {
-    display: inline-block; font-size: 11px; padding: 2px 8px;
-    border-radius: 10px; margin-top: 6px; margin-right: 4px; background: #2a2d3a;
-    /* text color is set inline per-badge, gradient by matchup difficulty */
-}
-.injury-badge {
-    display: inline-block; font-size: 11px; padding: 2px 8px;
-    border-radius: 10px; margin-top: 6px; margin-right: 4px; background: #3a2323; color: #e08a8a;
-}
-</style>
-""", unsafe_allow_html=True)
+# Brand colors, component styling, and the logo header all live in theme.py
+# now, as one source of truth (the .streamlit/config.toml theme block
+# covers what Streamlit's native theme engine can reach; inject_css()
+# covers the rest, including this app's own player-card/badge/delta
+# classes that used to be defined inline right here).
+theme.inject_css()
+theme.render_header()
 
 PROP_STATS_BY_POSITION = {
     "QB": ["passing_yards", "passing_tds", "rushing_yards", "fantasy_points_ppr"],
@@ -369,13 +347,17 @@ def _icon_html(icon: str) -> str:
 
 
 def matchup_rank_color(rank: int, max_rank: int = 32) -> str:
-    """Soft red (rank 1, toughest defense) -> soft yellow -> soft green
+    """Soft red (rank 1, toughest defense) -> soft yellow -> brand-green
     (rank max_rank, easiest defense) text color for a matchup badge.
     Colors are pastel/muted rather than pure red/green so they stay
-    readable as text on the badges' dark background."""
+    readable as text on the badges' dark background. The easy-matchup end
+    is tinted toward theme.MATCHUP_EASY_RGB (mixed from the logo's own
+    green) rather than a generic pastel green, so this semantic gradient
+    still reads as on-brand even though color here means something
+    (difficulty), not decoration."""
     t = (rank - 1) / max(max_rank - 1, 1)
     t = min(max(t, 0.0), 1.0)
-    stops = [(0.0, (255, 107, 107)), (0.5, (255, 209, 102)), (1.0, (143, 214, 168))]
+    stops = [(0.0, theme.MATCHUP_TOUGH_RGB), (0.5, (255, 209, 102)), (1.0, theme.MATCHUP_EASY_RGB)]
     for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
         if t0 <= t <= t1:
             local_t = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
@@ -448,13 +430,19 @@ def anytime_td_badge_html(pct: float, tag: str = "div") -> str:
     return pill_badge_html(label, probability_color(pct), tag, title=title)
 
 
-def _matchup_label(team: str, position: str, stat: str, next_opp_map: pd.DataFrame, defense_ranks: pd.DataFrame):
+def _matchup_label(team: str, position: str, stat: str, next_opp_map: pd.DataFrame, defense_ranks: pd.DataFrame, plain: bool = False):
     """(text, rank) for a team's next scheduled opponent - text like
     '🏠 vs OPP — #N toughest' (home) or '✈️ @ OPP — #N toughest' (away),
     rank is that opponent's defensive rank (1=toughest, 32=easiest)
     against `stat` for `position` this season, for color-coding the
     badge. None if there's no upcoming game or no rank data for that
-    stat (e.g. a bye week, or a stat with no _rank column)."""
+    stat (e.g. a bye week, or a stat with no _rank column).
+    plain=True gives the icon as a bare emoji instead of the sized
+    _icon_html span - use this for anywhere the result lands in plain
+    text rather than being rendered via st.markdown(unsafe_allow_html=True)
+    (e.g. a st.dataframe cell, which shows HTML source literally instead
+    of rendering it - same reasoning as add_matchup_display's separate
+    plain-text column for chart tooltips)."""
     rank_col = f"{stat}_rank"
     opp_row = next_opp_map[next_opp_map["team"] == team]
     if opp_row.empty or rank_col not in defense_ranks.columns:
@@ -464,7 +452,8 @@ def _matchup_label(team: str, position: str, stat: str, next_opp_map: pd.DataFra
     dr = defense_ranks[(defense_ranks["position"] == position) & (defense_ranks["team"] == opponent)]
     if dr.empty:
         return None
-    icon = _icon_html(HOME_ICON if is_home else AWAY_ICON)
+    raw_icon = HOME_ICON if is_home else AWAY_ICON
+    icon = raw_icon if plain else _icon_html(raw_icon)
     prefix = "vs" if is_home else "@"
     rank = int(dr[rank_col].iloc[0])
     return f"{icon} {prefix} {opponent} — #{rank} toughest", rank
@@ -591,7 +580,6 @@ def render_player_cards(summary_df: pd.DataFrame, sort_stat: str, cols_per_row: 
                 """, unsafe_allow_html=True)
 
 
-st.title("🏈 The Prop Shop")
 st.caption(f"Current season: {CURRENT_SEASON}. Trend charts include prior seasons' data for longer-term context.")
 
 if not ODDS_API_KEY:
@@ -706,7 +694,7 @@ def render_rosters_tab():
 
         save_col, delete_col = st.columns([3, 1])
         with save_col:
-            submitted = st.form_submit_button("💾 Save roster", use_container_width=True)
+            submitted = st.form_submit_button("💾 Save roster", use_container_width=True, type="primary")
         with delete_col:
             delete_clicked = st.form_submit_button(
                 "🗑️ Delete", use_container_width=True, disabled=(editing is None),
@@ -817,7 +805,7 @@ def compute_lineup_projections(roster_players: list) -> pd.DataFrame:
         pdf = current_season_df[current_season_df["player"] == player]
         if pdf.empty:
             rows.append({
-                "player": player, "position": "?", "team": "?", "opponent": None,
+                "player": player, "position": "?", "team": "?", "opponent": None, "opponent_plain": None,
                 "season_avg": 0.0, "matchup_rank": None, "proj_points": 0.0,
                 "injury_status": None, "note": "Not tracked this season",
             })
@@ -828,13 +816,19 @@ def compute_lineup_projections(roster_players: list) -> pd.DataFrame:
 
         if team not in teams_this_week:
             rows.append({
-                "player": player, "position": position, "team": team, "opponent": None,
+                "player": player, "position": position, "team": team, "opponent": None, "opponent_plain": None,
                 "season_avg": round(season_avg, 1), "matchup_rank": None, "proj_points": 0.0,
                 "injury_status": "Bye", "note": "Bye this week - not eligible to start",
             })
             continue
 
         matchup = _matchup_label(team, position, "fantasy_points_ppr", next_opp_map, defense_ranks)
+        # Separate plain-text opponent label for the "Full roster
+        # comparison" st.dataframe below - st.dataframe shows HTML source
+        # literally instead of rendering it, so the badge-flavored HTML
+        # label (used by lineup_row's on-brand badge) would otherwise show
+        # up as raw <span> tags in that table.
+        matchup_plain = _matchup_label(team, position, "fantasy_points_ppr", next_opp_map, defense_ranks, plain=True)
         rank = matchup[1] if matchup else None
         note = "" if matchup else "No matchup data found"
         proj = round(season_avg * matchup_adjustment(rank), 1)
@@ -845,6 +839,7 @@ def compute_lineup_projections(roster_players: list) -> pd.DataFrame:
         rows.append({
             "player": player, "position": position, "team": team,
             "opponent": matchup[0] if matchup else None,
+            "opponent_plain": matchup_plain[0] if matchup_plain else None,
             "season_avg": round(season_avg, 1), "matchup_rank": rank, "proj_points": proj,
             "injury_status": inj_status, "note": note,
         })
@@ -962,11 +957,18 @@ def render_lineup_tab():
     display["in_lineup"] = display["player"].isin(
         {r["player"] for r in lineup.values() if r is not None}
     ).map({True: "✅", False: ""})
+    # Blank out missing values instead of showing the literal word "None" -
+    # a healthy player has no injury_status, an unranked matchup has no
+    # note, and st.dataframe shows Python's None/NaN as visible text
+    # rather than leaving the cell empty like st.markdown would.
+    display[["opponent_plain", "matchup_rank", "injury_status", "note"]] = (
+        display[["opponent_plain", "matchup_rank", "injury_status", "note"]].fillna("")
+    )
     st.dataframe(
-        display[["in_lineup", "player", "position", "team", "opponent", "proj_points", "season_avg", "matchup_rank", "injury_status", "note"]]
+        display[["in_lineup", "player", "position", "team", "opponent_plain", "proj_points", "season_avg", "matchup_rank", "injury_status", "note"]]
         .rename(columns={
             "in_lineup": "Start", "player": "Player", "position": "Pos", "team": "Team",
-            "opponent": "Next opp", "proj_points": "Proj", "season_avg": "Szn avg",
+            "opponent_plain": "Next opp", "proj_points": "Proj", "season_avg": "Szn avg",
             "matchup_rank": "Opp rank", "injury_status": "Injury", "note": "Note",
         }),
         use_container_width=True, hide_index=True,
