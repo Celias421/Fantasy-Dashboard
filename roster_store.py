@@ -27,6 +27,13 @@ LOCAL_FALLBACK_PATH = "data/rosters_local.json"
 # module, so a hang here is a hang for every single visitor, forever.
 _SHEETS_TIMEOUT_SECONDS = 8
 
+# Set whenever the Sheets connection attempt fails or times out, so the app
+# can show *why* instead of just "isn't configured yet" - that message was
+# indistinguishable whether the secrets were missing, wrong, or the sheet
+# just wasn't shared with the service account, which made this genuinely
+# hard to debug from outside. Read via last_connection_error().
+_last_error = None
+
 
 def _with_timeout(fn, *args, default=None):
     """Runs fn(*args) on a background thread and gives up after
@@ -71,10 +78,12 @@ def _sheets_client_uncapped(st_secrets):
     gspread.authorize()/open_by_key() network calls if Google's API (or the
     credentials) are slow/misconfigured; callers must go through the
     timeout wrapper."""
+    global _last_error
     try:
         service_account_info = st_secrets.get("GOOGLE_SERVICE_ACCOUNT")
         sheet_id = st_secrets.get("ROSTER_SHEET_ID")
         if not service_account_info or not sheet_id:
+            _last_error = "GOOGLE_SERVICE_ACCOUNT or ROSTER_SHEET_ID secret is missing."
             return None
         import gspread
         from google.oauth2.service_account import Credentials
@@ -88,8 +97,10 @@ def _sheets_client_uncapped(st_secrets):
         except Exception:
             worksheet = sheet.add_worksheet(title="rosters", rows=20, cols=3)
             worksheet.append_row(["id", "name", "players_json"])
+        _last_error = None
         return worksheet
-    except Exception:
+    except Exception as e:
+        _last_error = f"{type(e).__name__}: {e}"
         return None
 
 
@@ -100,7 +111,21 @@ def _sheets_client(st_secrets):
     module-level) so it's only attempted when actually needed, and so a
     misconfigured/missing/slow credential never hangs or crashes app
     startup - the local fallback silently takes over instead."""
-    return _with_timeout(_sheets_client_uncapped, st_secrets, default=None)
+    global _last_error
+    _TIMED_OUT = object()
+    result = _with_timeout(_sheets_client_uncapped, st_secrets, default=_TIMED_OUT)
+    if result is _TIMED_OUT:
+        _last_error = f"Connection attempt did not finish within {_SHEETS_TIMEOUT_SECONDS}s (timed out)."
+        return None
+    return result
+
+
+def last_connection_error():
+    """The most recent reason Google Sheets wasn't used (a specific error
+    message, or None if the last attempt succeeded or hasn't run yet).
+    Surfaced in the UI so a bad secret/permission can actually be diagnosed
+    instead of just showing a generic 'not configured' message."""
+    return _last_error
 
 
 def _sheets_load(worksheet) -> list:

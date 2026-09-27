@@ -655,11 +655,13 @@ def render_rosters_tab():
     actually uses a selected roster to build a start/sit recommendation is
     a separate, later feature - this tab only manages who's ON a roster."""
     if roster_store.using_local_fallback(st.secrets):
+        reason = roster_store.last_connection_error()
+        detail = f"\n\n**Reason:** `{reason}`" if reason else ""
         st.warning(
             "Google Sheets isn't configured yet, so rosters are being saved to this app's local disk instead - "
             "that storage does NOT survive the next code deploy. See README to set up the Sheets connection "
             "before relying on this for real. Local saves work fine for now, just don't build a whole roster "
-            "you'd be upset to lose.",
+            "you'd be upset to lose." + detail,
             icon="⚠️",
         )
 
