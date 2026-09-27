@@ -50,6 +50,15 @@ PROP_STATS_BY_POSITION = {
     "TE": ["receiving_yards", "receptions", "receiving_tds", "fantasy_points_ppr"],
 }
 
+# Fixed-order categorical colors for the 4 offensive positions, used on the
+# Hot Picks page's charts (donut + position-colored bars) so a position
+# means the same color everywhere on that page. Chosen from a validated
+# colorblind-safe 8-hue set (dark-surface step) rather than eyeballed -
+# these 4 adjacent pairs clear the CVD separation and normal-vision floors
+# on this app's dark background. Order is fixed (never re-sorted by a
+# filter), per the "color follows the entity, never its rank" rule.
+POSITION_COLORS = {"QB": "#3987e5", "RB": "#d95926", "WR": "#199e70", "TE": "#c98500"}
+
 ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", "")
 
 
@@ -2216,6 +2225,49 @@ else:
     section1.metric("Prop Edges Found", len(edge_rows))
     section2.metric("TD Chances Tracked", len(td_rows))
     section3.metric("High-Consistency Favorable Matchups", len(matchup_rows))
+
+    # ---- Position mix donut: the one place on this page a donut earns its
+    # keep - a real part-to-whole with only 4 possible slices (QB/RB/WR/TE),
+    # not a close-values comparison a bar would read better. Every other
+    # chart on this page is a magnitude comparison (biggest edge, highest
+    # odds, best matchup), which a bar chart shows more precisely than a
+    # pie ever could - so this is deliberately the only donut here. ----
+    all_hot_players = {}
+    for row in edge_rows + td_rows + matchup_rows:
+        all_hot_players[row["player"]] = row["position"]
+    if all_hot_players:
+        position_counts = pd.Series(list(all_hot_players.values())).value_counts().reset_index()
+        position_counts.columns = ["position", "count"]
+        donut = alt.Chart(position_counts).mark_arc(innerRadius=70, cornerRadius=3, padAngle=0.015).encode(
+            theta=alt.Theta("count:Q", stack=True),
+            color=alt.Color(
+                "position:N", title="Position",
+                scale=alt.Scale(domain=list(POSITION_COLORS.keys()), range=list(POSITION_COLORS.values())),
+                legend=alt.Legend(orient="right"),
+            ),
+            order=alt.Order("position:N", sort="ascending"),
+            tooltip=[
+                alt.Tooltip("position:N", title="Position"),
+                alt.Tooltip("count:Q", title="Hot picks"),
+            ],
+        ).properties(height=220)
+        donut_labels = alt.Chart(position_counts).mark_text(radius=95, size=13, fontWeight=600).encode(
+            theta=alt.Theta("count:Q", stack=True),
+            order=alt.Order("position:N", sort="ascending"),
+            text="count:Q",
+            color=alt.value(theme.INK),
+        )
+        dcol1, dcol2 = st.columns([1, 2])
+        with dcol1:
+            st.markdown("###### This week's Hot Picks by position")
+            st.altair_chart(donut + donut_labels, use_container_width=True)
+        with dcol2:
+            st.markdown("###### ")
+            st.caption(
+                f"{len(all_hot_players)} unique players appear in at least one list below - "
+                "the mix shows whether this week's hot picks skew toward a particular position."
+            )
+
     st.divider()
 
     # ---- Section 1: Biggest Prop-Line Edges ----
@@ -2225,6 +2277,45 @@ else:
         st.info("No live prop lines available right now to compare against - try \"Refresh prop lines now\" on the Prop Bets side.")
     else:
         edge_df = pd.DataFrame(edge_rows).sort_values("edge", key=abs, ascending=False).head(15)
+
+        # Diverging bar around 0 (positive = Over, negative = Under) - the
+        # right form for "above/below a baseline" per the site's charting
+        # guide, and more precise than a donut for comparing edge sizes
+        # that are often close to each other.
+        edge_chart_df = edge_df.head(10).copy()
+        edge_chart_df["label"] = edge_chart_df["player"] + " — " + edge_chart_df["stat"]
+        edge_bar = alt.Chart(edge_chart_df).mark_bar(cornerRadiusEnd=4, size=18).encode(
+            x=alt.X("edge:Q", title="Edge (season avg − prop line)"),
+            y=alt.Y("label:N", sort=alt.EncodingSortField(field="edge", op="abs", order="descending"), title=None),
+            color=alt.Color(
+                "direction:N", title=None,
+                scale=alt.Scale(domain=["▲ Over", "▼ Under"], range=["#4CAF50", "#F44336"]),
+                legend=alt.Legend(orient="top"),
+            ),
+            tooltip=[
+                alt.Tooltip("player:N", title="Player"), alt.Tooltip("stat:N", title="Stat"),
+                alt.Tooltip("season_avg:Q", title=f"{CURRENT_SEASON} Avg", format=".1f"),
+                alt.Tooltip("prop_line:Q", title="Prop Line", format=".1f"),
+                alt.Tooltip("edge:Q", title="Edge", format="+.1f"),
+            ],
+        )
+        edge_text_pos = edge_bar.mark_text(
+            align="left", dx=4, fontWeight=600,
+        ).encode(
+            text=alt.Text("edge:Q", format="+.1f"),
+            color=alt.value(theme.INK),
+        ).transform_filter(alt.datum.edge > 0)
+        edge_text_neg = edge_bar.mark_text(
+            align="right", dx=-4, fontWeight=600,
+        ).encode(
+            text=alt.Text("edge:Q", format="+.1f"),
+            color=alt.value(theme.INK),
+        ).transform_filter(alt.datum.edge < 0)
+        st.altair_chart(
+            (edge_bar + edge_text_pos + edge_text_neg).properties(height=max(220, 28 * len(edge_chart_df))),
+            use_container_width=True,
+        )
+
         edge_display = edge_df[["player", "team", "position", "stat", "season_avg", "prop_line", "edge", "direction"]].rename(columns={
             "player": "Player", "team": "Team", "position": "Pos", "stat": "Stat",
             "season_avg": f"{CURRENT_SEASON} Avg", "prop_line": "Prop Line", "edge": "Edge", "direction": "Direction",
@@ -2245,6 +2336,25 @@ else:
         td_df = pd.DataFrame(td_rows)
         td_df["_sort"] = td_df[["anytime_td_pct", "first_td_pct"]].max(axis=1, skipna=True)
         td_df = td_df.sort_values("_sort", ascending=False).head(15)
+
+        td_long = pd.concat([
+            td_df[["player", "anytime_td_pct"]].rename(columns={"anytime_td_pct": "pct"}).assign(market="🎯 Anytime TD"),
+            td_df[["player", "first_td_pct"]].rename(columns={"first_td_pct": "pct"}).assign(market="🥇 First TD"),
+        ]).dropna(subset=["pct"])
+        td_chart_df = td_long[td_long["player"].isin(td_df.head(10)["player"])]
+        td_bar = alt.Chart(td_chart_df).mark_bar(cornerRadiusEnd=4).encode(
+            x=alt.X("pct:Q", title="Implied probability", scale=alt.Scale(domain=[0, 100])),
+            y=alt.Y("player:N", sort=td_df.head(10)["player"].tolist(), title=None),
+            color=alt.Color(
+                "market:N", title=None,
+                scale=alt.Scale(domain=["🎯 Anytime TD", "🥇 First TD"], range=[theme.ACCENT, theme.WARN]),
+                legend=alt.Legend(orient="top"),
+            ),
+            yOffset="market:N",
+            tooltip=[alt.Tooltip("player:N", title="Player"), alt.Tooltip("market:N", title="Market"), alt.Tooltip("pct:Q", title="Chance", format=".0f")],
+        ).properties(height=max(220, 22 * td_chart_df["player"].nunique() * 2))
+        st.altair_chart(td_bar, use_container_width=True)
+
         td_display = td_df[["player", "team", "position", "anytime_td_pct", "first_td_pct"]].rename(columns={
             "player": "Player", "team": "Team", "position": "Pos",
             "anytime_td_pct": "Anytime TD %", "first_td_pct": "First TD %",
@@ -2266,6 +2376,24 @@ else:
         st.info("No players currently match both a High consistency rating and a favorable upcoming matchup.")
     else:
         matchup_df = pd.DataFrame(matchup_rows).sort_values("matchup_rank", ascending=False).head(15)
+
+        safe_chart_df = matchup_df.head(10)
+        safe_bar = alt.Chart(safe_chart_df).mark_bar(cornerRadiusEnd=4).encode(
+            x=alt.X("season_avg_ppr:Q", title=f"{CURRENT_SEASON} Avg Fantasy Points (PPR)"),
+            y=alt.Y("player:N", sort="-x", title=None),
+            color=alt.Color(
+                "position:N", title="Position",
+                scale=alt.Scale(domain=list(POSITION_COLORS.keys()), range=list(POSITION_COLORS.values())),
+                legend=alt.Legend(orient="top"),
+            ),
+            tooltip=[
+                alt.Tooltip("player:N", title="Player"), alt.Tooltip("team:N", title="Team"),
+                alt.Tooltip("matchup_label:N", title="Matchup"),
+                alt.Tooltip("season_avg_ppr:Q", title=f"{CURRENT_SEASON} Avg PPR", format=".1f"),
+            ],
+        ).properties(height=max(220, 28 * len(safe_chart_df)))
+        st.altair_chart(safe_bar, use_container_width=True)
+
         matchup_display = matchup_df[["player", "team", "position", "matchup_label", "season_avg_ppr"]].rename(columns={
             "player": "Player", "team": "Team", "position": "Pos",
             "matchup_label": "Matchup", "season_avg_ppr": f"{CURRENT_SEASON} Avg PPR",
