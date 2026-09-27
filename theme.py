@@ -132,6 +132,19 @@ def inject_css() -> None:
         border-radius: 10px; margin-top: 6px; margin-right: 4px;
         background: {BAD_SOFT}; color: {BAD}; border: 1px solid rgba(229,72,77,.3);
     }}
+    /* Initials avatar shown in place of a headshot when a player has no
+       photo on file (or it fails to load) - keeps every card the same
+       size/shape instead of leaving a blank gap. Used by the Hot Picks
+       page's card grid (render_hotpick_cards / player_avatar_html). */
+    .hotpick-avatar-fallback {{
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 700;
+        flex-shrink: 0;
+        font-variant-numeric: tabular-nums;
+    }}
 
     /* ---- Header / masthead --------------------------------------------- */
     /* Logo is a transparent-background wordmark, stretched to span almost

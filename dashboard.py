@@ -631,6 +631,82 @@ def render_player_cards(summary_df: pd.DataFrame, sort_stat: str, cols_per_row: 
                 """, unsafe_allow_html=True)
 
 
+def player_avatar_html(row: dict, px: int) -> str:
+    """Large player photo for a card, using the same Cloudinary sizing
+    pipeline (sized_headshot) as every other photo on the site. When a
+    player has no headshot on file, falls back to a colored initials
+    avatar (using the player's team color) at the same size, so a card
+    grid never has a gap where a photo should be. A headshot that 404s at
+    runtime hides itself (onerror), same fallback behavior as every other
+    photo in the app (render_player_cards, First TD podium cards) -
+    intentionally not swapped to the initials avatar dynamically, since
+    that would mean building HTML-with-quotes inside a JS string inside
+    an HTML attribute, a nesting bug waiting to happen for a case (a
+    broken URL after being fetched) that's already rare."""
+    url = row.get("headshot_url")
+    if url and pd.notna(url):
+        photo = sized_headshot(url, px)
+        return f'<img src="{photo}" width="{px}" height="{px}" onerror="this.style.display=\'none\'"/>'
+    name = row.get("player") or "?"
+    initials = "".join(part[0] for part in name.split()[:2]).upper() or "?"
+    color = row.get("team_color") or "#444444"
+    font_px = max(14, px // 3)
+    return (
+        f'<div class="hotpick-avatar-fallback" style="width:{px}px; height:{px}px; '
+        f'font-size:{font_px}px; background:{color}26; color:{color}; border:2px solid {color};">'
+        f"{initials}</div>"
+    )
+
+
+def render_hotpick_cards(rows: list, body_fn, cols_per_row: int = 4, headshot_px: int = 128, medals: bool = False):
+    """Shared large-headshot + team-logo card row for the Hot Picks page's
+    three sections and its Suggested Bets panel - one component so a
+    layout or styling change here applies to all four instead of four
+    near-duplicate blocks (the same reasoning as render_player_cards
+    above, and the same .player-card styling everywhere else on the site
+    uses). `rows` is a list of plain dicts (not a DataFrame - the Hot
+    Picks section already builds edge_rows/td_rows/matchup_rows/
+    suggestion_rows as lists of dicts). `body_fn(row)` returns whatever
+    HTML is unique to that section - a stat figure, badges - rendered
+    below the player identity block. `medals=True` prefixes the first
+    three cards with the same 🥇🥈🥉 podium treatment as the First TD tab."""
+    # NOTE: this is built as ONE single-line string (adjacent f-string
+    # literals, no actual embedded newlines) rather than a multi-line
+    # triple-quoted template. A multi-line version that interpolates a
+    # value which can be EMPTY (medal_html is "" whenever medals=False,
+    # which is every call site except the three podium sections) leaves a
+    # whitespace-only line in the markdown source. Streamlit's markdown-it
+    # renderer treats that as a blank line, which terminates the raw-HTML
+    # block early - everything after it (including body_fn's badges) then
+    # renders as literal escaped text instead of HTML. Caught by actually
+    # rendering the Suggested Bets panel (medals=False) with populated
+    # data before shipping, not just the three medals=True sections, which
+    # never hit this because their medal_html is never empty.
+    medal_icons = ["🥇", "🥈", "🥉"]
+    for start in range(0, len(rows), cols_per_row):
+        chunk = rows[start:start + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for i, (col, row) in enumerate(zip(cols, chunk)):
+            rank = start + i
+            with col:
+                medal_html = f'<div style="font-size:20px;">{medal_icons[rank]}</div>' if medals and rank < 3 else ""
+                card_html = (
+                    f'<div class="player-card" style="border-left: 4px solid {row.get("team_color") or "#444444"};">'
+                    f"{medal_html}"
+                    f'<div style="display:flex; align-items:center; gap:14px;">'
+                    f"{player_avatar_html(row, headshot_px)}"
+                    f"<div>"
+                    f'<div style="font-weight:700; font-size:17px;">{row["player"]}</div>'
+                    f'<div style="font-size:13px; color:#999; margin-top:2px;">'
+                    f'{team_logo_html(row["team"])}{row["position"]} · {row["team"]}</div>'
+                    f"</div>"
+                    f"</div>"
+                    f"{body_fn(row)}"
+                    f"</div>"
+                )
+                st.markdown(card_html, unsafe_allow_html=True)
+
+
 theme.info_popover(
     f"**Current season:** {CURRENT_SEASON}. Trend charts include prior seasons' data for longer-term context.",
     label="ℹ️ Season info",
@@ -2314,31 +2390,44 @@ else:
             source = edge or td or matchup
             if not source:
                 continue
-            bets = []
+
+            badges_html = ""
             if edge:
-                bets.append(
-                    f"{edge['direction']} {edge['prop_line']} {edge['stat']} "
-                    f"({CURRENT_SEASON} avg {edge['season_avg']}, edge {edge['edge']:+.1f})"
+                delta_cls = "delta-up" if edge["direction"] == "▲ Over" else "delta-down"
+                badges_html += (
+                    f'<div style="margin-top:6px;"><span class="{delta_cls}">{edge["direction"]} '
+                    f'{edge["prop_line"]:.1f} {edge["stat"]}</span> '
+                    f'<span class="stat-label">({CURRENT_SEASON} avg {edge["season_avg"]:.1f}, '
+                    f'edge {edge["edge"]:+.1f})</span></div>'
                 )
             if td:
-                td_parts = []
                 if td["anytime_td_pct"] is not None:
-                    td_parts.append(f"Anytime TD {td['anytime_td_pct']:.0f}%")
+                    badges_html += anytime_td_badge_html(td["anytime_td_pct"])
                 if td["first_td_pct"] is not None:
-                    td_parts.append(f"First TD {td['first_td_pct']:.0f}%")
-                if td_parts:
-                    bets.append(" / ".join(td_parts))
+                    badges_html += first_td_badge_html(td["first_td_pct"])
             if matchup:
-                bets.append(f"Safe play - {matchup['matchup_label']} matchup, {matchup['season_avg_ppr']} PPR avg")
+                badges_html += matchup_badge_html(matchup["matchup_label"], matchup["matchup_rank"])
+                badges_html += f'<div class="stat-label" style="margin-top:4px;">{matchup["season_avg_ppr"]:.1f} avg PPR</div>'
+            if not badges_html:
+                badges_html = '<div class="stat-label" style="margin-top:8px;">No specific angle this week</div>'
+
             suggestion_rows.append({
-                "Player": player,
-                "Pos": position,
-                "Team": source["team"],
-                "Suggested Bet(s)": " · ".join(bets) if bets else "—",
+                "player": player,
+                "position": position,
+                "team": source["team"],
+                "headshot_url": source.get("headshot_url"),
+                "team_color": source.get("team_color"),
+                "badges_html": badges_html,
             })
+
         if suggestion_rows:
-            suggestion_df = pd.DataFrame(suggestion_rows).sort_values(["Pos", "Player"])
-            st.dataframe(suggestion_df, use_container_width=True, hide_index=True, row_height=40)
+            suggestion_rows.sort(key=lambda r: (r["position"], r["player"]))
+            render_hotpick_cards(
+                suggestion_rows,
+                body_fn=lambda row: row["badges_html"],
+                cols_per_row=4,
+                headshot_px=128,
+            )
         else:
             st.info("No suggested bets found for that position this week.")
 
@@ -2351,6 +2440,28 @@ else:
         st.info("No live prop lines available right now to compare against - try \"Refresh prop lines now\" on the Prop Bets side.")
     else:
         edge_df = pd.DataFrame(edge_rows).sort_values("edge", key=abs, ascending=False).head(15)
+
+        st.markdown("###### This week's biggest edges")
+        edge_card_rows = edge_df.head(3).to_dict("records")
+
+        def _edge_card_body(row: dict) -> str:
+            # Single-line HTML, no embedded newlines - matching every other
+            # HTML-returning helper in this file (pill_badge_html, delta_html,
+            # etc.). A multi-line triple-quoted string here breaks Streamlit's
+            # markdown-it HTML-block parsing when it's spliced into the
+            # outer card template (a blank/whitespace-only line acts as an
+            # HTML-block terminator), which showed up as a literal, visible
+            # "</div>" on the card instead of a closed tag - caught by
+            # actually rendering this with populated data before shipping.
+            delta_cls = "delta-up" if row["direction"] == "▲ Over" else "delta-down"
+            return (
+                f'<div class="stat-big">{row["edge"]:+.1f}</div>'
+                f'<div class="stat-label">{row["stat"]} edge</div>'
+                f'<div style="margin-top:6px;"><span class="{delta_cls}">{row["direction"]} '
+                f'{row["prop_line"]:.1f} (avg {row["season_avg"]:.1f})</span></div>'
+            )
+
+        render_hotpick_cards(edge_card_rows, body_fn=_edge_card_body, cols_per_row=3, headshot_px=128, medals=True)
 
         # Diverging bar around 0 (positive = Over, negative = Under) - the
         # right form for "above/below a baseline" per the site's charting
@@ -2418,6 +2529,19 @@ else:
         td_df["_sort"] = td_df[["anytime_td_pct", "first_td_pct"]].max(axis=1, skipna=True)
         td_df = td_df.sort_values("_sort", ascending=False).head(15)
 
+        st.markdown("###### This week's best scoring chances")
+        td_card_rows = td_df.head(3).to_dict("records")
+
+        def _td_card_body(row: dict) -> str:
+            badges = ""
+            if pd.notna(row.get("anytime_td_pct")):
+                badges += anytime_td_badge_html(row["anytime_td_pct"])
+            if pd.notna(row.get("first_td_pct")):
+                badges += first_td_badge_html(row["first_td_pct"])
+            return badges
+
+        render_hotpick_cards(td_card_rows, body_fn=_td_card_body, cols_per_row=3, headshot_px=128, medals=True)
+
         td_long = pd.concat([
             td_df[["player", "anytime_td_pct"]].rename(columns={"anytime_td_pct": "pct"}).assign(market="🎯 Anytime TD"),
             td_df[["player", "first_td_pct"]].rename(columns={"first_td_pct": "pct"}).assign(market="🥇 First TD"),
@@ -2457,6 +2581,20 @@ else:
         st.info("No players currently match both a High consistency rating and a favorable upcoming matchup.")
     else:
         matchup_df = pd.DataFrame(matchup_rows).sort_values("matchup_rank", ascending=False).head(15)
+
+        st.markdown("###### This week's safest plays")
+        safe_card_rows = matchup_df.head(3).to_dict("records")
+
+        def _safe_card_body(row: dict) -> str:
+            # Single-line HTML - see _edge_card_body's comment above for why.
+            badge = matchup_badge_html(row["matchup_label"], row["matchup_rank"]) if row.get("matchup_label") else ""
+            return (
+                f'<div class="stat-big">{row["season_avg_ppr"]:.1f}</div>'
+                f'<div class="stat-label">avg PPR</div>'
+                f'<div style="margin-top:2px;">{badge}</div>'
+            )
+
+        render_hotpick_cards(safe_card_rows, body_fn=_safe_card_body, cols_per_row=3, headshot_px=128, medals=True)
 
         safe_chart_df = matchup_df.head(10)
         safe_bar = alt.Chart(safe_chart_df).mark_bar(cornerRadiusEnd=4).encode(
