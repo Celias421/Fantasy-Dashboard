@@ -19,8 +19,38 @@ import pandas as pd
 
 from config import (
     SEASONS, CURRENT_SEASON, STARTERS_PER_POSITION, PROP_MARKET_MAP,
-    ANYTIME_TD_MARKET, ODDS_API_SAFETY_BUFFER,
+    ANYTIME_TD_MARKET, FIRST_TD_MARKET, ODDS_API_SAFETY_BUFFER,
 )
+
+# nflreadpy keeps its OWN in-memory cache of every file it downloads from
+# nflverse - completely separate from, and underneath, dashboard.py's
+# st.cache_data layer. Left at its default (24 hours!), that means: even
+# after a st.cache_data-wrapped function's ttl expires and calls back into
+# nflreadpy, nflreadpy can silently hand back a snapshot from up to a day
+# ago instead of actually hitting the network again - a roster move,
+# trade, or injury update can take up to 24h to ever reach this app no
+# matter how short the st.cache_data ttls above are set. This is what was
+# actually behind a stale-roster report (a traded player still showing his
+# old team) even though the live nflverse data itself was already correct
+# - the sandbox's own nflreadpy cache was serving an older pull.
+#
+# Bringing this down to match get_stats()/get_schedule()'s 1-hour
+# st.cache_data ttl bounds that worst case at 1 hour instead of 24, and
+# clear_nflverse_cache() (called from the "Refresh all data now" button
+# alongside st.cache_data.clear()) lets a manual refresh actually force a
+# real re-download on demand rather than possibly still serving nflreadpy's
+# own stale copy underneath a freshly-cleared st.cache_data cache.
+nfl.config.update_config(cache_duration=3600)
+
+
+def clear_nflverse_cache() -> None:
+    """Force nflreadpy to drop its own in-memory cache of every nflverse
+    file it's downloaded, so the next load_* call is a real network pull
+    rather than a possibly-stale (up to cache_duration old) cached copy.
+    Call this alongside st.cache_data.clear() - clearing only Streamlit's
+    cache still leaves this deeper cache in place, which is exactly what
+    made "Refresh all data now" not actually guarantee fresh data before."""
+    nfl.clear_cache()
 
 # Where the last successful prop-lines pull is saved on disk, independent
 # of Streamlit's own st.cache_data cache. Streamlit's cache resets whenever
@@ -190,29 +220,35 @@ def _quota_from_headers(resp) -> dict:
 
 
 def load_prop_lines(api_key: str):
-    """Current player prop lines from The Odds API: (props_df, td_df, quota).
+    """Current player prop lines from The Odds API: (props_df, td_df, first_td_df, quota).
 
     props_df covers the point-value markets in PROP_MARKET_MAP (yards,
-    passing TDs) with columns [player, market, point] - the season
-    average gets compared directly against these.
+    passing TDs, receptions) with columns [player, market, point] - the
+    season average gets compared directly against these.
 
-    td_df covers ANYTIME_TD_MARKET separately, with columns
-    [player, implied_prob] (0-100, averaged across bookmakers) - this is
-    a yes/no "does this player score" market priced as odds, not a line,
-    so it can't be compared to a season average the same way and is kept
-    apart from props_df on purpose.
+    td_df covers ANYTIME_TD_MARKET, and first_td_df covers FIRST_TD_MARKET,
+    each with columns [player, implied_prob] (0-100, averaged across
+    bookmakers) - these are yes/no "does this player score" markets priced
+    as odds, not a line, so they can't be compared to a season average the
+    same way and are kept apart from props_df on purpose. Kept as two
+    separate frames (not one with a market column) since callers use them
+    differently: td_df feeds the Anytime TD badge shown everywhere, while
+    first_td_df feeds its own dedicated First TD tab.
 
     quota is {"remaining": int|None, "used": int|None, "skipped": bool} -
     "remaining"/"used" come straight from the API's own response headers
     (the authoritative source), and "skipped" is True if we deliberately
     didn't pull odds this cycle because there wasn't enough quota headroom.
 
-    Both prop markets and the TD market come from the same API calls (one
-    per event), so pulling the extra market doesn't cost any additional
-    requests - just a few more credits per event since the markets list
-    is longer. Each event's odds call costs (markets requested) x (regions
-    requested) credits, per The Odds API's own pricing - with 5 markets
-    and 1 region that's 5 credits per game.
+    All markets come from the same API calls (one per event), so pulling
+    an extra market doesn't cost any additional requests - just a few more
+    credits per event since the markets list is longer. Each event's odds
+    call costs (markets requested) x (regions requested) credits, per The
+    Odds API's own pricing - with 6 markets (yards x3, passing TDs,
+    receptions, anytime TD, first TD - see PROP_MARKET_MAP plus
+    ANYTIME_TD_MARKET and FIRST_TD_MARKET) and 1 region that's 6 credits
+    per game, so a full ~16-game week costs under 100 credits - trivial
+    against a 20k/month plan even refreshed daily.
 
     Before spending anything on odds, this checks the quota remaining
     after the (cheap/free) events listing call. If pulling odds for every
@@ -221,14 +257,14 @@ def load_prop_lines(api_key: str):
     risk running the account down to zero - the next cached refresh (up
     to 24h later) will try again.
 
-    Returns two empty DataFrames (never raises) if the key is missing,
+    Returns three empty DataFrames (never raises) if the key is missing,
     invalid, or the API is unreachable - callers should treat missing
     prop data as normal, not a crash."""
     prop_columns = ["player", "market", "point"]
     td_columns = ["player", "implied_prob"]
     empty_quota = {"remaining": None, "used": None, "skipped": False}
     if not api_key:
-        return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns), empty_quota
+        return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns), pd.DataFrame(columns=td_columns), empty_quota
 
     try:
         events_resp = requests.get(
@@ -240,9 +276,9 @@ def load_prop_lines(api_key: str):
         events = events_resp.json()
         quota = _quota_from_headers(events_resp)
     except Exception:
-        return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns), empty_quota
+        return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns), pd.DataFrame(columns=td_columns), empty_quota
 
-    markets_list = list(PROP_MARKET_MAP.values()) + [ANYTIME_TD_MARKET]
+    markets_list = list(PROP_MARKET_MAP.values()) + [ANYTIME_TD_MARKET, FIRST_TD_MARKET]
     markets = ",".join(markets_list)
 
     # Pre-flight safety check: estimate the worst-case cost of pulling odds
@@ -251,10 +287,11 @@ def load_prop_lines(api_key: str):
     estimated_cost = len(events) * len(markets_list)
     if quota["remaining"] is not None and quota["remaining"] - estimated_cost < ODDS_API_SAFETY_BUFFER:
         quota["skipped"] = True
-        return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns), quota
+        return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns), pd.DataFrame(columns=td_columns), quota
 
     prop_rows = []
     td_rows = []
+    first_td_rows = []
     for event in events:
         event_id = event.get("id")
         if not event_id:
@@ -293,7 +330,7 @@ def load_prop_lines(api_key: str):
                         player_name = outcome.get("description")
                         if player_name is None:
                             continue
-                        if market_key == ANYTIME_TD_MARKET:
+                        if market_key in (ANYTIME_TD_MARKET, FIRST_TD_MARKET):
                             price = outcome.get("price")
                             if price is None:
                                 continue
@@ -301,7 +338,8 @@ def load_prop_lines(api_key: str):
                                 implied = _implied_probability(float(price))
                             except (TypeError, ValueError):
                                 continue
-                            td_rows.append({"player": player_name, "implied_prob": implied})
+                            target = td_rows if market_key == ANYTIME_TD_MARKET else first_td_rows
+                            target.append({"player": player_name, "implied_prob": implied})
                         else:
                             # Each player prop market has two outcomes (Over/Under)
                             # per player; we only need the line itself, which is
@@ -334,7 +372,14 @@ def load_prop_lines(api_key: str):
     else:
         td = pd.DataFrame(columns=td_columns)
 
-    return props, td, quota
+    if first_td_rows:
+        first_td = pd.DataFrame(first_td_rows)
+        first_td = first_td.groupby("player", as_index=False)["implied_prob"].mean()
+        first_td["implied_prob"] = (first_td["implied_prob"] * 100).round(1)
+    else:
+        first_td = pd.DataFrame(columns=td_columns)
+
+    return props, td, first_td, quota
 
 
 def _read_prop_lines_cache_file():
@@ -348,6 +393,10 @@ def _read_prop_lines_cache_file():
         return {
             "props_df": pd.DataFrame(raw["props"]),
             "td_df": pd.DataFrame(raw["td"]),
+            # .get() with a default - a cache file written before the First
+            # TD feature existed won't have this key at all, and that's a
+            # normal "no first-TD data cached yet" case, not corruption.
+            "first_td_df": pd.DataFrame(raw.get("first_td", [])),
             "quota": raw["quota"],
             "pulled_at": datetime.datetime.fromisoformat(raw["pulled_at"]),
         }
@@ -355,7 +404,7 @@ def _read_prop_lines_cache_file():
         return None
 
 
-def _write_prop_lines_cache_file(props_df: pd.DataFrame, td_df: pd.DataFrame, quota: dict, pulled_at: datetime.datetime) -> None:
+def _write_prop_lines_cache_file(props_df: pd.DataFrame, td_df: pd.DataFrame, first_td_df: pd.DataFrame, quota: dict, pulled_at: datetime.datetime) -> None:
     """Best-effort write. If this fails (e.g. a read-only filesystem) we
     just lose the cross-restart fallback for this cycle - degraded, not
     fatal, since load_prop_lines_with_cache still works, it'll just call
@@ -365,6 +414,7 @@ def _write_prop_lines_cache_file(props_df: pd.DataFrame, td_df: pd.DataFrame, qu
         payload = {
             "props": props_df.to_dict(orient="records"),
             "td": td_df.to_dict(orient="records"),
+            "first_td": first_td_df.to_dict(orient="records"),
             "quota": quota,
             "pulled_at": pulled_at.isoformat(),
         }
@@ -385,7 +435,7 @@ def load_prop_lines_with_cache(api_key: str):
     file that doesn't care whether the code changed - only how old the
     last successful pull actually is.
 
-    Returns (props_df, td_df, quota, pulled_at, stale):
+    Returns (props_df, td_df, first_td_df, quota, pulled_at, stale):
     - pulled_at: when this data was actually fetched from the API (not
       necessarily just now - could be from the on-disk cache).
     - stale: True if this is a fallback to the last known good pull,
@@ -403,9 +453,9 @@ def load_prop_lines_with_cache(api_key: str):
     now = datetime.datetime.now()
 
     if cached and (now - cached["pulled_at"]) < datetime.timedelta(hours=24):
-        return cached["props_df"], cached["td_df"], cached["quota"], cached["pulled_at"], False
+        return cached["props_df"], cached["td_df"], cached["first_td_df"], cached["quota"], cached["pulled_at"], False
 
-    props_df, td_df, quota = load_prop_lines(api_key)
+    props_df, td_df, first_td_df, quota = load_prop_lines(api_key)
 
     # Only fall back to the stale cache when the fresh attempt didn't
     # really tell us anything new: either it was deliberately skipped to
@@ -416,10 +466,10 @@ def load_prop_lines_with_cache(api_key: str):
     # should be trusted and cached as current, not treated as a failure).
     fresh_pull_uninformative = quota.get("skipped") or (bool(api_key) and quota.get("remaining") is None)
     if cached and fresh_pull_uninformative:
-        return cached["props_df"], cached["td_df"], cached["quota"], cached["pulled_at"], True
+        return cached["props_df"], cached["td_df"], cached["first_td_df"], cached["quota"], cached["pulled_at"], True
 
-    _write_prop_lines_cache_file(props_df, td_df, quota, now)
-    return props_df, td_df, quota, now, False
+    _write_prop_lines_cache_file(props_df, td_df, first_td_df, quota, now)
+    return props_df, td_df, first_td_df, quota, now, False
 
 
 def geocode_city(city: str):

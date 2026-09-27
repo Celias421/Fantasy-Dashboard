@@ -15,11 +15,22 @@ import roster_store
 import slip_parser
 import slip_store
 import theme
+from schedule_logic import (
+    FLEX_ELIGIBLE,
+    SLOT_ORDER,
+    build_lineup_slots,
+    build_next_opponent_map,
+    format_gametime,
+    format_kickoff,
+    matchup_adjustment,
+    optimize_lineup,
+    teams_playing_this_week,
+)
 from config import CURRENT_SEASON, PROP_MARKET_MAP, TEAM_CITY, INDOOR_ROOF_STATES, ODDS_API_SAFETY_BUFFER
 from data_loader import (
     load_starter_stats, load_player_meta, load_team_meta, load_defense_ranks, load_schedule,
     load_current_injuries, load_prop_lines_with_cache, geocode_city, load_game_weather,
-    load_all_seasons_schedule,
+    load_all_seasons_schedule, clear_nflverse_cache,
 )
 
 st.set_page_config(page_title="The Prop Shop", layout="wide", page_icon="🏈")
@@ -34,7 +45,7 @@ theme.render_header()
 
 PROP_STATS_BY_POSITION = {
     "QB": ["passing_yards", "passing_tds", "rushing_yards", "fantasy_points_ppr"],
-    "RB": ["rushing_yards", "rushing_tds", "receiving_yards", "fantasy_points_ppr"],
+    "RB": ["rushing_yards", "rushing_tds", "receiving_yards", "receptions", "fantasy_points_ppr"],
     "WR": ["receiving_yards", "receptions", "receiving_tds", "fantasy_points_ppr"],
     "TE": ["receiving_yards", "receptions", "receiving_tds", "fantasy_points_ppr"],
 }
@@ -96,7 +107,7 @@ def _get_prop_lines_with_timestamp():
     path so a normal page rerun doesn't even need to re-read that file."""
     empty_quota = {"remaining": None, "used": None, "skipped": False}
     try:
-        props_df, td_df, quota, pulled_at, stale = load_prop_lines_with_cache(ODDS_API_KEY)
+        props_df, td_df, first_td_df, quota, pulled_at, stale = load_prop_lines_with_cache(ODDS_API_KEY)
     except Exception:
         # Belt-and-suspenders: load_prop_lines_with_cache is written to
         # never raise, but this function runs at the top of every single
@@ -104,14 +115,15 @@ def _get_prop_lines_with_timestamp():
         # showing "no prop lines today" beats crashing the whole app.
         props_df = pd.DataFrame(columns=["player", "market", "point"])
         td_df = pd.DataFrame(columns=["player", "implied_prob"])
+        first_td_df = pd.DataFrame(columns=["player", "implied_prob"])
         quota = empty_quota
         pulled_at = datetime.datetime.now()
         stale = False
-    return props_df, td_df, quota, pulled_at, stale
+    return props_df, td_df, first_td_df, quota, pulled_at, stale
 
 
 def get_prop_lines() -> pd.DataFrame:
-    df, _, _, _, _ = _get_prop_lines_with_timestamp()
+    df, _, _, _, _, _ = _get_prop_lines_with_timestamp()
     return df
 
 
@@ -119,12 +131,22 @@ def get_anytime_td_odds() -> pd.DataFrame:
     """player -> implied_prob (0-100): the market's implied chance a
     player scores any touchdown this week. See load_prop_lines for why
     this is kept separate from get_prop_lines()."""
-    _, td_df, _, _, _ = _get_prop_lines_with_timestamp()
+    _, td_df, _, _, _, _ = _get_prop_lines_with_timestamp()
     return td_df
 
 
+def get_first_td_odds() -> pd.DataFrame:
+    """player -> implied_prob (0-100): the market's implied chance a
+    player is specifically the FIRST player to score in their game - a
+    narrower bet than get_anytime_td_odds(), and the market behind the
+    First TD tab. See load_prop_lines for why this is kept separate from
+    both get_prop_lines() and get_anytime_td_odds()."""
+    _, _, first_td_df, _, _, _ = _get_prop_lines_with_timestamp()
+    return first_td_df
+
+
 def get_prop_lines_updated_at() -> datetime.datetime:
-    _, _, _, updated_at, _ = _get_prop_lines_with_timestamp()
+    _, _, _, _, updated_at, _ = _get_prop_lines_with_timestamp()
     return updated_at
 
 
@@ -133,14 +155,14 @@ def get_odds_api_quota() -> dict:
     Odds API's own usage-credit counters as of the last refresh, plus
     whether that refresh skipped pulling odds to protect the safety
     buffer (see ODDS_API_SAFETY_BUFFER in config.py)."""
-    _, _, quota, _, _ = _get_prop_lines_with_timestamp()
+    _, _, _, quota, _, _ = _get_prop_lines_with_timestamp()
     return quota
 
 
 def get_prop_lines_are_stale() -> bool:
     """True if what's showing is a fallback to the last known good pull
     (because a fresh one was skipped or failed), not today's actual pull."""
-    _, _, _, _, stale = _get_prop_lines_with_timestamp()
+    _, _, _, _, _, stale = _get_prop_lines_with_timestamp()
     return stale
 
 
@@ -318,52 +340,6 @@ def add_matchup_display(df: pd.DataFrame, home_away_lookup: pd.DataFrame) -> pd.
     return df
 
 
-def format_gametime(gametime) -> str:
-    """'HH:MM' (24h, Eastern) -> '1:00 PM'. Just the time, with no
-    weekday/date attached - used where the date is already shown
-    separately (the Matchups table's own Kickoff column, game-picker
-    labels) so the time isn't duplicated with format_kickoff()'s
-    "Sun 1:00 PM" form."""
-    if not gametime or pd.isna(gametime):
-        return ""
-    try:
-        return pd.Timestamp(f"2000-01-01 {gametime}").strftime("%-I:%M %p")
-    except (ValueError, TypeError):
-        return ""
-
-
-def format_kickoff(gameday, gametime) -> str:
-    """'gameday' (a date) and 'gametime' (a "HH:MM", 24h Eastern string) -
-    nflverse's schedule keeps them as two separate columns - combined into
-    one short label like "Sun 1:00 PM". Returns "" if either piece is
-    missing (a game far enough out that a time hasn't been set yet)."""
-    if pd.isna(gameday) or not gametime or pd.isna(gametime):
-        return ""
-    try:
-        ts = pd.Timestamp(f"{pd.Timestamp(gameday).strftime('%Y-%m-%d')} {gametime}")
-    except (ValueError, TypeError):
-        return ""
-    return ts.strftime("%a %-I:%M %p")
-
-
-def build_next_opponent_map(schedule: pd.DataFrame) -> pd.DataFrame:
-    """team -> next scheduled opponent + week + home/away + kickoff time,
-    based on games not yet played. Kickoff comes along for the ride so
-    every matchup label built from this map (cards, badges, lineup rows,
-    roster comparison) can show "Sun 1:00 PM" alongside the opponent
-    instead of just the week number."""
-    upcoming = schedule[schedule["home_score"].isna()].sort_values("gameday")
-    rows = []
-    for _, g in upcoming.iterrows():
-        kickoff = format_kickoff(g.get("gameday"), g.get("gametime"))
-        rows.append((g["home_team"], g["away_team"], g["week"], True, kickoff))
-        rows.append((g["away_team"], g["home_team"], g["week"], False, kickoff))
-    if not rows:
-        return pd.DataFrame(columns=["team", "opponent", "week", "is_home", "kickoff"])
-    next_opp = pd.DataFrame(rows, columns=["team", "opponent", "week", "is_home", "kickoff"])
-    return next_opp.drop_duplicates(subset="team", keep="first")
-
-
 # Distinct icons for home/away, used everywhere a matchup badge appears
 # (cards, Deep Dive, Prop Comparator) so the two are recognizable at a
 # glance, not just from the vs/@ text.
@@ -464,6 +440,22 @@ def anytime_td_badge_html(pct: float, tag: str = "div") -> str:
     return pill_badge_html(label, probability_color(pct), tag, title=title)
 
 
+def first_td_badge_html(pct: float, tag: str = "div") -> str:
+    """'First TD: NN%' badge - same styling/coloring rules as
+    anytime_td_badge_html, but for the much narrower "scores the FIRST
+    touchdown of the game" market rather than "scores any touchdown".
+    Kept as its own small badge (🥇 vs 🎯) so the two are never confused
+    at a glance - a player can have a modest anytime-TD chance but still
+    be the clear first-scorer favorite on his own team, or vice versa."""
+    title = (
+        "Betting market's implied probability (averaged across bookmakers) that this player scores "
+        "the FIRST touchdown of the game - a narrower bet than Anytime TD. Includes the sportsbook's "
+        "margin, so it runs a bit high vs. true odds. Not a Prop Shop projection."
+    )
+    label = f"🥇 First TD: {pct:.0f}%"
+    return pill_badge_html(label, probability_color(pct), tag, title=title)
+
+
 def _matchup_label(team: str, position: str, stat: str, next_opp_map: pd.DataFrame, defense_ranks: pd.DataFrame, plain: bool = False):
     """(text, rank) for a team's next scheduled opponent - text like
     '🏠 vs OPP — #N toughest' (home) or '✈️ @ OPP — #N toughest' (away),
@@ -514,6 +506,7 @@ def build_player_summary(view: pd.DataFrame, sort_stat: str) -> pd.DataFrame:
     injuries = get_injuries()
     prop_lines = get_prop_lines()
     anytime_td = get_anytime_td_odds()
+    first_td = get_first_td_odds()
     defense_ranks = get_defense_ranks()
     next_opp_map = build_next_opponent_map(get_schedule())
     prop_market = PROP_MARKET_MAP.get(sort_stat)
@@ -542,6 +535,16 @@ def build_player_summary(view: pd.DataFrame, sort_stat: str) -> pd.DataFrame:
             if not td_match.empty:
                 td_odds_pct = float(td_match["implied_prob"].iloc[0])
 
+        # First-TD odds: same shape as anytime-TD above, narrower market
+        # (see get_first_td_odds / first_td_badge_html). Kept as its own
+        # column rather than folded into td_odds_pct so a card can show
+        # both badges side by side without one overwriting the other.
+        first_td_pct = None
+        if not first_td.empty:
+            first_td_match = first_td[first_td["player"] == player]
+            if not first_td_match.empty:
+                first_td_pct = float(first_td_match["implied_prob"].iloc[0])
+
         # Matchup rank: how tough is the upcoming opponent against this position/stat?
         matchup_result = _matchup_label(team, position, sort_stat, next_opp_map, defense_ranks)
         matchup_label, matchup_rank = matchup_result if matchup_result else (None, None)
@@ -569,6 +572,7 @@ def build_player_summary(view: pd.DataFrame, sort_stat: str) -> pd.DataFrame:
             "has_prop": has_prop,
             "delta": delta,
             "td_odds_pct": td_odds_pct,
+            "first_td_pct": first_td_pct,
             "matchup_label": matchup_label,
             "matchup_rank": matchup_rank,
             "injury_label": injury_label,
@@ -594,6 +598,8 @@ def render_player_cards(summary_df: pd.DataFrame, sort_stat: str, cols_per_row: 
                     badges += matchup_badge_html(p["matchup_label"], int(p["matchup_rank"]))
                 if pd.notna(p.get("td_odds_pct")):
                     badges += anytime_td_badge_html(p["td_odds_pct"])
+                if pd.notna(p.get("first_td_pct")):
+                    badges += first_td_badge_html(p["first_td_pct"])
                 if pd.notna(p.get("injury_label")):
                     badges += f'<div class="injury-badge">{p["injury_label"]}</div>'
 
@@ -651,6 +657,13 @@ else:
             st.rerun()
 
 if st.button("Refresh all data now"):
+    # Clearing st.cache_data alone isn't enough - nflreadpy (the library
+    # that actually downloads rosters/stats/schedules from nflverse) keeps
+    # its own separate cache underneath this one, so without also clearing
+    # that, this button could still silently serve up to an hour-old data
+    # (see clear_nflverse_cache's docstring in data_loader.py). Both need
+    # to be cleared together for "refresh now" to actually mean "now".
+    clear_nflverse_cache()
     st.cache_data.clear()
     st.rerun()
 
@@ -785,50 +798,9 @@ def render_rosters_tab():
 # editable on the My Rosters tab; roster_store.DEFAULT_LINEUP_SETTINGS is
 # what a roster gets until someone changes it. No DEF/K slots since TPS
 # doesn't track defense/kicker stats, so those aren't configurable here.
-FLEX_ELIGIBLE = {"RB", "WR", "TE"}
-# Order fixed slots are filled/displayed in - FLEX is always last so it
-# only sees leftovers after every dedicated position slot is filled first.
-SLOT_ORDER = ["QB", "RB", "WR", "TE", "FLEX"]
-
-
-def build_lineup_slots(lineup_settings: dict) -> list:
-    """Turns {"QB": 1, "RB": 2, ...} into a flat, ordered slot list like
-    ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "FLEX"] - what
-    optimize_lineup and the lineup display actually iterate over. A slot
-    count of 0 just omits that slot entirely (e.g. a QB: 0 means no
-    starting QB slot in a 2-QB-required league doesn't apply here, but a
-    true 0 is still handled the same as any other count)."""
-    slots = []
-    for slot in SLOT_ORDER:
-        slots.extend([slot] * lineup_settings.get(slot, 0))
-    return slots
-
-
-def matchup_adjustment(rank) -> float:
-    """Turn an opponent's fantasy-points-allowed rank (1=toughest,
-    32=easiest) into a simple, transparent multiplier on season-average
-    points: 0.85x facing the toughest defense, 1.15x facing the easiest,
-    linear in between. This is deliberately simple (not a real statistical
-    model) so the "why" behind a projection is easy to explain to someone
-    looking at it, rather than a black box."""
-    if rank is None:
-        return 1.0
-    return 0.85 + (rank - 1) / 31 * 0.30
-
-
-def teams_playing_this_week(schedule: pd.DataFrame) -> set:
-    """Every team with a game in the soonest upcoming week - NOT the same
-    as "has a next opponent" (build_next_opponent_map finds each team's
-    next game regardless of how far out it is, so a team on a bye this
-    week would still show a normal-looking matchup for the following
-    week). This is specifically "will they play in the next slate of
-    games", which is what actually matters for a lineup decision."""
-    upcoming = schedule[schedule["home_score"].isna()].sort_values("gameday")
-    if upcoming.empty:
-        return set()
-    next_week = upcoming["week"].min()
-    this_week = upcoming[upcoming["week"] == next_week]
-    return set(this_week["home_team"]) | set(this_week["away_team"])
+# FLEX_ELIGIBLE, SLOT_ORDER, build_lineup_slots, matchup_adjustment, and
+# teams_playing_this_week now live in schedule_logic.py (imported above)
+# so they can be unit tested without importing this whole Streamlit script.
 
 
 def compute_lineup_projections(roster_players: list) -> pd.DataFrame:
@@ -891,42 +863,6 @@ def compute_lineup_projections(roster_players: list) -> pd.DataFrame:
             "injury_status": inj_status, "note": note, "headshot_url": headshot_url,
         })
     return pd.DataFrame(rows)
-
-
-def optimize_lineup(proj_df: pd.DataFrame, lineup_slots: list):
-    """Greedy best-lineup pick: fill QB/RB/RB/WR/WR/TE (or whatever the
-    roster's own lineup_slots says - counts vary by league) with the
-    highest projected-points player at each position, then each FLEX slot
-    with the best leftover RB/WR/TE. lineup_slots order matters - fixed
-    slots always get first pick and FLEX only sees what's left, which is
-    what makes any number of FLEX slots work correctly, not just one.
-    Players marked "Out" or on a "Bye" are excluded entirely (not real
-    decisions - they literally can't play), but Doubtful/Questionable are
-    left in and just flagged - those are real game-time calls, not TPS's
-    to make for you.
-    Returns (lineup: dict slot_key -> row or None, bench: DataFrame,
-    unfillable: list of slots with no eligible player left)."""
-    available = proj_df[~proj_df["injury_status"].isin(["Out", "Bye"])].copy()
-    used_players = set()
-    lineup = {}
-    unfillable = []
-
-    for i, slot in enumerate(lineup_slots):
-        eligible_positions = FLEX_ELIGIBLE if slot == "FLEX" else {slot}
-        pool = available[
-            available["position"].isin(eligible_positions) & (~available["player"].isin(used_players))
-        ].sort_values("proj_points", ascending=False)
-        key = f"{slot}_{i}"
-        if pool.empty:
-            lineup[key] = None
-            unfillable.append(slot)
-        else:
-            pick = pool.iloc[0]
-            lineup[key] = pick
-            used_players.add(pick["player"])
-
-    bench = proj_df[~proj_df["player"].isin(used_players)].sort_values("proj_points", ascending=False)
-    return lineup, bench, unfillable
 
 
 def render_lineup_tab():
@@ -1065,8 +1001,8 @@ if tab_side == "🏈 Fantasy Lineups":
         ["📋 Overview", "🔍 Player Deep Dive", "🩹 Injuries", "🗓️ Matchups", "👥 My Rosters", "🏆 Lineup Optimizer"]
     )
 else:
-    tab_props, tab_game, tab_slips = st.tabs(
-        ["🎯 Prop Comparator", "🏟️ Game Center", "🧾 Bet Slip Tracker"]
+    tab_props, tab_firsttd, tab_game, tab_slips = st.tabs(
+        ["🎯 Prop Comparator", "🥇 First TD", "🏟️ Game Center", "🧾 Bet Slip Tracker"]
     )
 
 if st.session_state.pop("show_jump_toast", False):
@@ -1129,8 +1065,9 @@ if tab_side == "🏈 Fantasy Lineups":
                 theme.info_popover(
                     "**Badge key:** matchup badges show the upcoming opponent's defensive rank (color: red = "
                     "toughest, green = easiest). 🎯 Anytime TD is the betting market's implied chance this player "
-                    "scores any touchdown this week — a market probability, not a Prop Shop projection. Hover a "
-                    "badge for details.",
+                    "scores any touchdown this week; 🥇 First TD is the narrower chance they score the game's "
+                    "FIRST touchdown (see the First TD tab on the Prop Bets side for the full breakdown) — both "
+                    "are market probabilities, not Prop Shop projections. Hover a badge for details.",
                     label="ℹ️ Badge key",
                 )
             render_player_cards(summary_df, sort_stat, cols_per_row=4)
@@ -1158,6 +1095,10 @@ if tab_side == "🏈 Fantasy Lineups":
                 td_match = td_odds[td_odds["player"] == info["player"]] if not td_odds.empty else td_odds
                 if not td_match.empty:
                     st.markdown(anytime_td_badge_html(float(td_match["implied_prob"].iloc[0]), tag="span"), unsafe_allow_html=True)
+                first_td_odds = get_first_td_odds()
+                first_td_match = first_td_odds[first_td_odds["player"] == info["player"]] if not first_td_odds.empty else first_td_odds
+                if not first_td_match.empty:
+                    st.markdown(first_td_badge_html(float(first_td_match["implied_prob"].iloc[0]), tag="span"), unsafe_allow_html=True)
 
             metrics_source = pdf_current if not pdf_current.empty else pdf_full
             avg, last, trend, consistency = compute_summary(metrics_source, "fantasy_points_ppr")
@@ -1636,6 +1577,10 @@ else:
             prop_td_match = prop_td_odds[prop_td_odds["player"] == prop_player] if not prop_td_odds.empty else prop_td_odds
             if not prop_td_match.empty:
                 st.markdown(anytime_td_badge_html(float(prop_td_match["implied_prob"].iloc[0]), tag="span"), unsafe_allow_html=True)
+            prop_first_td_odds = get_first_td_odds()
+            prop_first_td_match = prop_first_td_odds[prop_first_td_odds["player"] == prop_player] if not prop_first_td_odds.empty else prop_first_td_odds
+            if not prop_first_td_match.empty:
+                st.markdown(first_td_badge_html(float(prop_first_td_match["implied_prob"].iloc[0]), tag="span"), unsafe_allow_html=True)
 
         with c2:
             prop_stat = st.selectbox("Stat", available_stats, key="prop_stat") if available_stats else None
@@ -1717,6 +1662,153 @@ else:
             )
         else:
             st.info("No stats available for this player yet this season.")
+
+    # ---------------- First TD (dedicated view/analytics) ----------------
+    with tab_firsttd:
+        st.subheader("First Touchdown Scorer")
+        st.caption(
+            "Who's most likely to score the FIRST touchdown of their game this week - a much narrower, "
+            "more concentrated bet than \"any\" touchdown. Odds come from The Odds API's player_1st_td market."
+        )
+
+        first_td_odds = get_first_td_odds()
+
+        if first_td_odds.empty:
+            st.info(
+                "No First TD odds available right now - either the odds pull hasn't found this market yet, "
+                "the safety buffer paused today's refresh, or it's off-season/bye week for every tracked team. "
+                "Try \"Refresh prop lines now\" above.",
+            )
+        else:
+            anytime_td_odds = get_anytime_td_odds()
+            schedule_for_ftd = get_schedule()
+            next_opp_map_ftd = build_next_opponent_map(schedule_for_ftd)
+
+            # One row per tracked player with First TD odds - pull in season
+            # context (TDs, games, rate) and the anytime-TD number for the
+            # "share of anytime" comparison below, the same way
+            # build_player_summary does for the Overview cards.
+            ftd_rows = []
+            for player, pdf in current_season_df.groupby("player"):
+                match = first_td_odds[first_td_odds["player"] == player]
+                if match.empty:
+                    continue
+                first_pct = float(match["implied_prob"].iloc[0])
+
+                first_row = pdf.iloc[0]
+                team = first_row["team"]
+                position = first_row["position"]
+
+                anytime_match = anytime_td_odds[anytime_td_odds["player"] == player] if not anytime_td_odds.empty else pd.DataFrame()
+                anytime_pct = float(anytime_match["implied_prob"].iloc[0]) if not anytime_match.empty else None
+                # How concentrated this player is as their team's early scoring
+                # threat: what share of their overall TD chance is specifically
+                # for being FIRST. Only meaningful when they actually have an
+                # anytime-TD price to divide into - a tiny anytime number with
+                # no first-TD context isn't a useful ratio.
+                share_of_anytime = round((first_pct / anytime_pct) * 100) if anytime_pct else None
+
+                total_tds = 0
+                for col in ("rushing_tds", "receiving_tds"):
+                    if col in pdf.columns:
+                        total_tds += pdf[col].sum()
+                games_played = pdf["week"].nunique()
+                tds_per_game = round(total_tds / games_played, 2) if games_played else 0.0
+
+                opp_row = next_opp_map_ftd[next_opp_map_ftd["team"] == team]
+                if not opp_row.empty:
+                    is_home = bool(opp_row["is_home"].iloc[0])
+                    opponent_text = f"{'vs' if is_home else '@'} {opp_row['opponent'].iloc[0]}"
+                    kickoff = opp_row["kickoff"].iloc[0] if "kickoff" in opp_row.columns else ""
+                else:
+                    opponent_text = "Bye / no game"
+                    kickoff = ""
+
+                ftd_rows.append({
+                    "player": player,
+                    "team": team,
+                    "position": position,
+                    "headshot_url": first_row.get("headshot_url"),
+                    "team_color": first_row.get("team_color") or "#444444",
+                    "opponent": opponent_text,
+                    "kickoff": kickoff,
+                    "first_td_pct": first_pct,
+                    "anytime_td_pct": anytime_pct,
+                    "share_of_anytime": share_of_anytime,
+                    "season_tds": int(total_tds),
+                    "tds_per_game": tds_per_game,
+                })
+
+            ftd_df = pd.DataFrame(ftd_rows)
+
+            if ftd_df.empty:
+                st.info("First TD odds came back, but none matched a currently tracked starter.")
+            else:
+                f1, f2 = st.columns(2)
+                with f1:
+                    ftd_positions = st.multiselect(
+                        "Position", ["QB", "RB", "WR", "TE"], default=["RB", "WR", "TE"], key="ftd_positions",
+                    )
+                with f2:
+                    ftd_teams = st.multiselect("Team", sorted(ftd_df["team"].dropna().unique()), default=[], key="ftd_teams")
+
+                filtered = ftd_df[ftd_df["position"].isin(ftd_positions)] if ftd_positions else ftd_df
+                if ftd_teams:
+                    filtered = filtered[filtered["team"].isin(ftd_teams)]
+                filtered = filtered.sort_values("first_td_pct", ascending=False)
+
+                if filtered.empty:
+                    st.info("No players match the current filters.")
+                else:
+                    st.markdown("##### This week's favorites")
+                    top3 = filtered.head(3)
+                    medal_cols = st.columns(len(top3))
+                    medals = ["🥇", "🥈", "🥉"]
+                    for medal, col, (_, row) in zip(medals, medal_cols, top3.iterrows()):
+                        with col:
+                            photo = sized_headshot(row["headshot_url"], 96) if pd.notna(row["headshot_url"]) else ""
+                            img_tag = f'<img src="{photo}" width="96" height="96" onerror="this.style.display=\'none\'"/>' if photo else ""
+                            st.markdown(f"""
+                            <div class="player-card" style="border-left: 4px solid {row['team_color']}; text-align:center;">
+                                <div style="font-size:22px;">{medal}</div>
+                                {img_tag}
+                                <div style="font-weight:600; margin-top:6px;">{row['player']}</div>
+                                <div style="font-size:12px; color:#999;">{team_logo_html(row['team'])}{row['position']} · {row['team']}</div>
+                                <div class="stat-big">{row['first_td_pct']:.0f}%</div>
+                                <div class="stat-label">First TD chance</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                    st.markdown("##### Full board")
+                    display_cols = filtered[[
+                        "player", "team", "position", "opponent", "kickoff",
+                        "first_td_pct", "anytime_td_pct", "share_of_anytime", "season_tds", "tds_per_game",
+                    ]].rename(columns={
+                        "player": "Player", "team": "Team", "position": "Pos", "opponent": "Opponent",
+                        "kickoff": "Kickoff", "first_td_pct": "First TD %", "anytime_td_pct": "Anytime TD %",
+                        "share_of_anytime": "Share of Anytime %", "season_tds": f"{CURRENT_SEASON} TDs",
+                        "tds_per_game": "TDs/Game",
+                    })
+                    st.dataframe(
+                        display_cols, use_container_width=True, hide_index=True, row_height=38,
+                        column_config={
+                            "First TD %": st.column_config.NumberColumn(format="%.0f%%"),
+                            "Anytime TD %": st.column_config.NumberColumn(format="%.0f%%"),
+                            "Share of Anytime %": st.column_config.NumberColumn(format="%.0f%%"),
+                            "TDs/Game": st.column_config.NumberColumn(format="%.2f"),
+                        },
+                    )
+                    st.caption(
+                        "**Share of Anytime %** = First TD chance ÷ Anytime TD chance. A high share means most of "
+                        "this player's touchdown equity comes from getting there FIRST (an early-game, "
+                        "concentrated role) rather than just scoring at some point. Both percentages are the "
+                        "betting market's implied probability, including the sportsbook's margin - not a Prop "
+                        "Shop projection."
+                    )
+
+        quota_ftd = get_odds_api_quota()
+        if quota_ftd["remaining"] is not None:
+            st.caption(f"🔑 Odds API quota: {quota_ftd['remaining']:,} credits remaining this billing period.")
 
     # ---------------- Game Center (single-game breakdown) ----------------
     with tab_game:
@@ -2011,4 +2103,10 @@ else:
                     slip_store.delete_slip(st.secrets, del_id)
                     st.success("Deleted.")
                     st.rerun()
+
+
+# Runs after the Fantasy Lineups / Prop Bets if-else above completes, so
+# this shows once at the true bottom of the page on every tab and every
+# sub-tab, regardless of which side is active.
+theme.render_footer()
 
