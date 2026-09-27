@@ -580,7 +580,10 @@ def render_player_cards(summary_df: pd.DataFrame, sort_stat: str, cols_per_row: 
                 """, unsafe_allow_html=True)
 
 
-st.caption(f"Current season: {CURRENT_SEASON}. Trend charts include prior seasons' data for longer-term context.")
+theme.info_popover(
+    f"**Current season:** {CURRENT_SEASON}. Trend charts include prior seasons' data for longer-term context.",
+    label="ℹ️ Season info",
+)
 
 if not ODDS_API_KEY:
     st.info("No prop odds API key configured yet - card deltas will show \"No prop line\" until one is added. See README for setup.", icon="ℹ️")
@@ -903,12 +906,17 @@ def render_lineup_tab():
     lineup, bench, unfillable = optimize_lineup(proj_df, lineup_slots)
 
     settings_summary = " / ".join(f"{n} {slot}" for slot, n in lineup_settings.items() if n > 0)
-    st.caption(
-        f"League settings for this roster: {settings_summary} (edit on the **My Rosters** tab). "
-        "Projections = this season's average PPR points per game, adjusted ±15% by the upcoming opponent's "
-        "defensive rank against that position (see the Matchups tab for how that rank is computed). This is a "
-        "simple, transparent estimate, not a black-box model - use it as a starting point, not gospel."
-    )
+    cap_col, info_col = st.columns([5, 1])
+    with cap_col:
+        st.caption(f"League settings for this roster: {settings_summary} (edit on the **My Rosters** tab).")
+    with info_col:
+        theme.info_popover(
+            "**How projections are calculated:** this season's average PPR points per game, adjusted ±15% by "
+            "the upcoming opponent's defensive rank against that position (see the Matchups tab for how that "
+            "rank is computed). This is a simple, transparent estimate, not a black-box model - use it as a "
+            "starting point, not gospel.",
+            label="ℹ️ How this works",
+        )
     if unfillable:
         from collections import Counter
         counts = Counter(unfillable)
@@ -1043,12 +1051,17 @@ if tab_side == "🏈 Fantasy Lineups":
         if summary_df.empty:
             st.info("No players match the current filters, or the season hasn't started yet.")
         else:
-            st.caption(f"{len(summary_df)} players — {CURRENT_SEASON} season, ranked by {sort_stat.replace('_', ' ')}")
-            st.caption(
-                "Badge key: matchup badges show the upcoming opponent's defensive rank (color: red = toughest, "
-                "green = easiest). 🎯 Anytime TD is the betting market's implied chance this player scores any "
-                "touchdown this week — a market probability, not a Prop Shop projection. Hover a badge for details."
-            )
+            cnt_col, badge_info_col = st.columns([5, 1])
+            with cnt_col:
+                st.caption(f"{len(summary_df)} players — {CURRENT_SEASON} season, ranked by {sort_stat.replace('_', ' ')}")
+            with badge_info_col:
+                theme.info_popover(
+                    "**Badge key:** matchup badges show the upcoming opponent's defensive rank (color: red = "
+                    "toughest, green = easiest). 🎯 Anytime TD is the betting market's implied chance this player "
+                    "scores any touchdown this week — a market probability, not a Prop Shop projection. Hover a "
+                    "badge for details.",
+                    label="ℹ️ Badge key",
+                )
             render_player_cards(summary_df, sort_stat, cols_per_row=4)
 
     # ---------------- Player Deep Dive (full history) ----------------
@@ -1269,11 +1282,16 @@ if tab_side == "🏈 Fantasy Lineups":
         if all_injuries.empty:
             st.info("No injury report available yet this week.")
         else:
-            st.caption(
-                f"Every player on the official NFL injury report for week {int(all_injuries['week'].iloc[0])} "
-                f"({CURRENT_SEASON} season) - not just tracked starters, so you can catch handcuffs and "
-                "breakout candidates too. Sourced from nflverse's copy of the official team-submitted reports."
-            )
+            inj_cap_col, inj_info_col = st.columns([5, 1])
+            with inj_cap_col:
+                st.caption(f"Week {int(all_injuries['week'].iloc[0])} ({CURRENT_SEASON} season) — full league injury report.")
+            with inj_info_col:
+                theme.info_popover(
+                    "Every player on the official NFL injury report - not just tracked starters, so you can "
+                    "catch handcuffs and breakout candidates too. Sourced from nflverse's copy of the official "
+                    "team-submitted reports.",
+                    label="ℹ️ About this report",
+                )
 
             STATUS_EMOJI = {"Out": "🔴", "Doubtful": "🟠", "Questionable": "🟡", "Injured Reserve": "🔴", "IR": "🔴"}
             STATUS_ORDER = {"Out": 0, "Doubtful": 1, "Questionable": 2}
@@ -1476,13 +1494,16 @@ if tab_side == "🏈 Fantasy Lineups":
             else:
                 st.dataframe(matchups_df[display_cols], use_container_width=True, hide_index=True, column_config=column_config)
 
-            st.caption(
-                "\"Away @ Home\" convention throughout - the Home column is the team hosting. Implied totals split "
-                "the game total by the spread. Weather is a live forecast (Open-Meteo, refreshes every few hours) for "
-                "games within about 16 days, or the actual recorded conditions for games already played. Domed/closed-roof "
-                "and neutral-site games show no weather since it doesn't apply or the venue differs from the "
-                "home team's usual city."
-            )
+            _, mm_info_col = st.columns([5, 1])
+            with mm_info_col:
+                theme.info_popover(
+                    "**\"Away @ Home\" convention throughout** - the Home column is the team hosting. Implied "
+                    "totals split the game total by the spread. Weather is a live forecast (Open-Meteo, refreshes "
+                    "every few hours) for games within about 16 days, or the actual recorded conditions for games "
+                    "already played. Domed/closed-roof and neutral-site games show no weather since it doesn't "
+                    "apply or the venue differs from the home team's usual city.",
+                    label="ℹ️ How to read this table",
+                )
 
             st.divider()
             jump_col1, jump_col2 = st.columns([3, 1])

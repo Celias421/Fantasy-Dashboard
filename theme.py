@@ -117,16 +117,26 @@ def inject_css() -> None:
     }}
 
     /* ---- Header / masthead --------------------------------------------- */
-    /* Spans the full content width on purpose - the logo's own artwork is
-       a full-bleed chalkboard background (play-diagram X's/O's), so
-       constraining its width left it looking like a cropped rectangle
-       floating on the left with the pattern cut off mid-way. Full width
-       lets that background read as one continuous banner instead. */
+    /* Logo is a transparent-background wordmark (no full-bleed artwork to
+       preserve), so it's centered at a fixed, comfortable height rather
+       than stretched to the page's full width - reads as a clean masthead
+       instead of an oversized banner. */
     .tps-header {{
-        padding: 6px 0 4px;
+        padding: 10px 0 6px;
         margin-bottom: 4px;
+        display: flex;
+        justify-content: center;
     }}
-    .tps-header img {{ display: block; width: 100%; height: auto; max-height: 260px; object-fit: cover; object-position: center 35%; border-radius: 10px; }}
+    .tps-header img {{
+        display: block;
+        height: 150px;
+        width: auto;
+        max-width: 100%;
+        object-fit: contain;
+    }}
+    @media (max-width: 640px) {{
+        .tps-header img {{ height: 90px; }}
+    }}
     .tps-tagline {{ color: {SUB}; font-size: 13px; margin: -2px 0 14px 2px; letter-spacing: .01em; }}
     .tps-divider {{
         height: 2px; border-radius: 2px; margin: 0 0 18px;
@@ -154,15 +164,37 @@ def inject_css() -> None:
         color: #06210A !important;
     }}
 
-    /* ---- Tabs -------------------------------------------------------------- */
+    /* ---- Tabs --------------------------------------------------------------
+       Default Streamlit packs tabs tightly against the left edge. Spreading
+       them across the full width (space-between the tab list, flex-grow on
+       each tab) makes the tab bar read as a proper section-navigator rather
+       than a cramped row of labels, especially with 6-8 tabs on a wide page. */
+    [data-testid="stTabs"] [role="tablist"] {{
+        display: flex;
+        width: 100%;
+        justify-content: space-between;
+        gap: 4px;
+        border-bottom: 1px solid {LINE};
+    }}
     [data-testid="stTabs"] button[role="tab"] {{
+        flex: 1 1 0;
+        justify-content: center;
         font-weight: 600; color: {SUB};
+        padding: 10px 14px;
     }}
     [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {{
         color: {INK};
     }}
     [data-testid="stTabs"] [data-baseweb="tab-highlight"] {{
         background-color: {ACCENT} !important;
+    }}
+    @media (max-width: 900px) {{
+        [data-testid="stTabs"] [role="tablist"] {{
+            overflow-x: auto;
+        }}
+        [data-testid="stTabs"] button[role="tab"] {{
+            flex: 0 0 auto;
+        }}
     }}
 
     /* ---- Fantasy Lineups / Prop Bets radio -> pill toggle ------------------ */
@@ -233,6 +265,18 @@ def inject_css() -> None:
     }}
     </style>
     """, unsafe_allow_html=True)
+
+
+def info_popover(text: str, label: str = "ℹ️ Details", *, use_container_width: bool = False) -> None:
+    """A small icon/label button that reveals an explanatory paragraph on
+    click, instead of that paragraph sitting on the page permanently as a
+    st.caption(). Used for the longer methodology/legend write-ups (how
+    projections are calculated, badge-key legends, data-source notes) that
+    were bulking up every tab - the short one-line status captions (e.g.
+    'props pulled Xs ago') are left as plain captions since those are quick
+    orientation info, not the kind of thing worth an extra click to see."""
+    with st.popover(label, use_container_width=use_container_width):
+        st.markdown(text)
 
 
 def render_header() -> None:
