@@ -31,7 +31,7 @@ from config import CURRENT_SEASON, PROP_MARKET_MAP, TEAM_CITY, INDOOR_ROOF_STATE
 from data_loader import (
     load_starter_stats, load_player_meta, load_team_meta, load_defense_ranks, load_schedule,
     load_current_injuries, load_prop_lines_with_cache, geocode_city, load_game_weather,
-    load_all_seasons_schedule, clear_nflverse_cache, load_first_td_scorers,
+    load_all_seasons_schedule, clear_nflverse_cache, load_first_td_scorers, load_snap_counts,
 )
 import pick_tracker_store
 
@@ -67,6 +67,11 @@ ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", "")
 @st.cache_data(ttl=3600)
 def get_stats() -> pd.DataFrame:
     return load_starter_stats()
+
+
+@st.cache_data(ttl=3600)
+def get_snap_counts() -> pd.DataFrame:
+    return load_snap_counts()
 
 
 @st.cache_data(ttl=3600 * 6)
@@ -477,6 +482,145 @@ def implied_total_tier(total) -> str:
 IMPLIED_TOTAL_TIER_RANK = {"high": 0, "neutral": 1, "low": 2}
 
 
+def fair_prob_color(pct: float) -> str:
+    """Same soft red -> yellow -> green gradient style as
+    implied_total_color, but centered on a fair coin flip (50%) instead
+    of a points range - a de-vigged prop's fair probability rarely
+    strays far from 50% (that's what "de-vigged" means: the market's true
+    view, not a book's marked-up price), so the whole visible gradient is
+    compressed into a tight 40-60% band on purpose. Below 40% or above
+    60% just clamps to the end color rather than needing a wider domain
+    that would make ordinary values look washed-out and rare extreme
+    ones indistinguishable from each other."""
+    t = (pct - 40.0) / (60.0 - 40.0)
+    t = min(max(t, 0.0), 1.0)
+    stops = [(0.0, theme.MATCHUP_TOUGH_RGB), (0.5, (255, 209, 102)), (1.0, theme.MATCHUP_EASY_RGB)]
+    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+        if t0 <= t <= t1:
+            local_t = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+            r = round(c0[0] + (c1[0] - c0[0]) * local_t)
+            g = round(c0[1] + (c1[1] - c0[1]) * local_t)
+            b = round(c0[2] + (c1[2] - c0[2]) * local_t)
+            return f"rgb({r},{g},{b})"
+    return "rgb(143,214,168)"
+
+
+def fair_prob_badge_html(fair_prob_over, direction: str, tag: str = "div") -> str:
+    """Small pill showing the de-vigged "fair" probability of THIS pick's
+    own side (Over or Under) hitting - the sportsbook market's true view
+    once its margin is stripped out (see _devig_two_outcome in
+    data_loader.py), as opposed to season-average-vs-line, which is our
+    own model's view. The two can and do disagree - that gap is exactly
+    the point of showing both: a big edge from our model that the market
+    itself sees as close to a coin flip is a very different bet than one
+    the market also leans toward. Purely informational (not a sort
+    factor) since it measures the market's confidence, not our own.
+    Returns "" when unknown - no bookmaker offered both Over and Under
+    prices for this player/market, which happens for thinner markets."""
+    if fair_prob_over is None or pd.isna(fair_prob_over):
+        return ""
+    pick_prob = fair_prob_over if direction == "▲ Over" else (1.0 - fair_prob_over)
+    pct = pick_prob * 100
+    title = "The sportsbook market's own de-vigged (margin stripped out) probability that this specific side hits - the market's honest view, separate from our season-average-vs-line model."
+    return pill_badge_html(f"🎯 Fair {pct:.0f}%", fair_prob_color(pct), tag, title=title)
+
+
+OPPORTUNITY_TREND_LAST_N = 3
+OPPORTUNITY_TREND_THRESHOLD_PP = 5.0
+_OPPORTUNITY_RECEIVING_STATS = {"receiving_yards", "receptions", "receiving_tds"}
+
+
+def compute_opportunity_trend(stats_df: pd.DataFrame, snap_df: pd.DataFrame, player: str, stat_col: str, current_season: int, last_n: int = OPPORTUNITY_TREND_LAST_N):
+    """A season average is a flat number - it can't tell you a player's
+    ROLE just changed. This looks at the underlying opportunity metric
+    behind a stat (not the stat itself) over the player's last `last_n`
+    games this season and compares it to their own full-season average
+    of that same metric, so a role that's growing or shrinking shows up
+    even before enough games have passed for the stat average itself to
+    catch up.
+
+    Metric picked by what `stat_col` actually measures: a receiving stat
+    (receiving_yards/receptions/receiving_tds) uses target_share (0-1,
+    that player's share of the team's own targets that week - the
+    standard receiving-opportunity metric, pulled straight from
+    nflverse's weekly stats, see KEEP_COLUMNS). Every other stat
+    (rushing, passing - and receiving stats for a player target_share
+    doesn't cover, like a pure route-runner with sparse data) falls back
+    to offense_pct (0-100, snap share) from load_snap_counts, which
+    applies to any position and stat since it just measures "how much is
+    this player even on the field."
+
+    Returns None (not a 0/neutral result) whenever there's too little
+    data to compare - fewer than 2 games played this season, or the
+    metric column itself is missing/NaN for every game - since "no
+    signal yet" and "confirmed stable" are different claims and this
+    function only makes the second one. Returns a dict with the metric
+    name, both percentages, the trend in percentage points, and a tier
+    ("up"/"down"/"stable") bucketed the same "tiered, not raw-sorted"
+    way every other signal on this page is, using
+    OPPORTUNITY_TREND_THRESHOLD_PP as the up/down cutoff."""
+    if stat_col in _OPPORTUNITY_RECEIVING_STATS:
+        metric_label = "Target Share"
+        pdf = stats_df[(stats_df["player"] == player) & (stats_df["season"] == current_season)].sort_values("week")
+        if "target_share" not in pdf.columns:
+            return None
+        values = pdf["target_share"].dropna() * 100
+    else:
+        metric_label = "Snap Share"
+        pdf = snap_df[(snap_df["player"] == player) & (snap_df["season"] == current_season)].sort_values("week")
+        if "offense_pct" not in pdf.columns:
+            return None
+        values = pdf["offense_pct"].dropna()
+
+    if len(values) < 2:
+        return None
+
+    season_pct = float(values.mean())
+    recent_pct = float(values.tail(min(last_n, len(values))).mean())
+    trend_pp = recent_pct - season_pct
+    if trend_pp >= OPPORTUNITY_TREND_THRESHOLD_PP:
+        tier = "up"
+    elif trend_pp <= -OPPORTUNITY_TREND_THRESHOLD_PP:
+        tier = "down"
+    else:
+        tier = "stable"
+    return {"metric": metric_label, "recent_pct": recent_pct, "season_pct": season_pct, "trend_pp": trend_pp, "tier": tier, "n_games": len(values)}
+
+
+def opportunity_trend_badge_html(trend: dict, tag: str = "div") -> str:
+    """Small pill rendering compute_opportunity_trend's verdict. Only
+    shown for "up"/"down" - a "stable" role isn't a signal worth taking
+    up space for on a card that's already busy with other badges (the
+    dataframe's Opportunity column still shows every tier, stable
+    included, since a table row has room and a filter/sort might want
+    it). Colored the same "reserved status color, not a gradient" way
+    confidence_badge_html is (this is a state, not a continuous scale)."""
+    if trend is None or trend["tier"] == "stable":
+        return ""
+    icon = "📈" if trend["tier"] == "up" else "📉"
+    label = "Role trending up" if trend["tier"] == "up" else "Role trending down"
+    color = theme.ACCENT if trend["tier"] == "up" else theme.BAD
+    title = (
+        f"{trend['metric']} over this player's last {min(OPPORTUNITY_TREND_LAST_N, trend['n_games'])} games "
+        f"({trend['recent_pct']:.0f}%) vs. their {CURRENT_SEASON} season average ({trend['season_pct']:.0f}%) - "
+        f"a season average alone can't show a role change like this in progress."
+    )
+    return pill_badge_html(f"{icon} {label} ({trend['trend_pp']:+.0f}pp)", color, tag, title=title)
+
+
+def opportunity_trend_text(trend: dict) -> str:
+    """Plain-text rendering of compute_opportunity_trend's verdict for a
+    st.dataframe cell (which shows HTML source literally rather than
+    rendering it, same reasoning as every other plain-text dataframe
+    column on this page) - shows every tier (including "stable"), unlike
+    the badge, since a table row has room for it and it's useful to
+    confirm "checked, nothing unusual" rather than just omitting it."""
+    if trend is None:
+        return "—"
+    icon = {"up": "📈", "down": "📉", "stable": "➖"}[trend["tier"]]
+    return f"{icon} {trend['metric']} {trend['trend_pp']:+.0f}pp"
+
+
 def probability_color(pct: float) -> str:
     """Soft red (0%, unlikely) -> yellow -> soft green (100%, likely).
     Same pastel style and stops as matchup_rank_color, oriented so a
@@ -854,6 +998,101 @@ def snapshot_hotpicks_for_tracking(edge_rows: list, td_rows: list, schedule_df: 
         pick_tracker_store.add_picks(st.secrets, new_picks)
 
 
+def _game_kickoff_timestamps(schedule_df: pd.DataFrame) -> dict:
+    """game_id -> real pd.Timestamp kickoff moment (date + time combined),
+    as opposed to a tracked pick's own "kickoff" field, which is only the
+    pre-formatted DISPLAY string ("Sun 1:00 PM") snapshot_hotpicks_for_
+    tracking stores - fine for showing on a card, useless for "has this
+    game actually started yet" comparisons, which is what
+    update_closing_lines needs. Games with no gametime posted yet are
+    skipped (same "missing means unknown, not now" treatment used
+    throughout schedule_logic.py)."""
+    timestamps = {}
+    for _, g in schedule_df.iterrows():
+        gameday, gametime, game_id = g.get("gameday"), g.get("gametime"), g.get("game_id")
+        if not game_id or pd.isna(gameday) or not gametime or pd.isna(gametime):
+            continue
+        try:
+            ts = pd.Timestamp(f"{pd.Timestamp(gameday).strftime('%Y-%m-%d')} {gametime}")
+        except (ValueError, TypeError):
+            continue
+        timestamps[game_id] = ts
+    return timestamps
+
+
+def update_closing_lines(picks: list, prop_lines_df: pd.DataFrame, anytime_td_df: pd.DataFrame, first_td_df: pd.DataFrame, schedule_df: pd.DataFrame) -> None:
+    """Closing Line Value (CLV) capture: every time the Hot Picks page
+    loads, opportunistically re-stamp each still-Pending tracked pick's
+    "closing" line/probability from whatever live odds this load already
+    pulled (free - no extra API cost), as long as that pick's game
+    hasn't kicked off yet. Each write simply overwrites the previous one,
+    so by definition the LAST write before kickoff is whatever this
+    approximates as "the closing line" - there's no background scheduler
+    in this app to catch the true final-seconds number, so "most recent
+    line seen before kickoff" is the honest, achievable approximation,
+    not a claim of catching the literal closing tick.
+
+    CLV itself (the point of tracking this) is computed and shown on
+    Track Record, not here - this function only ever writes the raw
+    closing_line/closing_pct/closing_pulled_at data point into each
+    pick's own `detail` dict (no schema change - `detail` is already
+    free-form JSON per pick_tracker_store.py). Once a game kicks off,
+    its picks are simply never touched again - whatever was captured on
+    the last pre-kickoff page load stands as that pick's closing line
+    for good, exactly like a real closing line would.
+
+    Deliberately NOT fed back into live Hot Picks ranking (see the
+    Section 1/2 sort comments) - CLV is inherently retrospective
+    (comparing where a line ended up to where it opened), so it can only
+    ever describe a pick already made, never help rank a new one."""
+    pending = [p for p in picks if p.get("status") == "Pending"]
+    if not pending:
+        return
+
+    kickoffs = _game_kickoff_timestamps(schedule_df)
+    now = pd.Timestamp.now()
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    updated = []
+    for pick in pending:
+        kickoff_ts = kickoffs.get(pick.get("game_id"))
+        # No posted kickoff time yet, or it's already passed - either way
+        # there's nothing safe to call a *closing* line right now (an
+        # in-progress or unscheduled game has no meaningful "close").
+        if kickoff_ts is None or now >= kickoff_ts:
+            continue
+
+        detail = dict(pick.get("detail") or {})
+        category = pick.get("category")
+        player = pick.get("player")
+        changed = False
+
+        if category == "edge" and not prop_lines_df.empty:
+            stat_col = detail.get("stat_col")
+            market = PROP_MARKET_MAP.get(stat_col) if stat_col else None
+            if market:
+                match = prop_lines_df[(prop_lines_df["player"] == player) & (prop_lines_df["market"] == market)]
+                if not match.empty:
+                    detail["closing_line"] = round(float(match["point"].iloc[0]), 1)
+                    changed = True
+        elif category in ("td_anytime", "td_first"):
+            source = anytime_td_df if category == "td_anytime" else first_td_df
+            if not source.empty:
+                match = source[source["player"] == player]
+                if not match.empty:
+                    detail["closing_pct"] = round(float(match["implied_prob"].iloc[0]), 1)
+                    changed = True
+
+        if changed:
+            detail["closing_pulled_at"] = now_iso
+            pick = dict(pick)
+            pick["detail"] = detail
+            updated.append(pick)
+
+    if updated:
+        pick_tracker_store.update_picks(st.secrets, updated)
+
+
 def resolve_pending_picks() -> tuple:
     """Check every still-Pending tracked pick whose game has gone final
     and mark it Hit/Miss/Push based on what actually happened. Returns
@@ -953,6 +1192,63 @@ def compute_hit_rate(resolved_picks: list, category: str = None):
         return None, 0, 0
     hits = sum(1 for p in scored if p["status"] == "Hit")
     return hits / len(scored) * 100, hits, len(scored)
+
+
+def compute_clv(pick: dict):
+    """Closing Line Value for one tracked pick: how far the line moved in
+    THIS pick's favor between when it was made (the opening line/
+    probability, captured at snapshot time) and the last value seen
+    before kickoff (the "closing" line/probability, opportunistically
+    captured by update_closing_lines - see its docstring for why that's
+    an honest approximation of a true closing line, not the literal
+    final-seconds number). Returns None whenever a closing value hasn't
+    been captured yet (the game hasn't reached kickoff on any page load
+    since this pick was made) - CLV is undefined until then, not zero.
+
+    CLV is deliberately independent of whether the pick actually hit -
+    it measures whether the market itself came around to agree with the
+    call, which professional sports-betting analytics treats as the more
+    reliable long-run skill signal (a lot of noise decides any single
+    game's outcome; a market move is thousands of people's money voting).
+
+    - "edge" picks: positive means the line moved toward the picked
+      side (e.g. picked Over 75.5, closing line is 78.5 -> +3.0, the
+      market now thinks MORE yards are likely, same direction as the
+      pick). Units are the stat's own points (yards, receptions, etc.).
+    - "td_anytime" / "td_first" picks: positive means the market's
+      implied probability of the SAME event (this player scoring) went
+      up since the pick was made. Units are percentage points."""
+    detail = pick.get("detail", {})
+    if pick.get("category") == "edge":
+        opening = detail.get("prop_line")
+        closing = detail.get("closing_line")
+        if opening is None or closing is None:
+            return None
+        diff = closing - opening
+        return diff if detail.get("direction") == "▲ Over" else -diff
+    elif pick.get("category") in ("td_anytime", "td_first"):
+        opening = detail.get("predicted_pct")
+        closing = detail.get("closing_pct")
+        if opening is None or closing is None:
+            return None
+        return closing - opening
+    return None
+
+
+def compute_clv_summary(picks: list) -> dict:
+    """category -> {"avg_clv": float, "n": int} across every pick with a
+    captured CLV value (see compute_clv) - Pending picks are included as
+    long as a closing line was captured, not just resolved ones, since
+    CLV describes the market's move and doesn't depend on the outcome
+    being known yet. A category with zero CLV-eligible picks is simply
+    absent from the returned dict."""
+    buckets: dict = {}
+    for p in picks:
+        clv = compute_clv(p)
+        if clv is None:
+            continue
+        buckets.setdefault(p["category"], []).append(clv)
+    return {cat: {"avg_clv": sum(vals) / len(vals), "n": len(vals)} for cat, vals in buckets.items()}
 
 
 def count_resolvable_picks(picks: list, schedule_df: pd.DataFrame) -> int:
@@ -2172,8 +2468,21 @@ elif tab_side == "🎯 Prop Bets":
             live_lines = get_prop_lines()
             market = PROP_MARKET_MAP.get(prop_stat) if prop_stat else None
             live_match = live_lines[(live_lines["player"] == prop_player) & (live_lines["market"] == market)] if market is not None and not live_lines.empty else pd.DataFrame()
+            # Captured here (rather than re-looked-up below) because it's
+            # only meaningful for the actual live market line - if the
+            # person then edits the Prop line box to a different number,
+            # this fair probability no longer describes that number, so
+            # it's shown tagged to the live line it came from, not
+            # silently re-attached to whatever they typed.
+            live_line_val = None
+            live_fair_prob_over = None
             if not live_match.empty:
                 default_line = round(float(live_match["point"].iloc[0]), 1)
+                live_line_val = default_line
+                if "fair_prob_over" in live_match.columns:
+                    raw_fpo = live_match["fair_prob_over"].iloc[0]
+                    if pd.notna(raw_fpo):
+                        live_fair_prob_over = float(raw_fpo)
             elif prop_stat and not prop_pdf.empty:
                 default_line = round(float(prop_pdf[prop_stat].mean()), 1)
             else:
@@ -2186,6 +2495,12 @@ elif tab_side == "🎯 Prop Bets":
             if next_matchup:
                 next_text, next_rank = next_matchup
                 st.markdown(matchup_badge_html(f"Next: {next_text}", next_rank, tag="span"), unsafe_allow_html=True)
+            if live_fair_prob_over is not None:
+                st.markdown(
+                    fair_prob_badge_html(live_fair_prob_over, "▲ Over", tag="span")
+                    + f' <span class="stat-label">market fair prob at the live line ({live_line_val:.1f})</span>',
+                    unsafe_allow_html=True,
+                )
             prop_pdf = prop_pdf.copy()
             prop_pdf["result"] = prop_pdf[prop_stat].apply(
                 lambda x: "✅ Over" if x > prop_line else ("❌ Under" if x < prop_line else "➖ Push")
@@ -2728,6 +3043,28 @@ elif tab_side == "🔥 Hot Picks":
         "total only breaks ties within a confidence tier.",
         label="ℹ️ About Implied Total badges",
     )
+    theme.info_popover(
+        "**🎯 Fair Prob badges** (Prop-Line Edges only) show the sportsbook market's own de-vigged probability "
+        "that this pick's specific side (Over or Under) hits - the book's raw Over/Under prices always sum to "
+        "a bit over 100% because of the book's built-in margin, so this strips that margin back out first, the "
+        "same way a professional handicapper reads a line. It's a second, independent opinion sitting next to "
+        "our season-average-vs-line edge: our model can show a big edge on a side the market itself still sees "
+        "as close to a coin flip (or vice versa), and that gap is worth knowing. Purely informational - it "
+        "doesn't affect sorting, since it measures the market's confidence, not a track record. No badge means "
+        "no bookmaker posted both sides' prices for that player/market this week.",
+        label="ℹ️ About Fair Prob badges",
+    )
+    theme.info_popover(
+        f"**📈/📉 Role trending badges** compare a player's opportunity metric (target share for receiving "
+        f"stats, snap share otherwise) over their last {OPPORTUNITY_TREND_LAST_N} games to their own full-"
+        f"{CURRENT_SEASON}-season average of that same metric - a flat season average can't show a role that's "
+        f"changed recently, but this can. A badge only appears once the swing is {OPPORTUNITY_TREND_THRESHOLD_PP:.0f}+ "
+        f"percentage points either way (smaller swings are shown as \"stable\" in the dataframe below, not "
+        f"flagged as a card badge) and only once a player has played 2+ games this season - there's nothing to "
+        f"compare against before that. Purely informational context for why a season average might be about to "
+        f"catch up (or might already be stale), not a sort factor.",
+        label="ℹ️ About Role Trending badges",
+    )
 
     hp1, hp2 = st.columns(2)
     with hp1:
@@ -2744,6 +3081,7 @@ elif tab_side == "🔥 Hot Picks":
     hp_anytime_td = get_anytime_td_odds()
     hp_first_td = get_first_td_odds()
     hp_injuries = get_injuries()
+    hp_snap_counts = get_snap_counts()
     # Continuous-improvement loop: re-read Track Record's resolved picks
     # live on every page load (automatic rollout, per the user's choice) and
     # bucket hit rate by (category, position). Used below to re-SORT and
@@ -2799,8 +3137,19 @@ elif tab_side == "🔥 Hot Picks":
             avg_val = pdf[stat].mean()
             line_val = float(match["point"].iloc[0])
             delta = avg_val - line_val
+            # fair_prob_over is de-vigged Over probability (0-1), added to
+            # load_prop_lines' output later than "point" - a cache file
+            # written before that change won't have the column at all, so
+            # this checks for its presence rather than assuming it, and
+            # falls back to None (unknown) the same way a missing/NaN
+            # value would - never treated as 0%.
+            fair_prob_over = None
+            if "fair_prob_over" in match.columns:
+                raw_fpo = match["fair_prob_over"].iloc[0]
+                if pd.notna(raw_fpo):
+                    fair_prob_over = float(raw_fpo)
             if best_edge is None or abs(delta) > abs(best_edge["delta"]):
-                best_edge = {"stat": stat, "avg": avg_val, "line": line_val, "delta": delta}
+                best_edge = {"stat": stat, "avg": avg_val, "line": line_val, "delta": delta, "fair_prob_over": fair_prob_over}
         if best_edge:
             edge_rows.append({
                 "player": player, "player_id": player_id, "team": team, "position": position,
@@ -2812,6 +3161,8 @@ elif tab_side == "🔥 Hot Picks":
                 "edge": round(best_edge["delta"], 1),
                 "direction": "▲ Over" if best_edge["delta"] > 0 else "▼ Under",
                 "implied_total": hp_implied_totals.get(team),
+                "fair_prob_over": best_edge["fair_prob_over"],
+                "opportunity_trend": compute_opportunity_trend(stats_df, hp_snap_counts, player, best_edge["stat"], CURRENT_SEASON),
             })
 
         # ---- Best TD scoring chances: anytime + first TD side by side ----
@@ -2820,11 +3171,18 @@ elif tab_side == "🔥 Hot Picks":
         anytime_pct = float(anytime_match["implied_prob"].iloc[0]) if not anytime_match.empty else None
         first_pct = float(first_match["implied_prob"].iloc[0]) if not first_match.empty else None
         if anytime_pct is not None or first_pct is not None:
+            # TD scoring chances aren't tied to one specific stat the way
+            # a prop-line edge is - use receiving opportunity (target
+            # share) for the positions that mostly score through the air,
+            # snap share (compute_opportunity_trend's fallback) for
+            # everyone else, as the best available role-trend proxy.
+            td_trend_stat = "receiving_yards" if position in ("WR", "TE") else "rushing_yards"
             td_rows.append({
                 "player": player, "player_id": player_id, "team": team, "position": position,
                 "headshot_url": headshot_url, "team_color": team_color,
                 "anytime_td_pct": anytime_pct, "first_td_pct": first_pct,
                 "implied_total": hp_implied_totals.get(team),
+                "opportunity_trend": compute_opportunity_trend(stats_df, hp_snap_counts, player, td_trend_stat, CURRENT_SEASON),
             })
 
         # ---- Safe plays: High consistency + a favorable upcoming matchup ----
@@ -2835,12 +3193,18 @@ elif tab_side == "🔥 Hot Picks":
         matchup_result = _matchup_label(team, position, "fantasy_points_ppr", hp_next_opp_map, hp_defense_ranks, plain=True)
         if consistency == "High" and matchup_result:
             matchup_label, matchup_rank = matchup_result
+            safe_trend_stat = "receiving_yards" if position in ("WR", "TE") else "rushing_yards"
             matchup_rows.append({
                 "player": player, "player_id": player_id, "team": team, "position": position,
                 "headshot_url": headshot_url, "team_color": team_color,
                 "matchup_label": matchup_label, "matchup_rank": matchup_rank,
                 "season_avg_ppr": round(avg_fp, 1),
                 "implied_total": hp_implied_totals.get(team),
+                # A "High consistency" verdict is itself a look backward
+                # over the whole season - if the role behind that
+                # consistency is now trending down, that's exactly the
+                # kind of thing worth flagging on a "safe" pick.
+                "opportunity_trend": compute_opportunity_trend(stats_df, hp_snap_counts, player, safe_trend_stat, CURRENT_SEASON),
             })
 
     # Snapshot the full, unfiltered set for the Track Record tab BEFORE
@@ -2848,6 +3212,16 @@ elif tab_side == "🔥 Hot Picks":
     # comment above for why. A no-op after the first page load of the
     # week (season_week_already_tracked short-circuits it).
     snapshot_hotpicks_for_tracking(edge_rows, td_rows, get_schedule())
+
+    # Opportunistic Closing Line Value capture - re-stamps every still-
+    # Pending pick's "closing" line/probability from this same page
+    # load's already-pulled live odds, as long as its game hasn't kicked
+    # off yet. Runs every load (not once-per-week like the snapshot
+    # above) since the whole point is catching the line as it moves
+    # throughout the week - see update_closing_lines' docstring.
+    update_closing_lines(
+        pick_tracker_store.load_picks(st.secrets), hp_prop_lines, hp_anytime_td, hp_first_td, hp_schedule,
+    )
 
     # NOW apply the position/team display filter (everything above this
     # point used the full, unfiltered player universe on purpose). An
@@ -2966,6 +3340,7 @@ elif tab_side == "🔥 Hot Picks":
                     f'<span class="stat-label">({CURRENT_SEASON} avg {edge["season_avg"]:.1f}, '
                     f'edge {edge["edge"]:+.1f})</span></div>'
                 )
+                badges_html += fair_prob_badge_html(edge.get("fair_prob_over"), edge["direction"])
             if td:
                 if td["anytime_td_pct"] is not None:
                     badges_html += anytime_td_badge_html(td["anytime_td_pct"])
@@ -2992,6 +3367,9 @@ elif tab_side == "🔥 Hot Picks":
             if edge or td:
                 badges_html += confidence_badge_html(conf_segment)
             badges_html += implied_total_badge_html(hp_implied_totals.get(source["team"]))
+            trend_source = edge or td
+            if trend_source:
+                badges_html += opportunity_trend_badge_html(trend_source.get("opportunity_trend"))
 
             suggestion_rows.append({
                 "player": player,
@@ -3056,6 +3434,8 @@ elif tab_side == "🔥 Hot Picks":
                 f'{row["prop_line"]:.1f} (avg {row["season_avg"]:.1f})</span></div>'
                 f'{confidence_badge_html(row.get("confidence"))}'
                 f'{implied_total_badge_html(row.get("implied_total"))}'
+                f'{fair_prob_badge_html(row.get("fair_prob_over"), row["direction"])}'
+                f'{opportunity_trend_badge_html(row.get("opportunity_trend"))}'
             )
 
         render_hotpick_cards(edge_card_rows, body_fn=_edge_card_body, cols_per_row=3, headshot_px=128, medals=True)
@@ -3107,7 +3487,13 @@ elif tab_side == "🔥 Hot Picks":
 
         edge_df["Confidence"] = edge_df["confidence"].apply(_confidence_label_text)
         edge_df["Implied Total"] = edge_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
-        edge_display = edge_df[["player", "team", "position", "stat", "season_avg", "prop_line", "edge", "direction", "Confidence", "Implied Total"]].rename(columns={
+        edge_df["Fair Prob"] = edge_df.apply(
+            lambda r: (f"{(r['fair_prob_over'] if r['direction'] == '▲ Over' else 1.0 - r['fair_prob_over']) * 100:.0f}%"
+                       if pd.notna(r.get("fair_prob_over")) else "—"),
+            axis=1,
+        )
+        edge_df["Opportunity"] = edge_df["opportunity_trend"].apply(opportunity_trend_text)
+        edge_display = edge_df[["player", "team", "position", "stat", "season_avg", "prop_line", "edge", "direction", "Confidence", "Implied Total", "Fair Prob", "Opportunity"]].rename(columns={
             "player": "Player", "team": "Team", "position": "Pos", "stat": "Stat",
             "season_avg": f"{CURRENT_SEASON} Avg", "prop_line": "Prop Line", "edge": "Edge", "direction": "Direction",
         })
@@ -3165,6 +3551,7 @@ elif tab_side == "🔥 Hot Picks":
                 badges += first_td_badge_html(row["first_td_pct"])
             badges += confidence_badge_html(row.get("confidence"))
             badges += implied_total_badge_html(row.get("implied_total"))
+            badges += opportunity_trend_badge_html(row.get("opportunity_trend"))
             return badges
 
         render_hotpick_cards(td_card_rows, body_fn=_td_card_body, cols_per_row=3, headshot_px=128, medals=True)
@@ -3189,7 +3576,8 @@ elif tab_side == "🔥 Hot Picks":
 
         td_df["Confidence"] = td_df["confidence"].apply(_confidence_label_text)
         td_df["Implied Total"] = td_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
-        td_display = td_df[["player", "team", "position", "anytime_td_pct", "first_td_pct", "Confidence", "Implied Total"]].rename(columns={
+        td_df["Opportunity"] = td_df["opportunity_trend"].apply(opportunity_trend_text)
+        td_display = td_df[["player", "team", "position", "anytime_td_pct", "first_td_pct", "Confidence", "Implied Total", "Opportunity"]].rename(columns={
             "player": "Player", "team": "Team", "position": "Pos",
             "anytime_td_pct": "Anytime TD %", "first_td_pct": "First TD %",
         })
@@ -3222,6 +3610,7 @@ elif tab_side == "🔥 Hot Picks":
                 f'<div class="stat-label">avg PPR</div>'
                 f'<div style="margin-top:2px;">{badge}</div>'
                 f'{implied_total_badge_html(row.get("implied_total"))}'
+                f'{opportunity_trend_badge_html(row.get("opportunity_trend"))}'
             )
 
         render_hotpick_cards(safe_card_rows, body_fn=_safe_card_body, cols_per_row=3, headshot_px=128, medals=True)
@@ -3244,7 +3633,8 @@ elif tab_side == "🔥 Hot Picks":
         st.altair_chart(safe_bar, use_container_width=True)
 
         matchup_df["Implied Total"] = matchup_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
-        matchup_display = matchup_df[["player", "team", "position", "matchup_label", "season_avg_ppr", "Implied Total"]].rename(columns={
+        matchup_df["Opportunity"] = matchup_df["opportunity_trend"].apply(opportunity_trend_text)
+        matchup_display = matchup_df[["player", "team", "position", "matchup_label", "season_avg_ppr", "Implied Total", "Opportunity"]].rename(columns={
             "player": "Player", "team": "Team", "position": "Pos",
             "matchup_label": "Matchup", "season_avg_ppr": f"{CURRENT_SEASON} Avg PPR",
         })
@@ -3363,6 +3753,38 @@ else:
                 "Show only Pending", use_container_width=True, key="tr_tile_pending",
                 type="primary" if pending_is_active else "secondary",
                 on_click=_filter_to_pending,
+            )
+
+        # ---- Closing Line Value ----
+        # Independent of hit rate above - this measures whether the
+        # market itself moved toward agreeing with each pick, not
+        # whether it actually hit. See compute_clv's docstring for the
+        # full explanation and the units (points for Prop Edge,
+        # percentage points for the two TD categories - never combined
+        # into one blended number since they're not the same unit).
+        clv_summary = compute_clv_summary(all_picks)
+        if clv_summary:
+            st.markdown("###### 📉 Closing Line Value")
+            clv1, clv2, clv3 = st.columns(3)
+            clv_cols = {"edge": (clv1, "Prop Edge", "pts"), "td_anytime": (clv2, "Anytime TD", "pp"), "td_first": (clv3, "First TD", "pp")}
+            for cat, (col, label, unit) in clv_cols.items():
+                with col:
+                    seg = clv_summary.get(cat)
+                    if seg:
+                        st.metric(f"{label} avg CLV", f"{seg['avg_clv']:+.1f} {unit}", f"{seg['n']} tracked", delta_color="off")
+                    else:
+                        st.metric(f"{label} avg CLV", "—", "no closing lines captured yet", delta_color="off")
+            theme.info_popover(
+                "**Closing Line Value (CLV)** measures whether the sportsbook line moved toward agreeing with "
+                "each pick between when it was made and kickoff - independent of whether the pick actually hit. "
+                "It's widely considered sports betting's most reliable long-run skill signal, since a market's "
+                "closing line reflects the sharpest available consensus, and a single game's outcome carries a "
+                "lot of noise a line move doesn't. Positive means the market came around to the picked side "
+                "after the pick was made; negative means it moved the other way. \"Closing\" here is an honest "
+                "approximation - the last live line this app happened to see before kickoff on some page load, "
+                "not a literal final-seconds price - so a pick with no page load between it being made and "
+                "kickoff has no CLV captured at all.",
+                label="ℹ️ About Closing Line Value",
             )
 
         st.divider()
@@ -3519,12 +3941,15 @@ else:
                     actual_text = "—"
             meta_row = tr_meta.loc[p["player"]] if p["player"] in tr_meta.index else None
             raw_headshot = meta_row.get("headshot_url") if meta_row is not None else None
+            pick_clv = compute_clv(p)
+            clv_unit = "pts" if p["category"] == "edge" else "pp"
             hist_rows.append({
                 "Headshot": sized_headshot(raw_headshot, 40) if raw_headshot and pd.notna(raw_headshot) else None,
                 "Logo": team_logos.get(p["team"]) if pd.notna(team_logos.get(p["team"])) else None,
                 "Season": p["season"], "Week": p["week"], "Category": category_labels.get(p["category"], p["category"]),
                 "Player": p["player"], "Team": p["team"], "Prediction": prediction,
                 "Actual": actual_text, "Result": p["status"],
+                "CLV": f"{pick_clv:+.1f} {clv_unit}" if pick_clv is not None else "—",
             })
         hist_df = pd.DataFrame(hist_rows)
 

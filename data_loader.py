@@ -70,6 +70,13 @@ KEEP_COLUMNS = [
     "carries", "rushing_yards", "rushing_tds",
     "targets", "receptions", "receiving_yards", "receiving_tds",
     "fantasy_points", "fantasy_points_ppr",
+    # target_share (0-1, that player's share of the TEAM's total targets
+    # that week) comes pre-computed straight from nflverse's own weekly
+    # player stats - no extra pull needed. It's the opportunity signal
+    # behind compute_opportunity_trend in dashboard.py: whether a
+    # player's recent role is trending up/down vs their season baseline,
+    # which a flat season stat average can't see on its own.
+    "target_share",
 ]
 
 
@@ -206,6 +213,27 @@ def load_starter_stats() -> pd.DataFrame:
     return filtered
 
 
+def load_snap_counts() -> pd.DataFrame:
+    """Weekly offense snap share (0-100, PFR-sourced via nflverse) across
+    all configured SEASONS, filtered to current starters - the second
+    half of the opportunity-trend signal alongside target_share (see
+    KEEP_COLUMNS' comment). target_share only exists for players who
+    catch passes; offense_pct applies to everyone, including a rushing-
+    only RB or a QB, so it's the fallback opportunity metric whenever a
+    stat isn't a receiving one. A separate pull (not part of
+    load_starter_stats' player_stats call) since snap counts come from
+    their own nflverse table - kept as its own function, own cache, same
+    pattern as every other data source in this file, so a hiccup pulling
+    this one can never take down the stats everything else depends on."""
+    starter_names = get_current_starters()
+    df = nfl.load_snap_counts(SEASONS).to_pandas()
+    df = df[df["player"].isin(starter_names)].copy()
+    df["offense_pct"] = df["offense_pct"] * 100
+    keep = ["player", "position", "team", "season", "week", "offense_pct"]
+    df = df[[c for c in keep if c in df.columns]]
+    return df.sort_values(["season", "week"])
+
+
 def load_current_injuries() -> pd.DataFrame:
     """The most recent week's official NFL injury report: status
     (Out / Doubtful / Questionable), primary injury, and practice
@@ -231,6 +259,29 @@ def _implied_probability(american_odds: float) -> float:
     if american_odds >= 0:
         return 100.0 / (american_odds + 100.0)
     return (-american_odds) / (-american_odds + 100.0)
+
+
+def _devig_two_outcome(price_a: float, price_b: float):
+    """Strip the sportsbook's margin out of a two-sided market (e.g. a
+    player prop's Over/Under) so the two "fair" probabilities actually sum
+    to 100%, instead of the ~104-107% a book's raw prices imply once its
+    vig is baked in. Standard method: convert both sides to their raw
+    implied probabilities, then divide each by the sum of both -
+    normalizing away exactly the margin, since a fair two-outcome market's
+    true probabilities always sum to 1. Returns None if either price is
+    missing or both prices are somehow non-positive (never divide by
+    zero) - callers treat that as "fair probability unknown," not 0%."""
+    if price_a is None or price_b is None:
+        return None
+    try:
+        p_a = _implied_probability(float(price_a))
+        p_b = _implied_probability(float(price_b))
+    except (TypeError, ValueError):
+        return None
+    total = p_a + p_b
+    if total <= 0:
+        return None
+    return p_a / total
 
 
 def _quota_from_headers(resp) -> dict:
@@ -292,8 +343,28 @@ def load_prop_lines(api_key: str):
 
     Returns three empty DataFrames (never raises) if the key is missing,
     invalid, or the API is unreachable - callers should treat missing
-    prop data as normal, not a crash."""
-    prop_columns = ["player", "market", "point"]
+    prop data as normal, not a crash.
+
+    De-vigging: props_df also carries a fair_prob_over column (0-1, may be
+    NaN) - the Over side's de-vigged "fair" probability, stripped of the
+    book's margin, computed per-bookmaker from that book's own Over/Under
+    prices (see _devig_two_outcome) and then averaged across bookmakers
+    the same way point is. It's NaN whenever no bookmaker offered both
+    sides' prices for that player/market (only the line itself, not
+    prices, is required for the core point comparison, so this stays
+    optional rather than dropping the row). first_td_df is similarly
+    de-vigged, but with the "field" method appropriate to a
+    mutually-exclusive multi-outcome market (exactly one player, or none,
+    scores the first TD of the game): each bookmaker's own First TD
+    outcomes are normalized to sum to 100% before averaging across books,
+    rather than the two-outcome method above. td_df (Anytime TD) is
+    deliberately NOT de-vigged - it isn't a clean two-outcome market (many
+    players can each score) and isn't a clean mutually-exclusive field
+    either, so there's no rigorous way to strip its margin without
+    inventing an approximation; it's still fixed here to stop counting a
+    "No" outcome (when a book offers one) as if it were another "Yes"
+    price when averaging."""
+    prop_columns = ["player", "market", "point", "fair_prob_over"]
     td_columns = ["player", "implied_prob"]
     empty_quota = {"remaining": None, "used": None, "skipped": False}
     if not api_key:
@@ -322,9 +393,17 @@ def load_prop_lines(api_key: str):
         quota["skipped"] = True
         return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns), pd.DataFrame(columns=td_columns), quota
 
-    prop_rows = []
+    # Point-value props are accumulated per (bookmaker, market, player) so
+    # each book's own Over AND Under prices can be paired up and de-vigged
+    # against each other before averaging across books - averaging raw
+    # prices (or probabilities) across books first would blur together
+    # different books' margins instead of removing them.
+    prop_temp = {}
     td_rows = []
-    first_td_rows = []
+    # Each row also carries event_id + bookmaker so First TD (a
+    # mutually-exclusive field market) can be normalized to 100% within
+    # its own (event, bookmaker) group before averaging across books.
+    first_td_raw = []
     for event in events:
         event_id = event.get("id")
         if not event_id:
@@ -357,6 +436,7 @@ def load_prop_lines(api_key: str):
         # Skipping just the one bad event keeps everything else working.
         try:
             for bookmaker in event_odds.get("bookmakers", []):
+                bookmaker_key = bookmaker.get("key")
                 for market in bookmaker.get("markets", []):
                     market_key = market.get("key")
                     for outcome in market.get("outcomes", []):
@@ -364,6 +444,19 @@ def load_prop_lines(api_key: str):
                         if player_name is None:
                             continue
                         if market_key in (ANYTIME_TD_MARKET, FIRST_TD_MARKET):
+                            # These markets price each player as a
+                            # "Yes"/no-side proposition. Most books only
+                            # ever post the "Yes" side, but when a book
+                            # does post a "No" side too, it must NOT be
+                            # averaged in as if it were another
+                            # independent "Yes" price - that would silently
+                            # drag the averaged probability down. outcome
+                            # name is missing on some books' single-sided
+                            # feeds, so a missing name is treated as "Yes"
+                            # (the only side those books ever send).
+                            side = outcome.get("name")
+                            if side is not None and side != "Yes":
+                                continue
                             price = outcome.get("price")
                             if price is None:
                                 continue
@@ -371,12 +464,19 @@ def load_prop_lines(api_key: str):
                                 implied = _implied_probability(float(price))
                             except (TypeError, ValueError):
                                 continue
-                            target = td_rows if market_key == ANYTIME_TD_MARKET else first_td_rows
-                            target.append({"player": player_name, "implied_prob": implied})
+                            if market_key == ANYTIME_TD_MARKET:
+                                td_rows.append({"player": player_name, "implied_prob": implied})
+                            else:
+                                first_td_raw.append({
+                                    "event_id": event_id,
+                                    "bookmaker": bookmaker_key,
+                                    "player": player_name,
+                                    "raw_prob": implied,
+                                })
                         else:
                             # Each player prop market has two outcomes (Over/Under)
-                            # per player; we only need the line itself, which is
-                            # the same for both, so keep the first one seen.
+                            # per player, from the same bookmaker - pair them up so
+                            # they can be de-vigged against each other below.
                             point = outcome.get("point")
                             if point is None:
                                 continue
@@ -384,15 +484,40 @@ def load_prop_lines(api_key: str):
                                 point = float(point)
                             except (TypeError, ValueError):
                                 continue
-                            prop_rows.append({"player": player_name, "market": market_key, "point": point})
+                            side = outcome.get("name")
+                            price = outcome.get("price")
+                            key = (bookmaker_key, market_key, player_name)
+                            entry = prop_temp.setdefault(key, {"point": None, "over_price": None, "under_price": None})
+                            entry["point"] = point
+                            if side == "Over":
+                                entry["over_price"] = price
+                            elif side == "Under":
+                                entry["under_price"] = price
         except Exception:
             continue
         # Stop once we've pulled odds for every scheduled event this call found
 
-    if prop_rows:
+    if prop_temp:
+        prop_rows = []
+        for (bookmaker_key, market_key, player_name), entry in prop_temp.items():
+            if entry["point"] is None:
+                continue
+            fair_prob_over = _devig_two_outcome(entry["over_price"], entry["under_price"])
+            prop_rows.append({
+                "player": player_name,
+                "market": market_key,
+                "point": entry["point"],
+                "fair_prob_over": fair_prob_over,
+            })
         props = pd.DataFrame(prop_rows)
-        # Multiple bookmakers may list the same player/market - average their lines
-        props = props.groupby(["player", "market"], as_index=False)["point"].mean()
+        # Multiple bookmakers may list the same player/market - average
+        # both the line and the de-vigged fair probability across them.
+        # fair_prob_over is NaN for any book that didn't offer both sides;
+        # pandas' mean() skips NaNs automatically, so a player only loses
+        # the de-vig entirely if NO book offered both sides.
+        props = props.groupby(["player", "market"], as_index=False).agg(
+            point=("point", "mean"), fair_prob_over=("fair_prob_over", "mean")
+        )
     else:
         props = pd.DataFrame(columns=prop_columns)
 
@@ -405,9 +530,18 @@ def load_prop_lines(api_key: str):
     else:
         td = pd.DataFrame(columns=td_columns)
 
-    if first_td_rows:
-        first_td = pd.DataFrame(first_td_rows)
-        first_td = first_td.groupby("player", as_index=False)["implied_prob"].mean()
+    if first_td_raw:
+        first_td_df = pd.DataFrame(first_td_raw)
+        # De-vig within each bookmaker's own First TD market: First TD is
+        # mutually exclusive (exactly one player, or none, scores it), so
+        # a fair market's true probabilities sum to 100% - normalizing
+        # each book's raw implied probabilities by their own sum strips
+        # that book's margin out cleanly, the field-market equivalent of
+        # the two-outcome de-vig used for props above.
+        group_sum = first_td_df.groupby(["event_id", "bookmaker"])["raw_prob"].transform("sum")
+        first_td_df["fair_prob"] = first_td_df["raw_prob"] / group_sum
+        first_td = first_td_df.groupby("player", as_index=False)["fair_prob"].mean()
+        first_td = first_td.rename(columns={"fair_prob": "implied_prob"})
         first_td["implied_prob"] = (first_td["implied_prob"] * 100).round(1)
     else:
         first_td = pd.DataFrame(columns=td_columns)
