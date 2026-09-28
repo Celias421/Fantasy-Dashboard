@@ -30,8 +30,9 @@ from config import CURRENT_SEASON, PROP_MARKET_MAP, TEAM_CITY, INDOOR_ROOF_STATE
 from data_loader import (
     load_starter_stats, load_player_meta, load_team_meta, load_defense_ranks, load_schedule,
     load_current_injuries, load_prop_lines_with_cache, geocode_city, load_game_weather,
-    load_all_seasons_schedule, clear_nflverse_cache,
+    load_all_seasons_schedule, clear_nflverse_cache, load_first_td_scorers,
 )
+import pick_tracker_store
 
 st.set_page_config(page_title="The Prop Shop", layout="wide", page_icon="🏈")
 
@@ -90,6 +91,17 @@ def get_schedule() -> pd.DataFrame:
 @st.cache_data(ttl=3600 * 6)
 def get_all_seasons_schedule() -> pd.DataFrame:
     return load_all_seasons_schedule()
+
+
+@st.cache_data(ttl=1800)
+def get_first_td_scorers() -> pd.DataFrame:
+    """Cached wrapper around the play-by-play pull that resolves tracked
+    'First TD' picks - see load_first_td_scorers's docstring. A shorter
+    TTL (30 min) than most of this app's caches since, unlike season
+    stats, this can meaningfully change mid-game as new touchdowns are
+    scored, and Track Record's "Check results now" button is only useful
+    if a refresh actually picks up newly-final games in a reasonable time."""
+    return load_first_td_scorers(CURRENT_SEASON)
 
 
 @st.cache_data(ttl=1800)
@@ -707,6 +719,159 @@ def render_hotpick_cards(rows: list, body_fn, cols_per_row: int = 4, headshot_px
                 st.markdown(card_html, unsafe_allow_html=True)
 
 
+def snapshot_hotpicks_for_tracking(edge_rows: list, td_rows: list, schedule_df: pd.DataFrame) -> None:
+    """Silently save a snapshot of this week's Prop-Line Edge and TD
+    Chance (Anytime + First) picks to the pick tracker, the first time
+    the Hot Picks page loads after last week's snapshot - so Track
+    Record can later check what actually happened. Idempotent per
+    (season, week): season_week_already_tracked short-circuits every
+    subsequent page load that same week, so reloading the page (or
+    several people opening it) never double-counts a week's picks. Safe
+    Plays isn't tracked - the user asked to track Prop Edges and TD
+    Chances specifically.
+
+    `edge_rows`/`td_rows` must be the FULL, unfiltered set (every
+    position/team) - see the call site's comment for why a
+    position/team-filtered session must never feed this function."""
+    upcoming = schedule_df[schedule_df["home_score"].isna()]
+    if upcoming.empty:
+        return  # season's over (or schedule hasn't loaded) - nothing to track
+    week = int(upcoming["week"].min())
+    season = CURRENT_SEASON
+
+    if pick_tracker_store.season_week_already_tracked(st.secrets, season, week):
+        return
+
+    this_week = upcoming[upcoming["week"] == week]
+    team_game = {}
+    for _, g in this_week.iterrows():
+        kickoff = format_kickoff(g.get("gameday"), g.get("gametime"))
+        team_game[g["home_team"]] = (g["game_id"], kickoff)
+        team_game[g["away_team"]] = (g["game_id"], kickoff)
+
+    new_picks = []
+    for row in edge_rows:
+        game = team_game.get(row["team"])
+        if not game:
+            continue  # team's on bye this week - nothing to resolve against
+        new_picks.append({
+            "id": str(uuid.uuid4()), "season": season, "week": week, "category": "edge",
+            "player": row["player"], "player_id": row.get("player_id", ""),
+            "team": row["team"], "position": row["position"],
+            "detail": {
+                "stat": row["stat"], "stat_col": row["stat_col"], "prop_line": row["prop_line"],
+                "season_avg_at_pull": row["season_avg"], "direction": row["direction"],
+            },
+            "game_id": game[0], "kickoff": game[1], "status": "Pending", "actual": {}, "resolved_at": "",
+        })
+    for row in td_rows:
+        game = team_game.get(row["team"])
+        if not game:
+            continue
+        if row.get("anytime_td_pct") is not None:
+            new_picks.append({
+                "id": str(uuid.uuid4()), "season": season, "week": week, "category": "td_anytime",
+                "player": row["player"], "player_id": row.get("player_id", ""),
+                "team": row["team"], "position": row["position"],
+                "detail": {"predicted_pct": row["anytime_td_pct"]},
+                "game_id": game[0], "kickoff": game[1], "status": "Pending", "actual": {}, "resolved_at": "",
+            })
+        if row.get("first_td_pct") is not None:
+            new_picks.append({
+                "id": str(uuid.uuid4()), "season": season, "week": week, "category": "td_first",
+                "player": row["player"], "player_id": row.get("player_id", ""),
+                "team": row["team"], "position": row["position"],
+                "detail": {"predicted_pct": row["first_td_pct"]},
+                "game_id": game[0], "kickoff": game[1], "status": "Pending", "actual": {}, "resolved_at": "",
+            })
+
+    if new_picks:
+        pick_tracker_store.add_picks(st.secrets, new_picks)
+
+
+def resolve_pending_picks() -> tuple:
+    """Check every still-Pending tracked pick whose game has gone final
+    and mark it Hit/Miss/Push based on what actually happened. Returns
+    (newly_resolved_count, still_pending_count). Safe to call as often as
+    wanted - a pick whose game isn't final yet is simply left Pending.
+
+    Hit/miss rules:
+      - edge: the player's actual value for that stat this week vs. the
+        prop line, on the predicted side (Over/Under). Equal to the line
+        is a Push.
+      - td_anytime: hit if the player had any rushing + receiving TD that
+        week (the same definition the First TD tab itself uses for
+        "season TDs" - rushing_tds + receiving_tds - so a pick's result
+        here always agrees with what the rest of the site would say).
+      - td_first: hit if the player is that game's first touchdown scorer
+        per play-by-play (get_first_td_scorers) - matched by player_id,
+        not name, since pbp's td_player_name is an abbreviated "J.Love"
+        style that doesn't reliably match this app's full display names.
+        A game with no recorded touchdowns (or not yet in the pbp pull)
+        makes every td_first pick for it a Miss once the game is final -
+        see load_first_td_scorers's docstring for the one simplification
+        this carries (doesn't special-case a defensive/special-teams
+        score the way a real sportsbook market would)."""
+    picks = pick_tracker_store.load_picks(st.secrets)
+    pending = [p for p in picks if p["status"] == "Pending"]
+    if not pending:
+        return 0, 0
+
+    schedule_df = get_schedule()
+    final_games = set(schedule_df[schedule_df["home_score"].notna()]["game_id"])
+    resolvable = [p for p in pending if p.get("game_id") in final_games]
+    if not resolvable:
+        return 0, len(pending)
+
+    stats_df = get_stats()
+    stats_df = stats_df[stats_df["season"] == CURRENT_SEASON]
+    first_td_df = get_first_td_scorers()
+    first_td_by_game = first_td_df.set_index("game_id")["first_td_player_id"].to_dict() if not first_td_df.empty else {}
+
+    updated = []
+    for pick in resolvable:
+        actual_row = stats_df[
+            (stats_df["player_id"] == pick["player_id"]) & (stats_df["week"] == pick["week"])
+        ] if pick.get("player_id") else pd.DataFrame()
+
+        if pick["category"] == "edge":
+            if actual_row.empty or pick["detail"]["stat_col"] not in actual_row.columns:
+                status, actual = "Miss", {"note": "No stat line found for this player/week"}
+            else:
+                actual_val = float(actual_row[pick["detail"]["stat_col"]].iloc[0])
+                line = pick["detail"]["prop_line"]
+                if actual_val == line:
+                    status = "Push"
+                elif pick["detail"]["direction"] == "▲ Over":
+                    status = "Hit" if actual_val > line else "Miss"
+                else:
+                    status = "Hit" if actual_val < line else "Miss"
+                actual = {"actual_value": actual_val}
+
+        elif pick["category"] == "td_anytime":
+            if actual_row.empty:
+                status, actual = "Miss", {"actual_tds": 0}
+            else:
+                tds = int(actual_row.get("rushing_tds", pd.Series([0])).fillna(0).iloc[0]) + \
+                      int(actual_row.get("receiving_tds", pd.Series([0])).fillna(0).iloc[0])
+                status = "Hit" if tds > 0 else "Miss"
+                actual = {"actual_tds": tds}
+
+        else:  # td_first
+            scorer_id = first_td_by_game.get(pick.get("game_id"))
+            status = "Hit" if scorer_id and scorer_id == pick.get("player_id") else "Miss"
+            actual = {"first_td_scorer_id": scorer_id or ""}
+
+        pick["status"] = status
+        pick["actual"] = actual
+        pick["resolved_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        updated.append(pick)
+
+    if updated:
+        pick_tracker_store.update_picks(st.secrets, updated)
+    return len(updated), len(pending) - len(updated)
+
+
 theme.info_popover(
     f"**Current season:** {CURRENT_SEASON}. Trend charts include prior seasons' data for longer-term context.",
     label="ℹ️ Season info",
@@ -1076,7 +1241,7 @@ def render_lineup_tab():
 
 
 tab_side = st.radio(
-    "Site section", ["🏈 Fantasy Lineups", "🎯 Prop Bets", "🔥 Hot Picks"],
+    "Site section", ["🏈 Fantasy Lineups", "🎯 Prop Bets", "🔥 Hot Picks", "📊 Track Record"],
     horizontal=True, key="site_side", label_visibility="collapsed",
 )
 st.divider()
@@ -1089,8 +1254,9 @@ elif tab_side == "🎯 Prop Bets":
     tab_props, tab_firsttd, tab_game, tab_slips = st.tabs(
         ["🎯 Prop Comparator", "🥇 First TD", "🏟️ Game Center", "🧾 Bet Slip Tracker"]
     )
-# 🔥 Hot Picks has no sub-tabs of its own - it's one combined scouting page,
-# rendered further down in its own `elif tab_side == "🔥 Hot Picks":` branch.
+# 🔥 Hot Picks and 📊 Track Record have no sub-tabs of their own - each is
+# one combined page, rendered further down in its own
+# `elif tab_side == "...":` branch.
 
 if st.session_state.pop("show_jump_toast", False):
     # Set by the Matchups tab's "Open in Game Center" button (see
@@ -2190,7 +2356,7 @@ elif tab_side == "🎯 Prop Bets":
                     slip_store.delete_slip(st.secrets, del_id)
                     st.success("Deleted.")
                     st.rerun()
-else:
+elif tab_side == "🔥 Hot Picks":
     # ---------------- Hot Picks (league-wide scouting view) ----------------
     # One combined page, not sub-tabs - three curated leaderboards built
     # from the exact same live data (and the exact same helper functions:
@@ -2213,10 +2379,6 @@ else:
     with hp2:
         hot_teams = st.multiselect("Team", sorted(current_season_df["team"].dropna().unique()), default=[], key="hot_teams")
 
-    hot_view = current_season_df[current_season_df["position"].isin(hot_positions)] if hot_positions else current_season_df
-    if hot_teams:
-        hot_view = hot_view[hot_view["team"].isin(hot_teams)]
-
     hp_defense_ranks = get_defense_ranks()
     hp_next_opp_map = build_next_opponent_map(get_schedule())
     hp_prop_lines = get_prop_lines()
@@ -2228,10 +2390,20 @@ else:
     td_rows = []
     matchup_rows = []
 
-    for player, pdf in hot_view.groupby("player"):
+    # Deliberately iterates the FULL player universe (current_season_df),
+    # not a position/team-filtered view - the position/team multiselects
+    # above are a display filter only, applied to edge_rows/td_rows/
+    # matchup_rows further down, AFTER the tracking snapshot below. If
+    # this loop itself were scoped to the UI filter, a session left
+    # narrowed to (say) just RBs would silently stop tracking every other
+    # position's picks - the snapshot needs the same full set every week
+    # regardless of whatever filter happens to be selected when the page
+    # loads.
+    for player, pdf in current_season_df.groupby("player"):
         first_row = pdf.iloc[0]
         team = first_row["team"]
         position = first_row["position"]
+        player_id = first_row.get("player_id", "")
         headshot_url = first_row.get("headshot_url")
         team_color = first_row.get("team_color") or "#444444"
 
@@ -2261,9 +2433,10 @@ else:
                 best_edge = {"stat": stat, "avg": avg_val, "line": line_val, "delta": delta}
         if best_edge:
             edge_rows.append({
-                "player": player, "team": team, "position": position,
+                "player": player, "player_id": player_id, "team": team, "position": position,
                 "headshot_url": headshot_url, "team_color": team_color,
                 "stat": best_edge["stat"].replace("_", " ").title(),
+                "stat_col": best_edge["stat"],
                 "season_avg": round(best_edge["avg"], 1),
                 "prop_line": round(best_edge["line"], 1),
                 "edge": round(best_edge["delta"], 1),
@@ -2277,7 +2450,7 @@ else:
         first_pct = float(first_match["implied_prob"].iloc[0]) if not first_match.empty else None
         if anytime_pct is not None or first_pct is not None:
             td_rows.append({
-                "player": player, "team": team, "position": position,
+                "player": player, "player_id": player_id, "team": team, "position": position,
                 "headshot_url": headshot_url, "team_color": team_color,
                 "anytime_td_pct": anytime_pct, "first_td_pct": first_pct,
             })
@@ -2291,11 +2464,31 @@ else:
         if consistency == "High" and matchup_result:
             matchup_label, matchup_rank = matchup_result
             matchup_rows.append({
-                "player": player, "team": team, "position": position,
+                "player": player, "player_id": player_id, "team": team, "position": position,
                 "headshot_url": headshot_url, "team_color": team_color,
                 "matchup_label": matchup_label, "matchup_rank": matchup_rank,
                 "season_avg_ppr": round(avg_fp, 1),
             })
+
+    # Snapshot the full, unfiltered set for the Track Record tab BEFORE
+    # applying the position/team display filter below - see the loop's
+    # comment above for why. A no-op after the first page load of the
+    # week (season_week_already_tracked short-circuits it).
+    snapshot_hotpicks_for_tracking(edge_rows, td_rows, get_schedule())
+
+    # NOW apply the position/team display filter (everything above this
+    # point used the full, unfiltered player universe on purpose). An
+    # empty multiselect means "no filter" here - same convention as the
+    # First TD tab's position filter and this page's own team filter
+    # just below, not "show nothing."
+    if hot_positions:
+        edge_rows = [r for r in edge_rows if r["position"] in hot_positions]
+        td_rows = [r for r in td_rows if r["position"] in hot_positions]
+        matchup_rows = [r for r in matchup_rows if r["position"] in hot_positions]
+    if hot_teams:
+        edge_rows = [r for r in edge_rows if r["team"] in hot_teams]
+        td_rows = [r for r in td_rows if r["team"] in hot_teams]
+        matchup_rows = [r for r in matchup_rows if r["team"] in hot_teams]
 
     section1, section2, section3 = st.columns(3)
     section1.metric("Prop Edges Found", len(edge_rows))
@@ -2625,8 +2818,106 @@ else:
         "Prop Comparator, and First TD tabs."
     )
 
-# Runs after the Fantasy Lineups / Prop Bets / Hot Picks if-elif-else above
-# completes, so this shows once at the true bottom of the page on every
-# tab and every sub-tab, regardless of which side is active.
+else:
+    # ---------------- Track Record (hit-rate tracking) ----------------
+    # Every Prop-Line Edge and TD Chance pick Hot Picks surfaces gets
+    # snapshotted once a week (snapshot_hotpicks_for_tracking, called
+    # from the Hot Picks branch above) and checked against what actually
+    # happened once each game is final (resolve_pending_picks, above).
+    # This page is just the read side: hit-rate stats and history over
+    # whatever's been snapshotted and resolved so far.
+    st.subheader("📊 Track Record")
+    st.caption(
+        "Every Prop-Line Edge and TD Chance pick the Hot Picks page has surfaced gets saved automatically "
+        "the first time that week's page loads, then checked against what actually happened once each "
+        "game goes final. Safe Plays aren't tracked here - \"high consistency + a favorable matchup\" is a "
+        "different kind of claim than a specific Over/Under or scoring prediction, so there's no single "
+        "hit/miss to score it against."
+    )
+
+    if st.button("🔄 Check results now"):
+        resolved, still_pending = resolve_pending_picks()
+        if resolved:
+            st.success(f"Resolved {resolved} pick(s) against final scores. {still_pending} still waiting on a final score.")
+        elif still_pending:
+            st.info(f"Nothing newly final yet - {still_pending} pick(s) still waiting on a final score.")
+        else:
+            st.info("No pending picks to check.")
+        st.rerun()
+
+    all_picks = pick_tracker_store.load_picks(st.secrets)
+
+    if not all_picks:
+        st.info("No picks tracked yet - check back after the Hot Picks page has loaded at least once this week.")
+    else:
+        resolved_picks = [p for p in all_picks if p["status"] != "Pending"]
+        pending_count = len(all_picks) - len(resolved_picks)
+
+        def _hit_rate(category: str):
+            scored = [p for p in resolved_picks if p["category"] == category and p["status"] in ("Hit", "Miss")]
+            if not scored:
+                return None, 0, 0
+            hits = sum(1 for p in scored if p["status"] == "Hit")
+            return hits / len(scored) * 100, hits, len(scored)
+
+        edge_pct, edge_hits, edge_n = _hit_rate("edge")
+        any_pct, any_hits, any_n = _hit_rate("td_anytime")
+        first_pct, first_hits, first_n = _hit_rate("td_first")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Prop Edges", f"{edge_pct:.0f}%" if edge_pct is not None else "—", f"{edge_hits}/{edge_n} resolved" if edge_n else "no results yet", delta_color="off")
+        m2.metric("Anytime TD", f"{any_pct:.0f}%" if any_pct is not None else "—", f"{any_hits}/{any_n} resolved" if any_n else "no results yet", delta_color="off")
+        m3.metric("First TD", f"{first_pct:.0f}%" if first_pct is not None else "—", f"{first_hits}/{first_n} resolved" if first_n else "no results yet", delta_color="off")
+        m4.metric("Pending", pending_count)
+
+        st.divider()
+        st.markdown("##### History")
+
+        category_labels = {"edge": "Prop Edge", "td_anytime": "Anytime TD", "td_first": "First TD"}
+        hist_rows = []
+        for p in sorted(all_picks, key=lambda x: (x["season"], x["week"], x["player"]), reverse=True):
+            detail = p.get("detail", {})
+            actual = p.get("actual", {})
+            if p["category"] == "edge":
+                prediction = f"{detail.get('direction', '')} {detail.get('prop_line', '')} {detail.get('stat', '')}"
+                actual_text = f"{actual['actual_value']:.1f}" if "actual_value" in actual else "—"
+            elif p["category"] == "td_anytime":
+                prediction = f"Anytime TD ({detail.get('predicted_pct', 0):.0f}% implied)"
+                actual_text = (
+                    f"{actual['actual_tds']} TD{'s' if actual['actual_tds'] != 1 else ''}"
+                    if "actual_tds" in actual else "—"
+                )
+            else:
+                prediction = f"First TD ({detail.get('predicted_pct', 0):.0f}% implied)"
+                if p["status"] == "Hit":
+                    actual_text = "Scored first"
+                elif p["status"] == "Miss":
+                    actual_text = "Did not score first"
+                else:
+                    actual_text = "—"
+            hist_rows.append({
+                "Season": p["season"], "Week": p["week"], "Category": category_labels.get(p["category"], p["category"]),
+                "Player": p["player"], "Team": p["team"], "Prediction": prediction,
+                "Actual": actual_text, "Result": p["status"],
+            })
+        hist_df = pd.DataFrame(hist_rows)
+
+        result_filter = st.multiselect(
+            "Result", ["Hit", "Miss", "Push", "Pending"], default=["Hit", "Miss", "Push", "Pending"], key="tr_result_filter",
+        )
+        display_df = hist_df[hist_df["Result"].isin(result_filter)] if result_filter else hist_df
+        st.dataframe(display_df, use_container_width=True, hide_index=True, row_height=38)
+
+    if pick_tracker_store.using_local_fallback(st.secrets):
+        st.caption(
+            "⚠️ Google Sheets isn't configured (or isn't reachable right now) - tracked picks are saved "
+            "locally on this server instead and won't survive a redeploy. Same setup as My Rosters and the "
+            "Bet Slip Tracker - see README."
+        )
+
+# Runs after the Fantasy Lineups / Prop Bets / Hot Picks / Track Record
+# if-elif-else above completes, so this shows once at the true bottom of
+# the page on every tab and every sub-tab, regardless of which side is
+# active.
 theme.render_footer()
 

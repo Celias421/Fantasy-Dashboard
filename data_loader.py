@@ -64,7 +64,7 @@ def clear_nflverse_cache() -> None:
 PROP_LINES_CACHE_PATH = "data/prop_lines_cache.json"
 
 KEEP_COLUMNS = [
-    "player_display_name", "position", "team", "opponent_team",
+    "player_display_name", "player_id", "position", "team", "opponent_team",
     "season", "week",
     "completions", "attempts", "passing_yards", "passing_tds", "passing_interceptions",
     "carries", "rushing_yards", "rushing_tds",
@@ -155,6 +155,39 @@ def load_all_seasons_schedule() -> pd.DataFrame:
     since it's scoped to the current season only."""
     sched = nfl.load_schedules(SEASONS).to_pandas()
     return sched[["season", "week", "home_team", "away_team"]]
+
+
+def load_first_td_scorers(season: int) -> pd.DataFrame:
+    """For every game in `season` that has had at least one touchdown so
+    far, the player_id/name of whoever scored that game's FIRST one -
+    used to resolve tracked "First TD" picks (see pick_tracker_store.py
+    and resolve_pending_picks in dashboard.py) against what actually
+    happened, rather than the market's pre-game odds.
+
+    Play-by-play rows come back in chronological order within a game
+    (play_id increases as the game clock runs down - verified against
+    game_seconds_remaining), so the first touchdown is just the row with
+    the minimum play_id among that game's touchdown plays. A game with no
+    touchdowns (yet, or ever - a shutout) simply has no row here, which
+    resolve_pending_picks treats as "nobody scored first" -> every First
+    TD pick for that game is a Miss once the game is final.
+
+    One simplification worth knowing about: this doesn't distinguish an
+    offensive touchdown from a defensive/special-teams one (a pick-six,
+    a punt/kick return). Real "first touchdown scorer" markets usually
+    void the bet (no action) if a non-offensive player scores first;
+    here it's just scored as a Miss for whoever was picked. Rare enough
+    (and still directionally correct - the picked player didn't score
+    first either way) that it isn't worth the added complexity of
+    threading a "push" case through for it."""
+    pbp = nfl.load_pbp([season]).to_pandas()
+    tds = pbp[(pbp["touchdown"] == 1) & pbp["td_player_id"].notna()]
+    if tds.empty:
+        return pd.DataFrame(columns=["game_id", "first_td_player_id", "first_td_player_name"])
+    first = tds.sort_values("play_id").groupby("game_id", as_index=False).first()
+    return first[["game_id", "td_player_id", "td_player_name"]].rename(
+        columns={"td_player_id": "first_td_player_id", "td_player_name": "first_td_player_name"}
+    )
 
 
 def load_starter_stats() -> pd.DataFrame:
