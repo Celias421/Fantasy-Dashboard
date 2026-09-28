@@ -1380,26 +1380,27 @@ with tb_season:
 
 if not ODDS_API_KEY:
     with tb_msg:
-        st.info("No prop odds API key configured yet - card deltas will show \"No prop line\" until one is added. See README for setup.", icon="ℹ️")
+        st.info("Betting-odds data isn't connected yet - cards will show \"No prop line\" until it is. See the README for setup.", icon="ℹ️")
 else:
     prop_updated_at = get_prop_lines_updated_at()
     quota = get_odds_api_quota()
     is_stale = get_prop_lines_are_stale()
     quota_text = (
-        f"🔑 Odds API quota: {quota['remaining']:,} credits remaining ({quota['used']:,} used this billing period)"
-        if quota["remaining"] is not None else "Odds API quota info not available."
+        f"🔑 Odds data allowance: {quota['remaining']:,} credits left this month ({quota['used']:,} used)"
+        if quota["remaining"] is not None else "Data allowance info isn't available right now."
     )
     with tb_status:
         theme.info_popover(
-            f"**Prop lines last pulled:** {prop_updated_at.strftime('%a %-I:%M %p')} (auto-refreshes once a day "
-            f"to conserve API quota).\n\n{quota_text}",
+            f"**Betting lines last updated:** {prop_updated_at.strftime('%a %-I:%M %p')}. They refresh "
+            f"automatically once a day so the app stays within its monthly data allowance.\n\n{quota_text}",
             label="🔑 Prop line status", use_container_width=True,
         )
     with tb_msg:
         if is_stale:
             st.warning(
-                f"Couldn't get a fresh pull this cycle (quota safety buffer or a temporary API hiccup) - showing the last "
-                f"known odds from {prop_updated_at.strftime('%a %-I:%M %p')} instead of nothing. Will try again next refresh.",
+                f"Couldn't get fresh odds this time (the app was protecting its monthly data allowance, or the odds "
+                f"service had a hiccup) - showing the last odds from {prop_updated_at.strftime('%a %-I:%M %p')} instead. "
+                f"It'll try again at the next refresh.",
                 icon="⚠️",
             )
     with tb_refresh_props:
@@ -1457,10 +1458,9 @@ def render_rosters_tab():
         reason = roster_store.last_connection_error()
         detail = f"\n\n**Reason:** `{reason}`" if reason else ""
         st.warning(
-            "Google Sheets isn't configured yet, so rosters are being saved to this app's local disk instead - "
-            "that storage does NOT survive the next code deploy. See README to set up the Sheets connection "
-            "before relying on this for real. Local saves work fine for now, just don't build a whole roster "
-            "you'd be upset to lose." + detail,
+            "The app's online storage (Google Sheets) isn't connected, so rosters are being saved on the app's "
+            "server instead - and they'll be **erased the next time the app is updated**. Saving works fine for "
+            "now; just don't build a roster you'd be upset to lose. See the README to connect it." + detail,
             icon="⚠️",
         )
 
@@ -1643,10 +1643,11 @@ def render_lineup_tab():
         st.caption(f"League settings for this roster: {settings_summary} (edit on the **My Rosters** tab).")
     with info_col:
         theme.info_popover(
-            "**How projections are calculated:** this season's average PPR points per game, adjusted ±15% by "
-            "the upcoming opponent's defensive rank against that position (see the Matchups tab for how that "
-            "rank is computed). This is a simple, transparent estimate, not a black-box model - use it as a "
-            "starting point, not gospel.",
+            "**How the projection works:** we start with the player's average fantasy points per game this "
+            "season (PPR scoring), then nudge it up by as much as 15% for an easy opponent or down by as much "
+            "as 15% for a tough one. How tough an opponent is comes from how much they've given up to that "
+            "position this season (see Research → Matchups). It's a simple, honest estimate - a good starting "
+            "point, not a guarantee.",
             label="ℹ️ How this works",
         )
     if unfillable:
@@ -1981,11 +1982,15 @@ elif tab_side == "🔍 Research":
                 st.caption(f"{len(summary_df)} players — {CURRENT_SEASON} season, ranked by {sort_stat.replace('_', ' ')}")
             with badge_info_col:
                 theme.info_popover(
-                    "**Badge key:** matchup badges show the upcoming opponent's defensive rank (color: red = "
-                    "toughest, green = easiest). 🎯 Anytime TD is the betting market's implied chance this player "
-                    "scores any touchdown this week; 🥇 First TD is the narrower chance they score the game's "
-                    "FIRST touchdown (see the First TD tab in Props for the full breakdown) — both "
-                    "are market probabilities, not Prop Shop projections. Hover a badge for details.",
+                    "**What the badges mean:**\n\n"
+                    "- **Matchup** - how tough this week's opponent is against this player's position. "
+                    "Red = one of the toughest defenses, green = one of the easiest.\n"
+                    "- **🎯 Anytime TD** - the sportsbooks' odds, turned into a percent, that this player "
+                    "scores a touchdown at any point in the game.\n"
+                    "- **🥇 First TD** - the chance he scores the game's very first touchdown (a much "
+                    "harder bet to win - see Props → First TD).\n\n"
+                    "Both percentages come from the sportsbooks, not The Prop Shop, and include the "
+                    "books' built-in profit, so they run slightly high. Hover over a badge for details.",
                     label="ℹ️ Badge key",
                 )
             render_player_cards(summary_df, sort_stat, cols_per_row=4)
@@ -2217,9 +2222,9 @@ elif tab_side == "🔍 Research":
                 st.caption(f"Week {int(all_injuries['week'].iloc[0])} ({CURRENT_SEASON} season) — full league injury report.")
             with inj_info_col:
                 theme.info_popover(
-                    "Every player on the official NFL injury report - not just tracked starters, so you can "
-                    "catch handcuffs and breakout candidates too. Sourced from nflverse's copy of the official "
-                    "team-submitted reports.",
+                    "This is the full official NFL injury report - every player teams have listed, not just the "
+                    "starters this app tracks - so you can also spot backups who may be about to get more "
+                    "playing time. It comes from the injury reports each team files with the league.",
                     label="ℹ️ About this report",
                 )
 
@@ -2450,11 +2455,13 @@ elif tab_side == "🔍 Research":
             _, mm_info_col = st.columns([5, 1])
             with mm_info_col:
                 theme.info_popover(
-                    "**\"Away @ Home\" convention throughout** - the Home column is the team hosting. Implied "
-                    "totals split the game total by the spread. Weather is a live forecast (Open-Meteo, refreshes "
-                    "every few hours) for games within about 16 days, or the actual recorded conditions for games "
-                    "already played. Domed/closed-roof and neutral-site games show no weather since it doesn't "
-                    "apply or the venue differs from the home team's usual city.",
+                    "**How to read this page:**\n\n"
+                    "- Games are listed **Away @ Home** - the second team is the one hosting.\n"
+                    "- **Implied total** is how many points Vegas expects each team to score, worked out "
+                    "from the game's over/under and point spread.\n"
+                    "- **Weather** is a live forecast for games in roughly the next two weeks (updated "
+                    "every few hours), or the actual conditions for games already played. Indoor stadiums "
+                    "and neutral-site games (like international games) don't show weather.",
                     label="ℹ️ How to read this table",
                 )
 
@@ -2595,8 +2602,8 @@ elif tab_side == "🎯 Props":
             display = prop_pdf[["week", "matchup", prop_stat, "result"]].rename(columns={prop_stat: "actual"})
             st.dataframe(display, width="content", hide_index=True, row_height=38)
             st.caption(
-                f"Matchup rank is out of 32, based on {CURRENT_SEASON} season totals allowed to that position "
-                "(#1 = toughest defense, #32 = easiest)."
+                f"Matchup rank goes from #1 to #32: #1 is the defense that has given up the least to this "
+                f"position this {CURRENT_SEASON} season (toughest), #32 has given up the most (easiest)."
             )
         else:
             st.info("No stats available for this player yet this season.")
@@ -2605,8 +2612,9 @@ elif tab_side == "🎯 Props":
     with tab_firsttd:
         st.subheader("First Touchdown Scorer")
         st.caption(
-            "Who's most likely to score the FIRST touchdown of their game this week - a much narrower, "
-            "more concentrated bet than \"any\" touchdown. Odds come from The Odds API's player_1st_td market."
+            "Who's most likely to score the **first** touchdown of their game this week. Only one player "
+            "per game can do it, so it's a much harder bet to win than \"scores anytime\" - that's why "
+            "the percentages are small. Odds come from the sportsbooks."
         )
 
         first_td_odds = get_first_td_odds()
@@ -2736,16 +2744,16 @@ elif tab_side == "🎯 Props":
                         },
                     )
                     st.caption(
-                        "**Share of Anytime %** = First TD chance ÷ Anytime TD chance. A high share means most of "
-                        "this player's touchdown equity comes from getting there FIRST (an early-game, "
-                        "concentrated role) rather than just scoring at some point. Both percentages are the "
-                        "betting market's implied probability, including the sportsbook's margin - not a Prop "
-                        "Shop projection."
+                        "**Share of Anytime %** compares a player's chance to score *first* with his chance to score "
+                        "*at all*. Example: a 10% first-TD chance ÷ a 40% anytime chance = 25%. A high number "
+                        "means that when he scores, he tends to score early - a sign of a featured, early role "
+                        "in the game plan. Both percentages come from sportsbook odds (including the books' "
+                        "built-in profit), not from The Prop Shop."
                     )
 
         quota_ftd = get_odds_api_quota()
         if quota_ftd["remaining"] is not None:
-            st.caption(f"🔑 Odds API quota: {quota_ftd['remaining']:,} credits remaining this billing period.")
+            st.caption(f"🔑 Odds data allowance: {quota_ftd['remaining']:,} credits left this month.")
 
     # ---------------- Game Center (single-game breakdown) ----------------
     with tab_game:
@@ -2872,21 +2880,21 @@ elif tab_side == "🎯 Props":
             st.caption("Drop a bet-slip screenshot to pre-fill the form below, then review and save - builds a running history for performance tracking.")
         with info_col:
             theme.info_popover(
-                "**How the auto-fill works:** the screenshot is read with local OCR (no API key, no cost, "
-                "nothing uploaded anywhere) and matched against common sportsbook-app wording to guess the "
-                "sportsbook, bet type, odds, stake, payout, and individual legs. OCR on stylized app "
-                "screenshots is never perfect - always double-check the fields (and the raw text it found, "
-                "in the expander) before saving. The image itself isn't kept; only what you save from the "
-                "form below is stored.",
+                "**How the auto-fill works:** the app reads the text in your screenshot itself (it isn't "
+                "sent to any outside service, and it's free) and makes its best guess at the sportsbook, "
+                "bet type, odds, amount wagered, payout, and each leg of the bet. Reading screenshots "
+                "isn't perfect, so always double-check the fields before you save - you can see exactly "
+                "what text it picked up under \"Raw text\". The screenshot itself is never saved, only "
+                "what you save in the form.",
                 label="ℹ️ How this works",
             )
 
         if slip_store.using_local_fallback(st.secrets):
             err = slip_store.last_connection_error()
             st.warning(
-                "Google Sheets isn't configured yet, so bet slips are being saved to this app's local disk "
-                "instead - that storage does NOT survive the next code deploy. See README to set up the "
-                "Sheets connection before relying on this for real."
+                "The app's online storage (Google Sheets) isn't connected, so bet slips are being saved on the "
+                "app's server instead - and they'll be **erased the next time the app is updated**. See the "
+                "README to connect it before relying on this."
                 + (f"\n\n**Reason:** `{err}`" if err else ""),
                 icon="⚠️",
             )
@@ -2903,7 +2911,7 @@ elif tab_side == "🎯 Props":
                 ocr_text = slip_parser.ocr_image_to_text(uploaded.getvalue())
             if ocr_text.strip():
                 parsed = slip_parser.parse_slip_text(ocr_text)
-                st.success("Read the screenshot - check the fields below before saving (OCR isn't perfect).", icon="✅")
+                st.success("Read the screenshot - double-check the fields below before saving (screenshot reading isn't perfect).", icon="✅")
                 with st.expander("Raw text OCR found (for double-checking)"):
                     st.text(ocr_text)
             else:
@@ -3148,43 +3156,45 @@ elif tab_side == "🔥 Hot Picks":
     with hp_title_col:
         st.subheader("🔥 Hot Picks")
     _guide_0 = (
-        f"**Confidence badges** are this page's continuous-improvement loop: every time it loads, it re-reads "
-        f"Track Record's resolved (Hit/Miss) pick history and groups it by category + position - for example, "
-        f"\"Prop Edges, RB\" or \"First TD, WR.\" Once a segment has **{CONFIDENCE_MIN_N}+ resolved picks**, it's "
-        f"marked 🔥 **Hot** ({CONFIDENCE_HIGH_PCT:.0f}%+ hit rate), 🧊 **Cold** ({CONFIDENCE_LOW_PCT:.0f}% or below), "
-        f"or ➖ **Even** (in between); fewer than {CONFIDENCE_MIN_N} resolved picks shows 🆕 **New** instead, since "
-        f"a small sample isn't trustworthy yet. Hot segments are sorted toward the top of Prop-Line Edges and TD "
-        f"Scoring Chances, cold segments toward the bottom - **nothing is ever hidden**, only re-ordered and "
-        f"labeled. Safe Plays isn't tracked in Track Record (see that tab for why), so it has no confidence badge."
+        (
+        f"**🔥 Confidence - how our past picks of this kind have done.** Each week the app looks back at "
+        f"how its earlier picks turned out and groups them by type and position (for example, \"Prop Edges "
+        f"for RBs\"). Once a group has at least **{CONFIDENCE_MIN_N} finished picks** it gets a label: 🔥 **Hot** "
+        f"= hitting {CONFIDENCE_HIGH_PCT:.0f}% or more, 🧊 **Cold** = hitting {CONFIDENCE_LOW_PCT:.0f}% or less, "
+        f"➖ **Even** = in between. Under {CONFIDENCE_MIN_N} finished picks it shows 🆕 **New** - too early to "
+        f"judge. Hot groups move up the lists and cold ones move down, but **nothing is ever hidden**. Safe "
+        f"Plays don't get this badge because they aren't win-or-lose picks."
+    )
     )
     _guide_1 = (
-        "**📈 Implied Total badges** show a team's Vegas-implied point total for its game this week - the "
-        "over/under split by the spread, a well-known handicapping proxy for how good an offensive environment "
-        "a team is expected to be in. It's a second re-ranking signal alongside Confidence: a good environment "
-        "(26+ implied points) floats a pick toward the top, a weak one (19 or below) sinks it, same **re-order, "
-        "never hide** rule. A team on a bye or without a posted line yet just has no badge - that's a data gap, "
-        "not a signal the environment is bad. Confidence (this segment's own history) is checked first; implied "
-        "total only breaks ties within a confidence tier."
+        (
+        "**📈 Implied Total - how many points Vegas expects this team to score.** It's worked out from the "
+        "game's over/under and point spread. More expected points usually means more fantasy points to go "
+        "around. Teams expected to score **26 or more** move up the list; teams at **19 or fewer** move "
+        "down - again, nothing is hidden. Confidence is checked first; this only breaks ties. No badge just "
+        "means the betting line isn't posted yet, or the team is on a bye."
+    )
     )
     _guide_2 = (
-        "**🎯 Fair Prob badges** (Prop-Line Edges only) show the sportsbook market's own de-vigged probability "
-        "that this pick's specific side (Over or Under) hits - the book's raw Over/Under prices always sum to "
-        "a bit over 100% because of the book's built-in margin, so this strips that margin back out first, the "
-        "same way a professional handicapper reads a line. It's a second, independent opinion sitting next to "
-        "our season-average-vs-line edge: our model can show a big edge on a side the market itself still sees "
-        "as close to a coin flip (or vice versa), and that gap is worth knowing. Purely informational - it "
-        "doesn't affect sorting, since it measures the market's confidence, not a track record. No badge means "
-        "no bookmaker posted both sides' prices for that player/market this week."
+        (
+        "**🎯 Fair Prob - the betting market's true opinion of this pick** (Prop-Line Edges only). "
+        "Sportsbooks build a small profit into every line, so their odds always add up to a bit over 100%. "
+        "We take that profit back out to show the real chance, according to the market, that this pick "
+        "hits. If a pick shows a big edge but its Fair Prob is near 50%, the market sees it as closer to a "
+        "coin flip than our numbers suggest - worth knowing before you bet. It doesn't change the order of "
+        "the list. No badge means the sportsbooks didn't post both sides of that bet."
+    )
     )
     _guide_3 = (
-        f"**📈/📉 Role trending badges** compare a player's opportunity metric (target share for receiving "
-        f"stats, snap share otherwise) over their last {OPPORTUNITY_TREND_LAST_N} games to their own full-"
-        f"{CURRENT_SEASON}-season average of that same metric - a flat season average can't show a role that's "
-        f"changed recently, but this can. A badge only appears once the swing is {OPPORTUNITY_TREND_THRESHOLD_PP:.0f}+ "
-        f"percentage points either way (smaller swings are shown as \"stable\" in the dataframe below, not "
-        f"flagged as a card badge) and only once a player has played 2+ games this season - there's nothing to "
-        f"compare against before that. Purely informational context for why a season average might be about to "
-        f"catch up (or might already be stale), not a sort factor."
+        (
+        f"**📈/📉 Role Trending - is this player's role growing or shrinking?** We compare his share of "
+        f"the action over his last {OPPORTUNITY_TREND_LAST_N} games (share of his team's targets for pass "
+        f"catchers, share of snaps for everyone else) with his average for the whole {CURRENT_SEASON} season. "
+        f"A badge only appears when that's changed by **{OPPORTUNITY_TREND_THRESHOLD_PP:.0f}+ percentage points** "
+        f"and he's played at least 2 games. 📈 means his role is growing, so his season average may be "
+        f"*underselling* him; 📉 means the opposite. It's extra context only - it doesn't change the order "
+        f"of the list."
+    )
     )
     with hp_guide_col:
         theme.info_popover(
@@ -3196,9 +3206,10 @@ elif tab_side == "🔥 Hot Picks":
             label="ℹ️ Badge guide", use_container_width=True,
         )
     st.caption(
-        "A league-wide scouting view, refreshed from the same live data as the rest of the site: the biggest "
-        "prop-line edges, the best touchdown-scoring chances, and the safest high-floor, most-consistent "
-        "plays. Every number here is explained in more depth on its own tab elsewhere in the app."
+        "This week's best opportunities across the whole league, in three lists: **Prop-Line Edges** "
+        "(where a player's season average is far from the sportsbook's line), **TD Scoring Chances** "
+        "(who's most likely to score), and **Safe Plays** (the steadiest scorers). Each one is covered "
+        "in more detail elsewhere in the app."
     )
 
     hp1, hp2 = st.columns(2)
@@ -3450,10 +3461,10 @@ elif tab_side == "🔥 Hot Picks":
         with dcol2:
             st.markdown("###### ")
             st.caption(
-                f"{len(all_hot_players)} unique players appear in at least one list below - "
-                "the mix shows whether this week's hot picks skew toward a particular position. "
-                "**Click a slice** to see that position's suggested bets (shift-click to add "
-                "another, click it again to clear)."
+                f"{len(all_hot_players)} different players show up in the lists below. The chart shows which "
+                "positions they play, so you can see if this week's picks lean toward one position. "
+                "**Click a slice** to see just that position's picks (shift-click to add another, "
+                "click it again to clear)."
             )
 
         if donut_event and donut_event.selection:
@@ -3539,7 +3550,9 @@ elif tab_side == "🔥 Hot Picks":
 
     # ---- Section 1: Biggest Prop-Line Edges ----
     st.markdown("##### 📈 Biggest Prop-Line Edges")
-    st.caption("Season average vs. the live sportsbook line, for whichever tracked stat shows the biggest gap for that player.")
+    st.caption("Where a player's average this season is furthest from the number the sportsbook set. A big "
+        "gap is worth a look: ▲ **Over** if he's been beating the line, ▼ **Under** if he's been falling "
+        "short of it.")
     if not edge_rows:
         st.info("No live prop lines available right now to compare against - try \"Refresh prop lines now\" at the top of the page.")
     else:
@@ -3650,7 +3663,9 @@ elif tab_side == "🔥 Hot Picks":
 
     # ---- Section 2: Best TD Scoring Chances ----
     st.markdown("##### 🎯 Best TD Scoring Chances")
-    st.caption("Market-implied probability (includes the sportsbook's margin) of scoring any touchdown, and specifically the first one, this week.")
+    st.caption("The sportsbooks' odds, turned into percentages, that each player scores a touchdown this "
+        "week - at any point, and specifically the game's first TD. These include the books' built-in "
+        "profit, so they run a little high.")
     if not td_rows:
         st.info("No live TD odds available right now - try \"Refresh prop lines now\" at the top of the page.")
     else:
@@ -3738,9 +3753,11 @@ elif tab_side == "🔥 Hot Picks":
     # ---- Section 3: Safe Plays (High Consistency, ranked by consistency) ----
     st.markdown("##### 🛡️ Safe Plays — High Consistency")
     st.caption(
-        f"Reliable, low-variance scorers (season coefficient of variation under {CONSISTENCY_HIGH_CV:.0%}, "
-        f"{MIN_GAMES_FOR_CONSISTENCY}+ games played), ranked most-consistent first. Matchup is shown for "
-        f"context, not as a ranking factor - a 2025 season backtest found it didn't predict anything here."
+        f"Players whose fantasy scores barely change from week to week - they rarely have a disaster "
+        f"game. To make the list, a player's weekly score typically stays within about "
+        f"{CONSISTENCY_HIGH_CV:.0%} of his average, over at least {MIN_GAMES_FOR_CONSISTENCY} games. Steadiest "
+        f"first. The matchup is shown for context only - when we tested this against the entire 2025 "
+        f"season, the matchup didn't help predict who would come through."
     )
     if not matchup_rows:
         st.info("No players currently have a High consistency rating with an upcoming game.")
@@ -3790,9 +3807,9 @@ elif tab_side == "🔥 Hot Picks":
         st.dataframe(matchup_display, width="content", hide_index=True, row_height=38)
 
     st.caption(
-        "All percentages and lines are live betting-market data, including the sportsbook's margin - not Prop "
-        "Shop projections. \"Edge\" and \"Matchup\" figures reuse the exact same calculations as the Overview, "
-        "Prop Comparator, and First TD tabs."
+        "All percentages and betting lines come straight from the sportsbooks (including their built-in "
+        "profit) - they aren't Prop Shop predictions. \"Edge\" and \"Matchup\" numbers are calculated "
+        "exactly the same way here as on the Research and Props pages."
     )
 
 else:
@@ -3805,11 +3822,10 @@ else:
     # whatever's been snapshotted and resolved so far.
     st.subheader("📊 Track Record")
     st.caption(
-        "Every Prop-Line Edge and TD Chance pick the Hot Picks page has surfaced gets saved automatically "
-        "the first time that week's page loads, then checked against what actually happened once each "
-        "game goes final. Safe Plays aren't tracked here - \"high consistency\" is a "
-        "different kind of claim than a specific Over/Under or scoring prediction, so there's no single "
-        "hit/miss to score it against."
+        "Every Prop-Line Edge and TD pick from Hot Picks is saved automatically the first time Hot Picks "
+        "is opened each week. After the games are over, click **Check results now** and each pick is "
+        "marked **Hit** or **Miss** based on what actually happened. Safe Plays aren't tracked here - "
+        "\"this player is steady\" isn't a bet that clearly wins or loses."
     )
 
     if st.button("🔄 Check results now"):
@@ -3924,15 +3940,17 @@ else:
                     else:
                         st.metric(f"{label} avg CLV", "—", "no closing lines captured yet", delta_color="off")
             theme.info_popover(
-                "**Closing Line Value (CLV)** measures whether the sportsbook line moved toward agreeing with "
-                "each pick between when it was made and kickoff - independent of whether the pick actually hit. "
-                "It's widely considered sports betting's most reliable long-run skill signal, since a market's "
-                "closing line reflects the sharpest available consensus, and a single game's outcome carries a "
-                "lot of noise a line move doesn't. Positive means the market came around to the picked side "
-                "after the pick was made; negative means it moved the other way. \"Closing\" here is an honest "
-                "approximation - the last live line this app happened to see before kickoff on some page load, "
-                "not a literal final-seconds price - so a pick with no page load between it being made and "
-                "kickoff has no CLV captured at all.",
+                "**Closing Line Value (CLV) - did the betting market end up agreeing with us?**\n\n"
+                "After we make a pick, the sportsbook's line keeps moving until kickoff as bets come in. "
+                "If it moves *toward* our pick - say we picked Over 60.5 yards and the line rises to "
+                "64.5 - that's a positive number: the market came around to our side. If it moves away, "
+                "it's negative. For touchdown picks it's the change in the scoring chance, in "
+                "percentage points.\n\n"
+                "Serious bettors watch this closely because it shows skill over the long run, even in "
+                "weeks when the results themselves are just bad luck.\n\n"
+                "One note: the \"closing\" line here is the last line the app saw before kickoff - close "
+                "to the final line, but not exact. If nobody opened the app between the pick and "
+                "kickoff, that pick has no CLV.",
                 label="ℹ️ About Closing Line Value",
             )
 
@@ -4157,9 +4175,9 @@ else:
 
     if pick_tracker_store.using_local_fallback(st.secrets):
         st.caption(
-            "⚠️ Google Sheets isn't configured (or isn't reachable right now) - tracked picks are saved "
-            "locally on this server instead and won't survive a redeploy. Same setup as My Rosters and the "
-            "Bet Slip Tracker - see README."
+            "⚠️ The app's online storage (Google Sheets) isn't connected right now, so tracked picks are "
+            "being saved on the app's server instead - and they'll be erased the next time the app is "
+            "updated. The same applies to My Rosters and the Bet Slip Tracker. See the README to connect it."
         )
 
 # Runs after the Fantasy Lineups / Prop Bets / Hot Picks / Track Record
