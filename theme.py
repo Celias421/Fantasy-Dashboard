@@ -132,6 +132,26 @@ def inject_css() -> None:
         border-radius: 10px; margin-top: 6px; margin-right: 4px;
         background: {BAD_SOFT}; color: {BAD}; border: 1px solid rgba(229,72,77,.3);
     }}
+    /* Hot Picks' continuous-improvement loop: how confident to be in a
+       (category, position) segment based on its Track Record hit rate.
+       Shared base + one color variant per tier - same sizing/shape as the
+       other badges above so it sits naturally alongside them on a card. */
+    .confidence-badge {{
+        display: inline-block; font-size: 13px; padding: 4px 11px;
+        border-radius: 10px; margin-top: 6px; margin-right: 4px;
+    }}
+    .confidence-high {{
+        background: {ACCENT_SOFT}; color: {ACCENT}; border: 1px solid {ACCENT_SOFT_STRONG};
+    }}
+    .confidence-neutral {{
+        background: {SURFACE_2}; color: {SUB}; border: 1px solid {LINE};
+    }}
+    .confidence-low {{
+        background: {BAD_SOFT}; color: {BAD}; border: 1px solid rgba(229,72,77,.3);
+    }}
+    .confidence-new {{
+        background: {SURFACE_2}; color: {SUB}; border: 1px dashed {LINE};
+    }}
     /* Initials avatar shown in place of a headshot when a player has no
        photo on file (or it fails to load) - keeps every card the same
        size/shape instead of leaving a blank gap. Used by the Hot Picks

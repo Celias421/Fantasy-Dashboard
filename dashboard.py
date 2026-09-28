@@ -916,6 +916,99 @@ def count_resolvable_picks(picks: list, schedule_df: pd.DataFrame) -> int:
     return sum(1 for p in picks if p["status"] == "Pending" and p.get("game_id") in final_games)
 
 
+# ---- Continuous-improvement loop: Hot Picks re-reads its own track record
+# every page load and lets it influence how it ranks and badges its own
+# suggestions - see compute_segment_confidence's docstring for the full
+# mechanics. Tunable in one place:
+CONFIDENCE_MIN_N = 5      # a (category, position) segment needs at least this
+                           # many resolved picks before its hit rate is trusted
+                           # for anything - below this it's shown as "new" and
+                           # never boosts or penalizes a pick's ranking.
+CONFIDENCE_HIGH_PCT = 60.0  # segment hit rate at/above this = "hot" (🔥)
+CONFIDENCE_LOW_PCT = 40.0   # segment hit rate at/below this = "cold" (🧊)
+CONFIDENCE_TIER_RANK = {"high": 0, "neutral": 1, "new": 2, "low": 3}
+
+
+def confidence_tier(pct: float, n: int, min_n: int = CONFIDENCE_MIN_N) -> str:
+    """"high" / "neutral" / "low" / "new" from a segment's raw hit rate -
+    "new" (not enough resolved picks yet to trust the number) always wins
+    regardless of what the percentage happens to be, which is what keeps
+    an early 2-for-2 from being treated the same as a real 12-for-20."""
+    if n < min_n:
+        return "new"
+    if pct >= CONFIDENCE_HIGH_PCT:
+        return "high"
+    if pct <= CONFIDENCE_LOW_PCT:
+        return "low"
+    return "neutral"
+
+
+def compute_segment_confidence(picks: list, min_n: int = CONFIDENCE_MIN_N) -> dict:
+    """The read half of Hot Picks' continuous-improvement loop: groups
+    every RESOLVED (Hit/Miss only - Push and Pending excluded, same
+    convention as compute_hit_rate) tracked pick by (category, position)
+    - e.g. ("edge", "WR") or ("td_anytime", "RB") - and returns each
+    segment's hit rate, sample size, and confidence tier. Hot Picks reads
+    this back to badge and re-sort its own suggestions
+    (confidence_badge_html renders it, the Section 1/2 sort keys use the
+    tier), so a segment that's actually been missing sinks toward the
+    bottom of its list and one that's been hitting rises - without ever
+    hiding a pick outright. Safe Plays has no entry here on purpose (that
+    category isn't tracked in Track Record at all - "high consistency + a
+    favorable matchup" has no single hit/miss to score).
+
+    Returns {(category, position): {"pct": float, "n": int, "tier": str}}
+    - a missing key means zero resolved picks for that segment yet, which
+    every caller treats identically to an explicit "new" tier."""
+    buckets: dict = {}
+    for p in picks:
+        if p["status"] not in ("Hit", "Miss"):
+            continue
+        buckets.setdefault((p["category"], p.get("position") or ""), []).append(p["status"] == "Hit")
+    segments = {}
+    for key, hits in buckets.items():
+        n = len(hits)
+        pct = sum(hits) / n * 100
+        segments[key] = {"pct": pct, "n": n, "tier": confidence_tier(pct, n, min_n)}
+    return segments
+
+
+def confidence_badge_html(segment, min_n: int = CONFIDENCE_MIN_N) -> str:
+    """Small badge rendering compute_segment_confidence's verdict on one
+    pick's (category, position) segment - the visible half of the
+    continuous-improvement loop. `segment` is that dict's per-key value,
+    or None when the segment has no resolved picks at all yet (same
+    treatment as an explicit "new" tier)."""
+    if segment is None:
+        return (
+            f'<div class="confidence-badge confidence-new">🆕 New segment '
+            f'<span style="text-transform:none;">— needs {min_n}+ resolved picks</span></div>'
+        )
+    tier, pct, n = segment["tier"], segment["pct"], segment["n"]
+    if tier == "new":
+        return (
+            f'<div class="confidence-badge confidence-new">🆕 {pct:.0f}% so far '
+            f'<span style="text-transform:none;">({n}/{min_n}+ picks — not enough yet)</span></div>'
+        )
+    icon = {"high": "🔥", "neutral": "➖", "low": "🧊"}[tier]
+    label = {"high": "Hot segment", "neutral": "Even segment", "low": "Cold segment"}[tier]
+    return f'<div class="confidence-badge confidence-{tier}">{icon} {label} — {pct:.0f}% hit rate ({n} picks)</div>'
+
+
+def _confidence_label_text(segment) -> str:
+    """Plain-text (non-HTML) equivalent of confidence_badge_html, for the
+    st.dataframe "Confidence" columns - a dataframe cell shows HTML source
+    literally rather than rendering it, same reasoning as every other
+    plain=True/plain-text column elsewhere in this file."""
+    if segment is None:
+        return "🆕 New"
+    tier, pct, n = segment["tier"], segment["pct"], segment["n"]
+    if tier == "new":
+        return f"🆕 {pct:.0f}% ({n} picks)"
+    icon = {"high": "🔥", "neutral": "➖", "low": "🧊"}[tier]
+    return f"{icon} {pct:.0f}% ({n} picks)"
+
+
 theme.info_popover(
     f"**Current season:** {CURRENT_SEASON}. Trend charts include prior seasons' data for longer-term context.",
     label="ℹ️ Season info",
@@ -2564,6 +2657,17 @@ elif tab_side == "🔥 Hot Picks":
         "prop-line edges, the best touchdown-scoring chances, and the safest high-floor + favorable-matchup "
         "plays. Every number here is explained in more depth on its own tab elsewhere in the app."
     )
+    theme.info_popover(
+        f"**Confidence badges** are this page's continuous-improvement loop: every time it loads, it re-reads "
+        f"Track Record's resolved (Hit/Miss) pick history and groups it by category + position - for example, "
+        f"\"Prop Edges, RB\" or \"First TD, WR.\" Once a segment has **{CONFIDENCE_MIN_N}+ resolved picks**, it's "
+        f"marked 🔥 **Hot** ({CONFIDENCE_HIGH_PCT:.0f}%+ hit rate), 🧊 **Cold** ({CONFIDENCE_LOW_PCT:.0f}% or below), "
+        f"or ➖ **Even** (in between); fewer than {CONFIDENCE_MIN_N} resolved picks shows 🆕 **New** instead, since "
+        f"a small sample isn't trustworthy yet. Hot segments are sorted toward the top of Prop-Line Edges and TD "
+        f"Scoring Chances, cold segments toward the bottom - **nothing is ever hidden**, only re-ordered and "
+        f"labeled. Safe Plays isn't tracked in Track Record (see that tab for why), so it has no confidence badge.",
+        label="ℹ️ About Confidence badges",
+    )
 
     hp1, hp2 = st.columns(2)
     with hp1:
@@ -2579,6 +2683,11 @@ elif tab_side == "🔥 Hot Picks":
     hp_anytime_td = get_anytime_td_odds()
     hp_first_td = get_first_td_odds()
     hp_injuries = get_injuries()
+    # Continuous-improvement loop: re-read Track Record's resolved picks
+    # live on every page load (automatic rollout, per the user's choice) and
+    # bucket hit rate by (category, position). Used below to re-SORT and
+    # BADGE Sections 1/2 and Suggested Bets - never to filter/hide anything.
+    hp_segment_confidence = compute_segment_confidence(pick_tracker_store.load_picks(st.secrets))
 
     edge_rows = []
     td_rows = []
@@ -2798,6 +2907,21 @@ elif tab_side == "🔥 Hot Picks":
             if not badges_html:
                 badges_html = '<div class="stat-label" style="margin-top:8px;">No specific angle this week</div>'
 
+            # Confidence badge: edge's segment takes priority (it's the
+            # more specific claim - an exact stat line vs. a TD market),
+            # then TD's driving category, then none for a matchup-only row
+            # (Safe Plays isn't tracked in Track Record, so there's no
+            # segment to look up). Informational only - this panel keeps
+            # its existing alphabetical (position, player) sort below.
+            conf_segment = None
+            if edge:
+                conf_segment = hp_segment_confidence.get(("edge", position))
+            elif td:
+                driving = "td_first" if (td["first_td_pct"] or -1) >= (td["anytime_td_pct"] or -1) else "td_anytime"
+                conf_segment = hp_segment_confidence.get((driving, position))
+            if edge or td:
+                badges_html += confidence_badge_html(conf_segment)
+
             suggestion_rows.append({
                 "player": player,
                 "position": position,
@@ -2826,7 +2950,17 @@ elif tab_side == "🔥 Hot Picks":
     if not edge_rows:
         st.info("No live prop lines available right now to compare against - try \"Refresh prop lines now\" on the Prop Bets side.")
     else:
-        edge_df = pd.DataFrame(edge_rows).sort_values("edge", key=abs, ascending=False).head(15)
+        edge_df = pd.DataFrame(edge_rows)
+        edge_df["_abs_edge"] = edge_df["edge"].abs()
+        edge_df["confidence"] = edge_df["position"].apply(lambda pos: hp_segment_confidence.get(("edge", pos)))
+        edge_df["_conf_rank"] = edge_df["confidence"].apply(
+            lambda seg: CONFIDENCE_TIER_RANK[seg["tier"]] if seg else CONFIDENCE_TIER_RANK["new"]
+        )
+        # Confidence tier first (hot segments float up, cold segments sink),
+        # then the edge size itself breaks ties within a tier - re-ranks,
+        # never filters, per the user's explicit "insights + confidence
+        # weighting, never hide anything" choice.
+        edge_df = edge_df.sort_values(["_conf_rank", "_abs_edge"], ascending=[True, False]).head(15)
 
         st.markdown("###### This week's biggest edges")
         edge_card_rows = edge_df.head(3).to_dict("records")
@@ -2846,6 +2980,7 @@ elif tab_side == "🔥 Hot Picks":
                 f'<div class="stat-label">{row["stat"]} edge</div>'
                 f'<div style="margin-top:6px;"><span class="{delta_cls}">{row["direction"]} '
                 f'{row["prop_line"]:.1f} (avg {row["season_avg"]:.1f})</span></div>'
+                f'{confidence_badge_html(row.get("confidence"))}'
             )
 
         render_hotpick_cards(edge_card_rows, body_fn=_edge_card_body, cols_per_row=3, headshot_px=128, medals=True)
@@ -2895,7 +3030,8 @@ elif tab_side == "🔥 Hot Picks":
             use_container_width=True,
         )
 
-        edge_display = edge_df[["player", "team", "position", "stat", "season_avg", "prop_line", "edge", "direction"]].rename(columns={
+        edge_df["Confidence"] = edge_df["confidence"].apply(_confidence_label_text)
+        edge_display = edge_df[["player", "team", "position", "stat", "season_avg", "prop_line", "edge", "direction", "Confidence"]].rename(columns={
             "player": "Player", "team": "Team", "position": "Pos", "stat": "Stat",
             "season_avg": f"{CURRENT_SEASON} Avg", "prop_line": "Prop Line", "edge": "Edge", "direction": "Direction",
         })
@@ -2914,7 +3050,26 @@ elif tab_side == "🔥 Hot Picks":
     else:
         td_df = pd.DataFrame(td_rows)
         td_df["_sort"] = td_df[["anytime_td_pct", "first_td_pct"]].max(axis=1, skipna=True)
-        td_df = td_df.sort_values("_sort", ascending=False).head(15)
+        # Driving category = whichever of anytime/first TD is this row's
+        # larger (displayed) number - same comparison _sort already makes -
+        # since that's the market the card is actually spotlighting. Uses
+        # pd.notna rather than a plain "or" fallback because a missing
+        # value here is NaN (not None) once it's in a DataFrame column,
+        # and NaN is truthy in Python - "x or -1" would silently keep the
+        # NaN instead of falling back, breaking the >= comparison.
+        def _td_driving_category(r):
+            anytime = r["anytime_td_pct"] if pd.notna(r["anytime_td_pct"]) else -1
+            first = r["first_td_pct"] if pd.notna(r["first_td_pct"]) else -1
+            return "td_first" if first >= anytime else "td_anytime"
+
+        td_df["_driving_category"] = td_df.apply(_td_driving_category, axis=1)
+        td_df["confidence"] = td_df.apply(
+            lambda r: hp_segment_confidence.get((r["_driving_category"], r["position"])), axis=1,
+        )
+        td_df["_conf_rank"] = td_df["confidence"].apply(
+            lambda seg: CONFIDENCE_TIER_RANK[seg["tier"]] if seg else CONFIDENCE_TIER_RANK["new"]
+        )
+        td_df = td_df.sort_values(["_conf_rank", "_sort"], ascending=[True, False]).head(15)
 
         st.markdown("###### This week's best scoring chances")
         td_card_rows = td_df.head(3).to_dict("records")
@@ -2925,6 +3080,7 @@ elif tab_side == "🔥 Hot Picks":
                 badges += anytime_td_badge_html(row["anytime_td_pct"])
             if pd.notna(row.get("first_td_pct")):
                 badges += first_td_badge_html(row["first_td_pct"])
+            badges += confidence_badge_html(row.get("confidence"))
             return badges
 
         render_hotpick_cards(td_card_rows, body_fn=_td_card_body, cols_per_row=3, headshot_px=128, medals=True)
@@ -2947,7 +3103,8 @@ elif tab_side == "🔥 Hot Picks":
         ).properties(height=max(220, 22 * td_chart_df["player"].nunique() * 2))
         st.altair_chart(td_bar, use_container_width=True)
 
-        td_display = td_df[["player", "team", "position", "anytime_td_pct", "first_td_pct"]].rename(columns={
+        td_df["Confidence"] = td_df["confidence"].apply(_confidence_label_text)
+        td_display = td_df[["player", "team", "position", "anytime_td_pct", "first_td_pct", "Confidence"]].rename(columns={
             "player": "Player", "team": "Team", "position": "Pos",
             "anytime_td_pct": "Anytime TD %", "first_td_pct": "First TD %",
         })
