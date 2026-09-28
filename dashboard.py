@@ -20,6 +20,7 @@ from schedule_logic import (
     SLOT_ORDER,
     build_lineup_slots,
     build_next_opponent_map,
+    build_team_implied_totals,
     format_gametime,
     format_kickoff,
     matchup_adjustment,
@@ -425,6 +426,55 @@ def weather_risk_badge_html(label: str, risk_pct: float, tag: str = "div") -> st
     red (high wind/rain risk) instead of by defensive rank."""
     title = "Rough 0-100 severity score from forecasted wind speed and rain chance - higher means more likely to affect passing/kicking."
     return pill_badge_html(label, severity_color(risk_pct), tag, title=title)
+
+
+def implied_total_color(total: float) -> str:
+    """Soft red (weak scoring environment) -> yellow -> brand-green
+    (strong scoring environment) text color, same pastel gradient style
+    as matchup_rank_color. Stops span roughly the range a team's Vegas-
+    implied total actually covers in a normal week (~14 to ~31)."""
+    t = (total - 14.0) / (31.0 - 14.0)
+    t = min(max(t, 0.0), 1.0)
+    stops = [(0.0, theme.MATCHUP_TOUGH_RGB), (0.5, (255, 209, 102)), (1.0, theme.MATCHUP_EASY_RGB)]
+    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+        if t0 <= t <= t1:
+            local_t = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+            r = round(c0[0] + (c1[0] - c0[0]) * local_t)
+            g = round(c0[1] + (c1[1] - c0[1]) * local_t)
+            b = round(c0[2] + (c1[2] - c0[2]) * local_t)
+            return f"rgb({r},{g},{b})"
+    return "rgb(143,214,168)"
+
+
+def implied_total_badge_html(total, tag: str = "div") -> str:
+    """Small pill showing a team's Vegas-implied point total (see
+    build_team_implied_totals) - a proxy for how good an offensive
+    environment this week's game is expected to be for that team.
+    Returns "" (not a badge) when the total is unknown - a bye or a game
+    with no posted line yet - rather than showing a misleading number."""
+    if total is None or pd.isna(total):
+        return ""
+    title = "This team's Vegas-implied point total for its game this week (the over/under split by the spread) - a rough gauge of how good an offensive environment this is expected to be."
+    return pill_badge_html(f"📈 Implied {total:.1f} pts", implied_total_color(total), tag, title=title)
+
+
+def implied_total_tier(total) -> str:
+    """Bucket an implied total into high/neutral/low, the same "tiered,
+    not raw-sorted" treatment confidence_tier uses for hit rate - keeps
+    the resulting sort order explainable (a whole tier apart) instead of
+    reshuffling on every fractional point. Missing (bye / no line yet)
+    counts as neutral, never as a penalty - it's a data gap, not a signal
+    that the team is a bad environment."""
+    if total is None or pd.isna(total):
+        return "neutral"
+    if total >= 26:
+        return "high"
+    if total <= 19:
+        return "low"
+    return "neutral"
+
+
+IMPLIED_TOTAL_TIER_RANK = {"high": 0, "neutral": 1, "low": 2}
 
 
 def probability_color(pct: float) -> str:
@@ -2668,6 +2718,16 @@ elif tab_side == "🔥 Hot Picks":
         f"labeled. Safe Plays isn't tracked in Track Record (see that tab for why), so it has no confidence badge.",
         label="ℹ️ About Confidence badges",
     )
+    theme.info_popover(
+        "**📈 Implied Total badges** show a team's Vegas-implied point total for its game this week - the "
+        "over/under split by the spread, a well-known handicapping proxy for how good an offensive environment "
+        "a team is expected to be in. It's a second re-ranking signal alongside Confidence: a good environment "
+        "(26+ implied points) floats a pick toward the top, a weak one (19 or below) sinks it, same **re-order, "
+        "never hide** rule. A team on a bye or without a posted line yet just has no badge - that's a data gap, "
+        "not a signal the environment is bad. Confidence (this segment's own history) is checked first; implied "
+        "total only breaks ties within a confidence tier.",
+        label="ℹ️ About Implied Total badges",
+    )
 
     hp1, hp2 = st.columns(2)
     with hp1:
@@ -2678,7 +2738,8 @@ elif tab_side == "🔥 Hot Picks":
         hot_teams = st.multiselect("Team", sorted(current_season_df["team"].dropna().unique()), default=[], key="hot_teams")
 
     hp_defense_ranks = get_defense_ranks()
-    hp_next_opp_map = build_next_opponent_map(get_schedule())
+    hp_schedule = get_schedule()
+    hp_next_opp_map = build_next_opponent_map(hp_schedule)
     hp_prop_lines = get_prop_lines()
     hp_anytime_td = get_anytime_td_odds()
     hp_first_td = get_first_td_odds()
@@ -2688,6 +2749,12 @@ elif tab_side == "🔥 Hot Picks":
     # bucket hit rate by (category, position). Used below to re-SORT and
     # BADGE Sections 1/2 and Suggested Bets - never to filter/hide anything.
     hp_segment_confidence = compute_segment_confidence(pick_tracker_store.load_picks(st.secrets))
+    # Vegas-implied team totals for this week (see build_team_implied_totals'
+    # docstring for the spread/total math) - a second re-ranking signal
+    # alongside confidence, this one about THIS week's specific game
+    # environment rather than historical hit rate. Same "badge + re-sort,
+    # never hide" treatment.
+    hp_implied_totals = build_team_implied_totals(hp_schedule)
 
     edge_rows = []
     td_rows = []
@@ -2744,6 +2811,7 @@ elif tab_side == "🔥 Hot Picks":
                 "prop_line": round(best_edge["line"], 1),
                 "edge": round(best_edge["delta"], 1),
                 "direction": "▲ Over" if best_edge["delta"] > 0 else "▼ Under",
+                "implied_total": hp_implied_totals.get(team),
             })
 
         # ---- Best TD scoring chances: anytime + first TD side by side ----
@@ -2756,6 +2824,7 @@ elif tab_side == "🔥 Hot Picks":
                 "player": player, "player_id": player_id, "team": team, "position": position,
                 "headshot_url": headshot_url, "team_color": team_color,
                 "anytime_td_pct": anytime_pct, "first_td_pct": first_pct,
+                "implied_total": hp_implied_totals.get(team),
             })
 
         # ---- Safe plays: High consistency + a favorable upcoming matchup ----
@@ -2771,6 +2840,7 @@ elif tab_side == "🔥 Hot Picks":
                 "headshot_url": headshot_url, "team_color": team_color,
                 "matchup_label": matchup_label, "matchup_rank": matchup_rank,
                 "season_avg_ppr": round(avg_fp, 1),
+                "implied_total": hp_implied_totals.get(team),
             })
 
     # Snapshot the full, unfiltered set for the Track Record tab BEFORE
@@ -2921,6 +2991,7 @@ elif tab_side == "🔥 Hot Picks":
                 conf_segment = hp_segment_confidence.get((driving, position))
             if edge or td:
                 badges_html += confidence_badge_html(conf_segment)
+            badges_html += implied_total_badge_html(hp_implied_totals.get(source["team"]))
 
             suggestion_rows.append({
                 "player": player,
@@ -2956,11 +3027,14 @@ elif tab_side == "🔥 Hot Picks":
         edge_df["_conf_rank"] = edge_df["confidence"].apply(
             lambda seg: CONFIDENCE_TIER_RANK[seg["tier"]] if seg else CONFIDENCE_TIER_RANK["new"]
         )
-        # Confidence tier first (hot segments float up, cold segments sink),
-        # then the edge size itself breaks ties within a tier - re-ranks,
-        # never filters, per the user's explicit "insights + confidence
-        # weighting, never hide anything" choice.
-        edge_df = edge_df.sort_values(["_conf_rank", "_abs_edge"], ascending=[True, False]).head(15)
+        edge_df["_env_rank"] = edge_df["implied_total"].apply(lambda t: IMPLIED_TOTAL_TIER_RANK[implied_total_tier(t)])
+        # Confidence tier first (hot/cold segments float/sink based on
+        # actual Track Record history), then this week's Vegas-implied
+        # scoring environment (a good environment floats up, a bad one
+        # sinks), then the edge size itself breaks ties within both tiers
+        # - re-ranks, never filters, same "insights + confidence
+        # weighting, never hide anything" choice the confidence loop used.
+        edge_df = edge_df.sort_values(["_conf_rank", "_env_rank", "_abs_edge"], ascending=[True, True, False]).head(15)
 
         st.markdown("###### This week's biggest edges")
         edge_card_rows = edge_df.head(3).to_dict("records")
@@ -2981,6 +3055,7 @@ elif tab_side == "🔥 Hot Picks":
                 f'<div style="margin-top:6px;"><span class="{delta_cls}">{row["direction"]} '
                 f'{row["prop_line"]:.1f} (avg {row["season_avg"]:.1f})</span></div>'
                 f'{confidence_badge_html(row.get("confidence"))}'
+                f'{implied_total_badge_html(row.get("implied_total"))}'
             )
 
         render_hotpick_cards(edge_card_rows, body_fn=_edge_card_body, cols_per_row=3, headshot_px=128, medals=True)
@@ -3031,7 +3106,8 @@ elif tab_side == "🔥 Hot Picks":
         )
 
         edge_df["Confidence"] = edge_df["confidence"].apply(_confidence_label_text)
-        edge_display = edge_df[["player", "team", "position", "stat", "season_avg", "prop_line", "edge", "direction", "Confidence"]].rename(columns={
+        edge_df["Implied Total"] = edge_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
+        edge_display = edge_df[["player", "team", "position", "stat", "season_avg", "prop_line", "edge", "direction", "Confidence", "Implied Total"]].rename(columns={
             "player": "Player", "team": "Team", "position": "Pos", "stat": "Stat",
             "season_avg": f"{CURRENT_SEASON} Avg", "prop_line": "Prop Line", "edge": "Edge", "direction": "Direction",
         })
@@ -3069,7 +3145,14 @@ elif tab_side == "🔥 Hot Picks":
         td_df["_conf_rank"] = td_df["confidence"].apply(
             lambda seg: CONFIDENCE_TIER_RANK[seg["tier"]] if seg else CONFIDENCE_TIER_RANK["new"]
         )
-        td_df = td_df.sort_values(["_conf_rank", "_sort"], ascending=[True, False]).head(15)
+        # Lighter touch than Section 1's env_rank tiebreaker: a player's own
+        # TD odds are already priced off their team's Vegas total to some
+        # degree, so implied total is a smaller marginal signal here than
+        # it is for a stat edge measured against a flat season average -
+        # still included as the same tiered tiebreaker for a consistent,
+        # explainable rule across both sections.
+        td_df["_env_rank"] = td_df["implied_total"].apply(lambda t: IMPLIED_TOTAL_TIER_RANK[implied_total_tier(t)])
+        td_df = td_df.sort_values(["_conf_rank", "_env_rank", "_sort"], ascending=[True, True, False]).head(15)
 
         st.markdown("###### This week's best scoring chances")
         td_card_rows = td_df.head(3).to_dict("records")
@@ -3081,6 +3164,7 @@ elif tab_side == "🔥 Hot Picks":
             if pd.notna(row.get("first_td_pct")):
                 badges += first_td_badge_html(row["first_td_pct"])
             badges += confidence_badge_html(row.get("confidence"))
+            badges += implied_total_badge_html(row.get("implied_total"))
             return badges
 
         render_hotpick_cards(td_card_rows, body_fn=_td_card_body, cols_per_row=3, headshot_px=128, medals=True)
@@ -3104,7 +3188,8 @@ elif tab_side == "🔥 Hot Picks":
         st.altair_chart(td_bar, use_container_width=True)
 
         td_df["Confidence"] = td_df["confidence"].apply(_confidence_label_text)
-        td_display = td_df[["player", "team", "position", "anytime_td_pct", "first_td_pct", "Confidence"]].rename(columns={
+        td_df["Implied Total"] = td_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
+        td_display = td_df[["player", "team", "position", "anytime_td_pct", "first_td_pct", "Confidence", "Implied Total"]].rename(columns={
             "player": "Player", "team": "Team", "position": "Pos",
             "anytime_td_pct": "Anytime TD %", "first_td_pct": "First TD %",
         })
@@ -3136,6 +3221,7 @@ elif tab_side == "🔥 Hot Picks":
                 f'<div class="stat-big">{row["season_avg_ppr"]:.1f}</div>'
                 f'<div class="stat-label">avg PPR</div>'
                 f'<div style="margin-top:2px;">{badge}</div>'
+                f'{implied_total_badge_html(row.get("implied_total"))}'
             )
 
         render_hotpick_cards(safe_card_rows, body_fn=_safe_card_body, cols_per_row=3, headshot_px=128, medals=True)
@@ -3157,7 +3243,8 @@ elif tab_side == "🔥 Hot Picks":
         ).properties(height=max(220, 28 * len(safe_chart_df)))
         st.altair_chart(safe_bar, use_container_width=True)
 
-        matchup_display = matchup_df[["player", "team", "position", "matchup_label", "season_avg_ppr"]].rename(columns={
+        matchup_df["Implied Total"] = matchup_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
+        matchup_display = matchup_df[["player", "team", "position", "matchup_label", "season_avg_ppr", "Implied Total"]].rename(columns={
             "player": "Player", "team": "Team", "position": "Pos",
             "matchup_label": "Matchup", "season_avg_ppr": f"{CURRENT_SEASON} Avg PPR",
         })

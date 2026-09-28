@@ -163,3 +163,33 @@ def build_next_opponent_map(schedule: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["team", "opponent", "week", "is_home", "kickoff"])
     next_opp = pd.DataFrame(rows, columns=["team", "opponent", "week", "is_home", "kickoff"])
     return next_opp.drop_duplicates(subset="team", keep="first")
+
+
+def build_team_implied_totals(schedule: pd.DataFrame) -> dict:
+    """team -> Vegas-implied point total for its next scheduled game,
+    derived from that game's total_line (over/under) and spread_line.
+    Confirmed against home_moneyline/away_moneyline on real data that
+    nflverse encodes spread_line as the HOME team's spread where POSITIVE
+    means the home team is favored (the opposite sign of how a spread is
+    usually spoken aloud, e.g. "KC -3") - so the standard team-total split
+    is:
+        home_implied = (total_line + spread_line) / 2
+        away_implied = (total_line - spread_line) / 2
+    A team's own implied total is a single, well-established handicapping
+    proxy for "how good an offensive environment is this expected to be
+    for this team this week" - useful context (and a ranking signal)
+    across every stat type, not just one. Same "games not yet played,
+    first upcoming one wins" scoping as build_next_opponent_map, so a bye
+    team simply has no entry (callers use .get() and treat that as
+    unknown, never as a penalty). A team whose next game has no posted
+    line yet (early in the week) is skipped the same way."""
+    upcoming = schedule[schedule["home_score"].isna()].sort_values("gameday")
+    totals: dict = {}
+    for _, g in upcoming.iterrows():
+        total_line = g.get("total_line")
+        spread_line = g.get("spread_line")
+        if pd.isna(total_line) or pd.isna(spread_line):
+            continue
+        totals.setdefault(g["home_team"], round((total_line + spread_line) / 2, 1))
+        totals.setdefault(g["away_team"], round((total_line - spread_line) / 2, 1))
+    return totals
