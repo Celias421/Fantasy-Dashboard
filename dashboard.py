@@ -1748,7 +1748,7 @@ def render_lineup_tab():
             "opponent_plain": "Next opp", "proj_points": "Proj", "season_avg": "Szn avg",
             "matchup_rank": "Opp rank", "injury_status": "Injury", "note": "Note",
         }),
-        use_container_width=True, hide_index=True, row_height=38,
+        width="content", hide_index=True, row_height=38,
         column_config={
             "Start": st.column_config.TextColumn(width="small"),
             "Player": st.column_config.TextColumn(width=200),
@@ -2115,10 +2115,10 @@ elif tab_side == "🔍 Research":
                     st.subheader(f"3-Week Rolling Average ({CURRENT_SEASON})")
                     rolling = pdf_current[numeric_cols].rolling(3, min_periods=1).mean()
                     rolling.insert(0, "week", pdf_current["week"].values)
-                    st.dataframe(rolling.set_index("week"), use_container_width=True, row_height=38)
+                    st.dataframe(rolling.set_index("week"), width="content", row_height=38)
 
                 with st.expander("Full weekly stats (all seasons)"):
-                    st.dataframe(pdf_full.drop(columns=["period"]), use_container_width=True, row_height=38)
+                    st.dataframe(pdf_full.drop(columns=["period"]), width="content", row_height=38)
 
         else:
             col_a, col_b = st.columns(2)
@@ -2224,9 +2224,9 @@ elif tab_side == "🔍 Research":
                     )
 
                 with st.expander(f"Full weekly stats — {player_a}"):
-                    st.dataframe(pdf_a_full.drop(columns=["period"]), use_container_width=True, row_height=38)
+                    st.dataframe(pdf_a_full.drop(columns=["period"]), width="content", row_height=38)
                 with st.expander(f"Full weekly stats — {player_b}"):
-                    st.dataframe(pdf_b_full.drop(columns=["period"]), use_container_width=True, row_height=38)
+                    st.dataframe(pdf_b_full.drop(columns=["period"]), width="content", row_height=38)
 
     # ---------------- Injuries (full league injury report) ----------------
     with tab_injuries:
@@ -2294,7 +2294,7 @@ elif tab_side == "🔍 Research":
                 }
                 shown = filtered_inj[display_cols].rename(columns=rename_map)
                 st.dataframe(
-                    shown, use_container_width=True, hide_index=True, row_height=44,
+                    shown, width="content", hide_index=True, row_height=44,
                     column_config={
                         "Tracked": st.column_config.TextColumn(width="small"),
                         "Player": st.column_config.TextColumn(width=200),
@@ -2467,9 +2467,9 @@ elif tab_side == "🔍 Research":
                 for day in matchups_df.sort_values("gameday")["day_name"].unique():
                     day_df = matchups_df[matchups_df["day_name"] == day]
                     st.markdown(f"**{day}**")
-                    st.dataframe(day_df[display_cols], use_container_width=True, hide_index=True, column_config=column_config, row_height=50)
+                    st.dataframe(day_df[display_cols], width="content", hide_index=True, column_config=column_config, row_height=50)
             else:
-                st.dataframe(matchups_df[display_cols], use_container_width=True, hide_index=True, column_config=column_config, row_height=50)
+                st.dataframe(matchups_df[display_cols], width="content", hide_index=True, column_config=column_config, row_height=50)
 
             _, mm_info_col = st.columns([5, 1])
             with mm_info_col:
@@ -2617,7 +2617,7 @@ elif tab_side == "🎯 Props":
                 prop_pdf["matchup"] = prop_pdf.get("opponent_team", "")
 
             display = prop_pdf[["week", "matchup", prop_stat, "result"]].rename(columns={prop_stat: "actual"})
-            st.dataframe(display, use_container_width=True, hide_index=True, row_height=38)
+            st.dataframe(display, width="content", hide_index=True, row_height=38)
             st.caption(
                 f"Matchup rank is out of 32, based on {CURRENT_SEASON} season totals allowed to that position "
                 "(#1 = toughest defense, #32 = easiest)."
@@ -2751,7 +2751,7 @@ elif tab_side == "🎯 Props":
                         "tds_per_game": "TDs/Game",
                     })
                     st.dataframe(
-                        display_cols, use_container_width=True, hide_index=True, row_height=38,
+                        display_cols, width="content", hide_index=True, row_height=38,
                         column_config={
                             "First TD %": st.column_config.NumberColumn(format="%.0f%%"),
                             "Anytime TD %": st.column_config.NumberColumn(format="%.0f%%"),
@@ -3571,7 +3571,7 @@ elif tab_side == "🔥 Hot Picks":
             "season_avg": f"{CURRENT_SEASON} Avg", "prop_line": "Prop Line", "edge": "Edge", "direction": "Direction",
         })
         st.dataframe(
-            edge_display, use_container_width=True, hide_index=True, row_height=38,
+            edge_display, width="content", hide_index=True, row_height=38,
             column_config={"Edge": st.column_config.NumberColumn(format="%+.1f")},
         )
 
@@ -3655,7 +3655,7 @@ elif tab_side == "🔥 Hot Picks":
             "anytime_td_pct": "Anytime TD %", "first_td_pct": "First TD %",
         })
         st.dataframe(
-            td_display, use_container_width=True, hide_index=True, row_height=38,
+            td_display, width="content", hide_index=True, row_height=38,
             column_config={
                 "Anytime TD %": st.column_config.NumberColumn(format="%.0f%%"),
                 "First TD %": st.column_config.NumberColumn(format="%.0f%%"),
@@ -3716,7 +3716,7 @@ elif tab_side == "🔥 Hot Picks":
             "player": "Player", "team": "Team", "position": "Pos",
             "matchup_label": "Matchup", "season_avg_ppr": f"{CURRENT_SEASON} Avg PPR",
         })
-        st.dataframe(matchup_display, use_container_width=True, hide_index=True, row_height=38)
+        st.dataframe(matchup_display, width="content", hide_index=True, row_height=38)
 
     st.caption(
         "All percentages and lines are live betting-market data, including the sportsbook's margin - not Prop "
@@ -3996,6 +3996,37 @@ else:
         with clear_col:
             if active_category:
                 st.button("✕ Clear filter", key="tr_clear_category", on_click=_toggle_category_filter, args=(active_category,))
+        # Opponent lookup for the History table's "Opp" logo column. Every
+        # tracked pick stores its nflverse game_id, so the opponent comes
+        # straight from the schedule - which means picks saved BEFORE this
+        # column existed get an opponent too, with no change to stored data.
+        # Fallback: nflverse game_ids are "{season}_{week}_{away}_{home}",
+        # so the teams can be read from the id itself if the schedule
+        # doesn't have that game for any reason.
+        try:
+            _hist_sched = get_schedule()
+            _game_teams = {
+                g["game_id"]: (g["away_team"], g["home_team"])
+                for _, g in _hist_sched[["game_id", "away_team", "home_team"]].iterrows()
+            }
+        except Exception:
+            _game_teams = {}
+
+        def _pick_opponent(pick):
+            gid = pick.get("game_id") or ""
+            teams = _game_teams.get(gid)
+            if teams is None:
+                parts = gid.split("_")
+                teams = (parts[2], parts[3]) if len(parts) == 4 else None
+            if teams is None:
+                return None
+            away, home = teams
+            return home if pick.get("team") == away else away if pick.get("team") == home else None
+
+        def _logo(team):
+            url = team_logos.get(team) if team else None
+            return url if url is not None and pd.notna(url) else None
+
         hist_rows = []
         for p in sorted(all_picks, key=lambda x: (x["season"], x["week"], x["player"]), reverse=True):
             detail = p.get("detail", {})
@@ -4022,10 +4053,12 @@ else:
             pick_clv = compute_clv(p)
             clv_unit = "pts" if p["category"] == "edge" else "pp"
             hist_rows.append({
-                "Headshot": sized_headshot(raw_headshot, 40) if raw_headshot and pd.notna(raw_headshot) else None,
-                "Logo": team_logos.get(p["team"]) if pd.notna(team_logos.get(p["team"])) else None,
                 "Season": p["season"], "Week": p["week"], "Category": category_labels.get(p["category"], p["category"]),
-                "Player": p["player"], "Team": p["team"], "Prediction": prediction,
+                "Headshot": sized_headshot(raw_headshot, 40) if raw_headshot and pd.notna(raw_headshot) else None,
+                "Player": p["player"],
+                "Team": _logo(p["team"]),
+                "Opp": _logo(_pick_opponent(p)),
+                "Prediction": prediction,
                 "Actual": actual_text, "Result": p["status"],
                 "CLV": f"{pick_clv:+.1f} {clv_unit}" if pick_clv is not None else "—",
             })
@@ -4037,11 +4070,17 @@ else:
         display_df = hist_df[hist_df["Result"].isin(result_filter)] if result_filter else hist_df
         if active_category:
             display_df = display_df[display_df["Category"] == category_labels[active_category]]
+        # Column order is the standard layout (Sep 2026): pick context
+        # first (season/week/category), then who (photo, name, team logo,
+        # opponent logo), then the call and how it turned out.
         st.dataframe(
-            display_df, use_container_width=True, hide_index=True, row_height=38,
+            display_df, width="content", hide_index=True, row_height=38,
+            column_order=["Season", "Week", "Category", "Headshot", "Player", "Team", "Opp",
+                          "Prediction", "Actual", "Result", "CLV"],
             column_config={
                 "Headshot": st.column_config.ImageColumn(width="small"),
-                "Logo": st.column_config.ImageColumn(width="small"),
+                "Team": st.column_config.ImageColumn("Team", width="small", help="Player's team"),
+                "Opp": st.column_config.ImageColumn("Opp", width="small", help="Opponent in that game"),
             },
         )
 
