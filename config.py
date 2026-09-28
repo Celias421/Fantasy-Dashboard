@@ -11,10 +11,23 @@ CURRENT_SEASON = max(SEASONS)
 
 # How many players per position count as "starters" to auto-track.
 # e.g. WR: 2 means each team's top 2 depth-chart wide receivers.
+#
+# RB/WR raised from 2 to 3 (192 -> 256 players league-wide) to pick up
+# committee backs, injury fill-ins and WR3s in pass-heavy offenses -
+# players who are genuinely fantasy-relevant some weeks but sat outside
+# the old cutoff. QB/TE stayed at 1: a backup QB or TE2 almost never
+# sees fantasy-relevant usage, so widening those two would add noise
+# without adding real signal.
+#
+# This has NO effect on Odds API quota - load_prop_lines pulls one
+# event (game) at a time and gets every player in that game's markets
+# back in a single response; this set only filters which of those
+# players the app tracks/displays afterward. Cost scales with games x
+# markets x regions, never with how many players are on this list.
 STARTERS_PER_POSITION = {
     "QB": 1,
-    "RB": 2,
-    "WR": 2,
+    "RB": 3,
+    "WR": 3,
     "TE": 1,
 }
 
