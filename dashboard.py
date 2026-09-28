@@ -603,44 +603,59 @@ def build_player_summary(view: pd.DataFrame, sort_stat: str) -> pd.DataFrame:
     return pd.DataFrame(summary_rows).sort_values("avg", ascending=False)
 
 
+def _summary_card_body(p, sort_stat: str) -> str:
+    """Single-line-safe stat/badge block for a build_player_summary() row -
+    shared by the Overview cards (render_player_cards) and every other
+    card that shows a summary row (currently the Matchups tab, via
+    render_hotpick_cards) so the same player is described identically no
+    matter which card frame it's shown in. `p` can be a pandas Series or a
+    plain dict - both support [] and .get()."""
+    badges = f'<div class="consistency-badge">Consistency: {p["consistency"]}</div>'
+    if pd.notna(p.get("matchup_label")):
+        badges += matchup_badge_html(p["matchup_label"], int(p["matchup_rank"]))
+    if pd.notna(p.get("td_odds_pct")):
+        badges += anytime_td_badge_html(p["td_odds_pct"])
+    if pd.notna(p.get("first_td_pct")):
+        badges += first_td_badge_html(p["first_td_pct"])
+    if pd.notna(p.get("injury_label")):
+        badges += f'<div class="injury-badge">{p["injury_label"]}</div>'
+    prop_line_text = f' (line {p["prop_line"]:.1f})' if p.get("has_prop") else ""
+    return (
+        f'<div class="stat-big">{p["avg"]:.1f}</div>'
+        f'<div class="stat-label">avg {sort_stat.replace("_", " ")}{prop_line_text}</div>'
+        f'<div style="margin-top:4px;">{delta_html(p["delta"], p.get("has_prop", False))}</div>'
+        f"{badges}"
+    )
+
+
 def render_player_cards(summary_df: pd.DataFrame, sort_stat: str, cols_per_row: int = 4):
-    """Render the standard player-card grid. Used by both the Overview and
-    Game Center tabs - a style change here applies everywhere at once."""
+    """Compact player-card grid, used ONLY by the Overview tab - the one
+    place on the site that deliberately keeps a denser, smaller-photo card
+    instead of the large Hot-Picks-style treatment (render_hotpick_cards)
+    used everywhere else, since Overview's whole job is showing a lot of
+    players at once. Still reuses player_avatar_html for the photo (an
+    initials-avatar fallback instead of a gap when a player has no
+    headshot on file, plus the single-line-HTML construction every other
+    card on the site uses) and _summary_card_body for the stats/badges, so
+    the only real difference from the large cards is size and type scale."""
     for start in range(0, len(summary_df), cols_per_row):
         chunk = summary_df.iloc[start:start + cols_per_row]
         cols = st.columns(cols_per_row)
         for col, (_, p) in zip(cols, chunk.iterrows()):
             with col:
-                photo = sized_headshot(p["headshot_url"], 132) if pd.notna(p["headshot_url"]) else ""
-                img_tag = f'<img src="{photo}" width="132" height="132" onerror="this.style.display=\'none\'"/>' if photo else ""
-
-                badges = f'<div class="consistency-badge">Consistency: {p["consistency"]}</div>'
-                if pd.notna(p.get("matchup_label")):
-                    badges += matchup_badge_html(p["matchup_label"], int(p["matchup_rank"]))
-                if pd.notna(p.get("td_odds_pct")):
-                    badges += anytime_td_badge_html(p["td_odds_pct"])
-                if pd.notna(p.get("first_td_pct")):
-                    badges += first_td_badge_html(p["first_td_pct"])
-                if pd.notna(p.get("injury_label")):
-                    badges += f'<div class="injury-badge">{p["injury_label"]}</div>'
-
-                prop_line_text = f' (line {p["prop_line"]:.1f})' if p.get("has_prop") else ""
-
-                st.markdown(f"""
-                <div class="player-card" style="border-left: 4px solid {p['team_color']};">
-                    <div style="display:flex; align-items:center; gap:12px;">
-                        {img_tag}
-                        <div>
-                            <div style="font-weight:600;">{p['player']}</div>
-                            <div style="font-size:12px; color:#999;">{team_logo_html(p['team'])}{p['position']} · {p['team']}</div>
-                        </div>
-                    </div>
-                    <div class="stat-big">{p['avg']:.1f}</div>
-                    <div class="stat-label">avg {sort_stat.replace('_', ' ')}{prop_line_text}</div>
-                    <div style="margin-top:4px;">{delta_html(p['delta'], p.get('has_prop', False))}</div>
-                    {badges}
-                </div>
-                """, unsafe_allow_html=True)
+                card_html = (
+                    f'<div class="player-card" style="border-left: 4px solid {p["team_color"]};">'
+                    f'<div style="display:flex; align-items:center; gap:12px;">'
+                    f"{player_avatar_html(p, 132)}"
+                    f"<div>"
+                    f'<div style="font-weight:600;">{p["player"]}</div>'
+                    f'<div style="font-size:12px; color:#999;">{team_logo_html(p["team"])}{p["position"]} · {p["team"]}</div>'
+                    f"</div>"
+                    f"</div>"
+                    f"{_summary_card_body(p, sort_stat)}"
+                    f"</div>"
+                )
+                st.markdown(card_html, unsafe_allow_html=True)
 
 
 def player_avatar_html(row: dict, px: int) -> str:
@@ -1173,25 +1188,23 @@ def render_lineup_tab():
         # print the literal word "nan" for every healthy player.
         inj = f" · {row['injury_status']}" if pd.notna(row["injury_status"]) else ""
 
-        photo = sized_headshot(row["headshot_url"], 104) if pd.notna(row.get("headshot_url")) else ""
-        img_tag = (
-            f'<img src="{photo}" width="104" height="104" style="border-radius:50%; object-fit:cover; flex-shrink:0;" '
-            f'onerror="this.style.display=\'none\'"/>' if photo else ""
+        # Large Hot-Picks-style card (player_avatar_html gives the same
+        # 128px photo-or-initials-avatar treatment as every other large
+        # card on the site) and single-line HTML - a lineup is at most a
+        # handful of slots, never the "many players" case Overview exists
+        # for, so this always gets the large card.
+        card_html = (
+            f'<div class="player-card" style="display:flex; align-items:center; gap:16px;">'
+            f"{player_avatar_html(row, 128)}"
+            f"<div>"
+            f'<div style="font-size:13px; color:{theme.SUB}; text-transform:uppercase; letter-spacing:.03em;">{slot_label}</div>'
+            f'<div style="font-size:19px; font-weight:700;">{row["player"]} <span style="font-weight:400; color:{theme.SUB};">({team_logo_html(row["team"])}{row["team"]})</span></div>'
+            f'<div style="margin-top:4px;">{badge}</div>'
+            f'<div style="margin-top:4px; color:{theme.SUB};">Proj <b style="color:{theme.INK};">{row["proj_points"]}</b> pts · season avg {row["season_avg"]}{inj}</div>'
+            f"</div>"
+            f"</div>"
         )
-        st.markdown(
-            f"""
-            <div class="player-card" style="display:flex; align-items:center; gap:16px;">
-                {img_tag}
-                <div>
-                    <div style="font-size:13px; color:{theme.SUB}; text-transform:uppercase; letter-spacing:.03em;">{slot_label}</div>
-                    <div style="font-size:19px; font-weight:700;">{row['player']} <span style="font-weight:400; color:{theme.SUB};">({team_logo_html(row['team'])}{row['team']})</span></div>
-                    <div style="margin-top:4px;">{badge}</div>
-                    <div style="margin-top:4px; color:{theme.SUB};">Proj <b style="color:{theme.INK};">{row['proj_points']}</b> pts · season avg {row['season_avg']}{inj}</div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        st.markdown(card_html, unsafe_allow_html=True)
 
     # Number duplicate slot labels (RB 1/RB 2, FLEX 1/FLEX 2, etc.) so two
     # identical-looking rows aren't both just labeled "RB" with no way to
@@ -2015,22 +2028,21 @@ elif tab_side == "🎯 Prop Bets":
                 else:
                     st.markdown("##### This week's favorites")
                     top3 = filtered.head(3)
-                    medal_cols = st.columns(len(top3))
-                    medals = ["🥇", "🥈", "🥉"]
-                    for medal, col, (_, row) in zip(medals, medal_cols, top3.iterrows()):
-                        with col:
-                            photo = sized_headshot(row["headshot_url"], 96) if pd.notna(row["headshot_url"]) else ""
-                            img_tag = f'<img src="{photo}" width="96" height="96" onerror="this.style.display=\'none\'"/>' if photo else ""
-                            st.markdown(f"""
-                            <div class="player-card" style="border-left: 4px solid {row['team_color']}; text-align:center;">
-                                <div style="font-size:22px;">{medal}</div>
-                                {img_tag}
-                                <div style="font-weight:600; margin-top:6px;">{row['player']}</div>
-                                <div style="font-size:12px; color:#999;">{team_logo_html(row['team'])}{row['position']} · {row['team']}</div>
-                                <div class="stat-big">{row['first_td_pct']:.0f}%</div>
-                                <div class="stat-label">First TD chance</div>
-                            </div>
-                            """, unsafe_allow_html=True)
+
+                    def _first_td_podium_body(row: dict) -> str:
+                        return (
+                            f'<div class="stat-big">{row["first_td_pct"]:.0f}%</div>'
+                            f'<div class="stat-label">First TD chance</div>'
+                        )
+
+                    # Same large Hot-Picks-style card (with the 🥇🥈🥉
+                    # podium treatment) as the Hot Picks page's own top
+                    # picks - this IS the pattern Hot Picks was modeled on,
+                    # so it now shares the exact same component.
+                    render_hotpick_cards(
+                        top3.to_dict("records"), body_fn=_first_td_podium_body,
+                        cols_per_row=len(top3), headshot_px=128, medals=True,
+                    )
 
                     st.markdown("##### Full board")
                     display_cols = filtered[[
@@ -2170,7 +2182,15 @@ elif tab_side == "🎯 Prop Bets":
                     if team_summary.empty:
                         st.info("No tracked starters with data for this team yet.")
                     else:
-                        render_player_cards(team_summary, sort_stat, cols_per_row=2)
+                        # Large Hot-Picks-style cards here (not the compact
+                        # Overview grid) - this is a per-team roster, a
+                        # handful of players, not the "everyone at once"
+                        # view Overview exists for.
+                        render_hotpick_cards(
+                            team_summary.to_dict("records"),
+                            body_fn=lambda row: _summary_card_body(row, sort_stat),
+                            cols_per_row=2, headshot_px=128,
+                        )
 
     # ---------------- Bet Slip Tracker (OCR-assisted manual entry) ----------------
     with tab_slips:
