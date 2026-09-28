@@ -1,0 +1,14 @@
+# Streamlit's built-in theme engine - sets the base colors every native
+# widget (buttons, tabs, sliders, inputs, dataframes, checkboxes, focus
+# rings) derives from, so the brand colors apply even to components
+# theme.py's CSS doesn't explicitly override. Must stay in sync with
+# theme.py's BG / SURFACE / INK / ACCENT - see theme.py for the full
+# brand palette (Sep 2026 redesign: warm near-black + brass gold,
+# replacing the original lime green).
+[theme]
+base = "dark"
+primaryColor = "#D4A934"
+backgroundColor = "#0B0A08"
+secondaryBackgroundColor = "#16140F"
+textColor = "#F6F3EA"
+font = "sans serif"

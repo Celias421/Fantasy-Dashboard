@@ -59,7 +59,7 @@ PROP_STATS_BY_POSITION = {
 # these 4 adjacent pairs clear the CVD separation and normal-vision floors
 # on this app's dark background. Order is fixed (never re-sorted by a
 # filter), per the "color follows the entity, never its rank" rule.
-POSITION_COLORS = {"QB": "#3987e5", "RB": "#d95926", "WR": "#199e70", "TE": "#c98500"}
+POSITION_COLORS = theme.POSITION_COLORS
 
 ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", "")
 
@@ -271,12 +271,38 @@ def implied_totals(spread_line, total_line, home_team: str, away_team: str):
     return round(home_implied, 1), round(away_implied, 1)
 
 
+MIN_GAMES_FOR_CONSISTENCY = 3
+# "High" consistency's coefficient-of-variation cutoff. Tightened from 0.25
+# to 0.20 after a walk-forward backtest against the real 2025 season: at
+# 0.25, the players it flagged only beat their own trailing average 44.1%
+# of the time - statistically identical to a random player - once you
+# account for weekly fantasy scoring being right-skewed (a few big games
+# pull the mean up, so even a truly average player clears their own mean
+# under half the time; the "50% coin flip" intuition is wrong here).
+# Tightening to 0.20 was the one change, of several tested, that produced
+# a real edge (50.9% vs the same 44.1% baseline - see /areas/prop-shop.md
+# discussion). See the Safe Plays section for the other two changes this
+# same backtest drove: dropping matchup rank as the sort key (it showed no
+# edge at any threshold tested) and requiring MIN_GAMES_FOR_CONSISTENCY
+# games before trusting a consistency label at all.
+CONSISTENCY_HIGH_CV = 0.20
+
+
 def compute_summary(player_df: pd.DataFrame, stat: str):
-    """Return (avg, last_game_value, trend_vs_prior_avg, consistency_label).
-    Expects a single season's worth of rows already."""
+    """Return (avg, last_game_value, trend_vs_prior_avg, consistency_label, cv).
+    Expects a single season's worth of rows already.
+
+    consistency_label is "N/A" until MIN_GAMES_FOR_CONSISTENCY games have
+    been played - with fewer, a coefficient of variation is close to
+    meaningless (a single game literally always computes to a standard
+    deviation of 0, which used to make a one-game player automatically
+    "High" consistency - not a real signal, just an artifact of only
+    having one data point). cv itself is returned alongside the label so
+    callers that want to rank by consistency directly (Safe Plays) don't
+    need to recompute it or reverse-engineer it from the label's bucket."""
     weeks = player_df.sort_values("week")
     if stat not in weeks.columns or weeks[stat].dropna().empty:
-        return 0.0, 0.0, 0.0, "N/A"
+        return 0.0, 0.0, 0.0, "N/A", None
 
     values = weeks[stat].fillna(0)
     season_avg = values.mean()
@@ -284,17 +310,24 @@ def compute_summary(player_df: pd.DataFrame, stat: str):
     trend = last_val - values.iloc[:-1].mean() if len(values) > 1 else 0.0
 
     std = values.std() if len(values) > 1 else 0.0
-    cv = (std / season_avg) if season_avg else 0.0
-    if season_avg == 0:
+    # Coefficient of variation is only meaningful for a POSITIVE mean. A
+    # negative season average (fumbles/interceptions outweighing output)
+    # produces a negative cv, which used to pass "cv < CONSISTENCY_HIGH_CV"
+    # and - since Safe Plays sorts by cv ascending - rank that player as the
+    # single MOST consistent play on the board (caught in the Sep 2026
+    # redesign QA: a -0.1 PPR player at #1). cv is None and consistency
+    # "N/A" whenever the mean isn't positive.
+    cv = (std / season_avg) if season_avg > 0 else None
+    if cv is None or len(values) < MIN_GAMES_FOR_CONSISTENCY:
         consistency = "N/A"
-    elif cv < 0.25:
+    elif cv < CONSISTENCY_HIGH_CV:
         consistency = "High"
     elif cv < 0.5:
         consistency = "Medium"
     else:
         consistency = "Low"
 
-    return season_avg, last_val, trend, consistency
+    return season_avg, last_val, trend, consistency, cv
 
 
 def sized_headshot(url: str, display_px: int) -> str:
@@ -599,7 +632,7 @@ def opportunity_trend_badge_html(trend: dict, tag: str = "div") -> str:
         return ""
     icon = "📈" if trend["tier"] == "up" else "📉"
     label = "Role trending up" if trend["tier"] == "up" else "Role trending down"
-    color = theme.ACCENT if trend["tier"] == "up" else theme.BAD
+    color = theme.GOOD if trend["tier"] == "up" else theme.BAD
     title = (
         f"{trend['metric']} over this player's last {min(OPPORTUNITY_TREND_LAST_N, trend['n_games'])} games "
         f"({trend['recent_pct']:.0f}%) vs. their {CURRENT_SEASON} season average ({trend['season_pct']:.0f}%) - "
@@ -728,7 +761,7 @@ def build_player_summary(view: pd.DataFrame, sort_stat: str) -> pd.DataFrame:
 
     summary_rows = []
     for player, pdf in view.groupby("player"):
-        avg, last, trend, consistency = compute_summary(pdf, sort_stat)
+        avg, last, trend, consistency, _cv = compute_summary(pdf, sort_stat)
         first_row = pdf.iloc[0]
         team = first_row["team"]
         position = first_row["position"]
@@ -843,7 +876,7 @@ def render_player_cards(summary_df: pd.DataFrame, sort_stat: str, cols_per_row: 
                     f"{player_avatar_html(p, 132)}"
                     f"<div>"
                     f'<div style="font-weight:600;">{p["player"]}</div>'
-                    f'<div style="font-size:12px; color:#999;">{team_logo_html(p["team"])}{p["position"]} · {p["team"]}</div>'
+                    f'<div style="font-size:13px; color:{theme.SUB};">{team_logo_html(p["team"])}{p["position"]} · {p["team"]}</div>'
                     f"</div>"
                     f"</div>"
                     f"{_summary_card_body(p, sort_stat)}"
@@ -918,7 +951,7 @@ def render_hotpick_cards(rows: list, body_fn, cols_per_row: int = 4, headshot_px
                     f"{player_avatar_html(row, headshot_px)}"
                     f"<div>"
                     f'<div style="font-weight:700; font-size:17px;">{row["player"]}</div>'
-                    f'<div style="font-size:13px; color:#999; margin-top:2px;">'
+                    f'<div style="font-size:13px; color:{theme.SUB}; margin-top:2px;">'
                     f'{team_logo_html(row["team"])}{row["position"]} · {row["team"]}</div>'
                     f"</div>"
                     f"</div>"
@@ -1300,8 +1333,8 @@ def compute_segment_confidence(picks: list, min_n: int = CONFIDENCE_MIN_N) -> di
     tier), so a segment that's actually been missing sinks toward the
     bottom of its list and one that's been hitting rises - without ever
     hiding a pick outright. Safe Plays has no entry here on purpose (that
-    category isn't tracked in Track Record at all - "high consistency + a
-    favorable matchup" has no single hit/miss to score).
+    category isn't tracked in Track Record at all - "high consistency"
+    has no single hit/miss to score).
 
     Returns {(category, position): {"pct": float, "n": int, "tier": str}}
     - a missing key means zero resolved picks for that segment yet, which
@@ -1355,50 +1388,60 @@ def _confidence_label_text(segment) -> str:
     return f"{icon} {pct:.0f}% ({n} picks)"
 
 
-theme.info_popover(
-    f"**Current season:** {CURRENT_SEASON}. Trend charts include prior seasons' data for longer-term context.",
-    label="ℹ️ Season info",
-)
+# ---- Utility toolbar: one row directly under the wordmark ----
+# (Sep 2026 redesign) These four controls used to stack down the left
+# edge as separate rows. Same controls, same behavior - just one row:
+# info popovers on the left, status message in the middle, refresh
+# actions on the right. Deliberately uses no st.columns() arguments newer
+# than what the rest of this file already relies on, so it can't break on
+# an older Streamlit Cloud runtime.
+tb_season, tb_status, tb_msg, tb_refresh_all, tb_refresh_props = st.columns([1.15, 1.45, 3.1, 1.45, 1.85])
+with tb_season:
+    theme.info_popover(
+        f"**Current season:** {CURRENT_SEASON}. Trend charts include prior seasons' data for longer-term context.",
+        label="ℹ️ Season info", use_container_width=True,
+    )
 
 if not ODDS_API_KEY:
-    st.info("No prop odds API key configured yet - card deltas will show \"No prop line\" until one is added. See README for setup.", icon="ℹ️")
+    with tb_msg:
+        st.info("No prop odds API key configured yet - card deltas will show \"No prop line\" until one is added. See README for setup.", icon="ℹ️")
 else:
     prop_updated_at = get_prop_lines_updated_at()
     quota = get_odds_api_quota()
     is_stale = get_prop_lines_are_stale()
-    refresh_col1, refresh_col2, refresh_col3 = st.columns([1, 3, 1])
     quota_text = (
         f"🔑 Odds API quota: {quota['remaining']:,} credits remaining ({quota['used']:,} used this billing period)"
         if quota["remaining"] is not None else "Odds API quota info not available."
     )
-    with refresh_col1:
+    with tb_status:
         theme.info_popover(
             f"**Prop lines last pulled:** {prop_updated_at.strftime('%a %-I:%M %p')} (auto-refreshes once a day "
             f"to conserve API quota).\n\n{quota_text}",
-            label="🔑 Prop line status",
+            label="🔑 Prop line status", use_container_width=True,
         )
-    with refresh_col2:
+    with tb_msg:
         if is_stale:
             st.warning(
                 f"Couldn't get a fresh pull this cycle (quota safety buffer or a temporary API hiccup) - showing the last "
                 f"known odds from {prop_updated_at.strftime('%a %-I:%M %p')} instead of nothing. Will try again next refresh.",
                 icon="⚠️",
             )
-    with refresh_col3:
+    with tb_refresh_props:
         if st.button("🔄 Refresh prop lines now", use_container_width=True):
             _get_prop_lines_with_timestamp.clear()
             st.rerun()
 
-if st.button("Refresh all data now"):
-    # Clearing st.cache_data alone isn't enough - nflreadpy (the library
-    # that actually downloads rosters/stats/schedules from nflverse) keeps
-    # its own separate cache underneath this one, so without also clearing
-    # that, this button could still silently serve up to an hour-old data
-    # (see clear_nflverse_cache's docstring in data_loader.py). Both need
-    # to be cleared together for "refresh now" to actually mean "now".
-    clear_nflverse_cache()
-    st.cache_data.clear()
-    st.rerun()
+with tb_refresh_all:
+    if st.button("Refresh all data now", use_container_width=True):
+        # Clearing st.cache_data alone isn't enough - nflreadpy (the library
+        # that actually downloads rosters/stats/schedules from nflverse) keeps
+        # its own separate cache underneath this one, so without also clearing
+        # that, this button could still silently serve up to an hour-old data
+        # (see clear_nflverse_cache's docstring in data_loader.py). Both need
+        # to be cleared together for "refresh now" to actually mean "now".
+        clear_nflverse_cache()
+        st.cache_data.clear()
+        st.rerun()
 
 stats_df = get_stats()
 meta_df = get_meta()
@@ -1564,7 +1607,7 @@ def compute_lineup_projections(roster_players: list) -> pd.DataFrame:
         latest = pdf.sort_values(["season", "week"]).iloc[-1]
         position, team = latest["position"], latest["team"]
         headshot_url = latest.get("headshot_url")
-        season_avg, _, _, _ = compute_summary(pdf[pdf["season"] == CURRENT_SEASON], "fantasy_points_ppr")
+        season_avg, _, _, _, _ = compute_summary(pdf[pdf["season"] == CURRENT_SEASON], "fantasy_points_ppr")
 
         if team not in teams_this_week:
             rows.append({
@@ -1721,21 +1764,40 @@ def render_lineup_tab():
     )
 
 
+SITE_SECTIONS = ["🏠 Dashboard", "🔍 Research", "🏈 Lineups", "🎯 Props", "🔥 Hot Picks", "📊 Track Record"]
+# A browser session that was open before the Sep 2026 nav redesign can
+# still hold an old section name ("🏈 Fantasy Lineups", "🎯 Prop Bets",
+# "🏠 Home") in session state - drop it so the radio falls back to its
+# default instead of erroring on a value that's no longer an option.
+if st.session_state.get("site_side") not in (None, *SITE_SECTIONS):
+    del st.session_state["site_side"]
 tab_side = st.radio(
-    "Site section", ["🏠 Home", "🏈 Fantasy Lineups", "🎯 Prop Bets", "🔥 Hot Picks", "📊 Track Record"],
+    "Site section", SITE_SECTIONS,
     horizontal=True, key="site_side", label_visibility="collapsed",
 )
-st.divider()
+# (No st.divider() here - the nav bar's own full-width bottom rule, styled
+# in theme.py, is the separator. Both together read as a doubled line.)
 
-if tab_side == "🏈 Fantasy Lineups":
-    tab_overview, tab_deep_dive, tab_injuries, tab_matchups, tab_rosters, tab_lineup = st.tabs(
-        ["📋 Overview", "🔍 Player Deep Dive", "🩹 Injuries", "🗓️ Matchups", "👥 My Rosters", "🏆 Lineup Optimizer"]
+# Site IA (Sep 2026 redesign): the old "Fantasy Lineups" section held six
+# sub-tabs covering two different jobs - browsing stats and managing your
+# own lineups. It's split into Research (browse/scout) and Lineups (build/
+# optimize). Each sub-tab was already a self-contained `with` block with no
+# shared setup between them, so the split moves no logic - only which
+# top-level section each one lives under. "Prop Bets" is renamed "Props"
+# with its four sub-tabs unchanged.
+if tab_side == "🔍 Research":
+    tab_overview, tab_deep_dive, tab_injuries, tab_matchups = st.tabs(
+        ["📋 Overview", "🔍 Player Deep Dive", "🩹 Injuries", "🗓️ Matchups"]
     )
-elif tab_side == "🎯 Prop Bets":
+elif tab_side == "🏈 Lineups":
+    tab_rosters, tab_lineup = st.tabs(
+        ["👥 My Rosters", "🏆 Lineup Optimizer"]
+    )
+elif tab_side == "🎯 Props":
     tab_props, tab_firsttd, tab_game, tab_slips = st.tabs(
         ["🎯 Prop Comparator", "🥇 First TD", "🏟️ Game Center", "🧾 Bet Slip Tracker"]
     )
-# 🏠 Home, 🔥 Hot Picks and 📊 Track Record have no sub-tabs of their own -
+# 🏠 Dashboard, 🔥 Hot Picks and 📊 Track Record have no sub-tabs of their own -
 # each is one combined page, rendered further down in its own
 # `elif tab_side == "...":` branch.
 
@@ -1754,13 +1816,13 @@ def jump_to_game_center(week, game_label):
     would throw StreamlitWidgetAlreadyInstantiatedError, since the Game
     Center tab's selectboxes (which share these keys) are instantiated
     earlier in the same top-to-bottom script pass, before the Matchups
-    tab's button code ever runs. Also flips to the Prop Bets side, since
+    tab's button code ever runs. Also flips to the Props section, since
     Game Center now lives there - without this, the jump would land on a
     tab that isn't visible until the user switches sides themselves."""
     st.session_state["game_week"] = week
     st.session_state["game_pick"] = game_label
     st.session_state["show_jump_toast"] = True
-    st.session_state["site_side"] = "🎯 Prop Bets"
+    st.session_state["site_side"] = "🎯 Props"
 
 def _home_jump(label: str) -> None:
     """Button callback for the Home page's quick-nav row. Same reasoning
@@ -1774,9 +1836,9 @@ def _home_jump(label: str) -> None:
     st.session_state["site_side"] = label
 
 
-if tab_side == "🏠 Home":
+if tab_side == "🏠 Dashboard":
     # ---------------- Home (alerts + at-a-glance briefing) ----------------
-    st.subheader("🏠 Home")
+    st.subheader("🏠 Dashboard")
     st.caption("What needs your attention right now, plus quick links to everything else.")
 
     home_schedule = get_schedule()
@@ -1829,8 +1891,8 @@ if tab_side == "🏠 Home":
             f"<b>Check results now</b> on Track Record to grade them.",
         ))
 
-    sev_style = {"bad": theme.BAD, "warn": theme.WARN, "good": theme.ACCENT}
-    sev_soft = {"bad": theme.BAD_SOFT, "warn": theme.WARN_SOFT, "good": theme.ACCENT_SOFT}
+    sev_style = {"bad": theme.BAD, "warn": theme.WARN, "good": theme.GOOD}
+    sev_soft = {"bad": theme.BAD_SOFT, "warn": theme.WARN_SOFT, "good": theme.GOOD_SOFT}
     sev_order = {"bad": 0, "warn": 1, "good": 2}
 
     if not alerts:
@@ -1896,18 +1958,19 @@ if tab_side == "🏠 Home":
 
     st.markdown("##### Jump to")
     nav_targets = [
-        ("🏈 Fantasy Lineups", "Rosters, lineups, matchups & injuries"),
-        ("🎯 Prop Bets", "Prop comparator, First TD, Game Center"),
+        ("🔍 Research", "Player stats, deep dives, injuries & matchups"),
+        ("🏈 Lineups", "Your rosters & the lineup optimizer"),
+        ("🎯 Props", "Prop comparator, First TD, Game Center, bet slips"),
         ("🔥 Hot Picks", "This week's best edges & TD chances"),
         ("📊 Track Record", "Hit rates on everything tracked"),
     ]
-    nav_cols = st.columns(4)
+    nav_cols = st.columns(5)
     for nav_col, (nav_label, nav_desc) in zip(nav_cols, nav_targets):
         with nav_col:
             st.button(nav_label, use_container_width=True, key=f"home_nav_{nav_label}", on_click=_home_jump, args=(nav_label,))
             st.caption(nav_desc)
 
-elif tab_side == "🏈 Fantasy Lineups":
+elif tab_side == "🔍 Research":
     # ---------------- Overview (current season only) ----------------
     with tab_overview:
         st.sidebar.header("Filters")
@@ -1945,7 +2008,7 @@ elif tab_side == "🏈 Fantasy Lineups":
                     "**Badge key:** matchup badges show the upcoming opponent's defensive rank (color: red = "
                     "toughest, green = easiest). 🎯 Anytime TD is the betting market's implied chance this player "
                     "scores any touchdown this week; 🥇 First TD is the narrower chance they score the game's "
-                    "FIRST touchdown (see the First TD tab on the Prop Bets side for the full breakdown) — both "
+                    "FIRST touchdown (see the First TD tab in Props for the full breakdown) — both "
                     "are market probabilities, not Prop Shop projections. Hover a badge for details.",
                     label="ℹ️ Badge key",
                 )
@@ -1980,7 +2043,7 @@ elif tab_side == "🏈 Fantasy Lineups":
                     st.markdown(first_td_badge_html(float(first_td_match["implied_prob"].iloc[0]), tag="span"), unsafe_allow_html=True)
 
             metrics_source = pdf_current if not pdf_current.empty else pdf_full
-            avg, last, trend, consistency = compute_summary(metrics_source, "fantasy_points_ppr")
+            avg, last, trend, consistency, _cv = compute_summary(metrics_source, "fantasy_points_ppr")
             label_suffix = f"({CURRENT_SEASON})" if not pdf_current.empty else "(no current-season games yet)"
             m1, m2 = st.columns(2)
             m1.metric(f"Avg PPR {label_suffix}", f"{avg:.1f}")
@@ -2008,7 +2071,7 @@ elif tab_side == "🏈 Fantasy Lineups":
 
                 period_order = chronological_order(pdf_full)
                 stat_title = stat.replace("_", " ").title()
-                line = alt.Chart(pdf_full).mark_line(point=True, color="#5B8DEF").encode(
+                line = alt.Chart(pdf_full).mark_line(point=True, color=theme.ACCENT).encode(
                     x=alt.X("period:N", sort=period_order, title=None),
                     y=alt.Y(f"{stat}:Q", title=stat_title),
                     tooltip=[
@@ -2026,7 +2089,7 @@ elif tab_side == "🏈 Fantasy Lineups":
                 if stat in avg_source.columns and not avg_source[stat].dropna().empty:
                     stat_avg = float(avg_source[stat].mean())
                     avg_rule = alt.Chart(pd.DataFrame({"y": [stat_avg]})).mark_rule(
-                        color="#999999", strokeDash=[5, 4], size=2
+                        color=theme.SUB, strokeDash=[5, 4], size=2
                     ).encode(y="y:Q", tooltip=alt.value(f"Season avg: {stat_avg:.1f}"))
                     layers.append(avg_rule)
                     legend_bits.append(f"⬤ ---- Season avg ({stat_avg:.1f})")
@@ -2039,7 +2102,7 @@ elif tab_side == "🏈 Fantasy Lineups":
                     if not match.empty:
                         prop_val = float(match["point"].iloc[0])
                         prop_rule = alt.Chart(pd.DataFrame({"y": [prop_val]})).mark_rule(
-                            color="#F5A623", strokeDash=[2, 2], size=2
+                            color=theme.INK, strokeDash=[2, 2], size=2
                         ).encode(y="y:Q", tooltip=alt.value(f"Prop line: {prop_val:.1f}"))
                         layers.append(prop_rule)
                         legend_bits.append(f"⬤ ···· Prop line ({prop_val:.1f})")
@@ -2101,7 +2164,7 @@ elif tab_side == "🏈 Fantasy Lineups":
                         pdf_a_full[["period", "season", "week", "matchup_display", stat]].assign(player=player_a),
                         pdf_b_full[["period", "season", "week", "matchup_display", stat]].assign(player=player_b),
                     ])
-                    player_colors = ["#5B8DEF", "#F5A623"]
+                    player_colors = [theme.ACCENT, theme.INK]
                     color_scale = alt.Scale(domain=[player_a, player_b], range=player_colors)
                     period_order = chronological_order(pdf_a_full, pdf_b_full)
                     cmp_stat_title = stat.replace("_", " ").title()
@@ -2350,7 +2413,7 @@ elif tab_side == "🏈 Fantasy Lineups":
                         y=alt.Y("matchup_label:N", sort="-x", title=None),
                         color=alt.Color(
                             "total_sort:Q", title="Total",
-                            scale=alt.Scale(range=["#ff6b6b", "#ffd166", "#8fd6a8"]),
+                            scale=alt.Scale(range=["#5A4A22", theme.ACCENT]),
                             legend=None,
                         ),
                         tooltip=[
@@ -2429,13 +2492,14 @@ elif tab_side == "🏈 Fantasy Lineups":
                     "Open →", key="matchup_jump_button",
                     on_click=jump_to_game_center, args=(matchup_week, jump_pick),
                 )
+elif tab_side == "🏈 Lineups":
     # ---------------- My Rosters ----------------
     with tab_rosters:
         render_rosters_tab()
     # ---------------- Lineup Optimizer ----------------
     with tab_lineup:
         render_lineup_tab()
-elif tab_side == "🎯 Prop Bets":
+elif tab_side == "🎯 Props":
     # ---------------- Prop Comparator (current season only) ----------------
     with tab_props:
         st.subheader("Player Prop Line Comparator")
@@ -2524,14 +2588,14 @@ elif tab_side == "🎯 Prop Bets":
                     y=alt.Y(f"{prop_stat}:Q", title=prop_stat.replace("_", " ").title()),
                     color=alt.Color(
                         "result_plain:N",
-                        scale=alt.Scale(domain=["Over", "Under", "Push"], range=["#4CAF50", "#F44336", "#999999"]),
+                        scale=alt.Scale(domain=["Over", "Under", "Push"], range=[theme.GOOD, theme.BAD, theme.SUB]),
                         legend=alt.Legend(title=None),
                     ),
                     tooltip=["week_label", prop_stat, "opponent_team", "result"],
                 )
             )
             rule = alt.Chart(pd.DataFrame({"y": [prop_line]})).mark_rule(
-                color="#e0e0e0", strokeDash=[6, 4], size=2
+                color=theme.INK, strokeDash=[6, 4], size=2
             ).encode(y="y:Q")
             st.altair_chart((bars + rule).properties(height=320), use_container_width=True)
 
@@ -2802,7 +2866,7 @@ elif tab_side == "🎯 Prop Bets":
                 with col:
                     st.markdown(
                         f"### {team_logo_html(team, px=44)}{team} "
-                        f"<span style='font-size:15px; color:#999; font-weight:400;'>({home_away_label})</span>",
+                        f"<span style='font-size:15px; color:{theme.SUB}; font-weight:400;'>({home_away_label})</span>",
                         unsafe_allow_html=True,
                     )
                     note = matchup_note(team, opponent)
@@ -3019,7 +3083,7 @@ elif tab_side == "🔥 Hot Picks":
     st.subheader("🔥 Hot Picks")
     st.caption(
         "A league-wide scouting view, refreshed from the same live data as the rest of the site: the biggest "
-        "prop-line edges, the best touchdown-scoring chances, and the safest high-floor + favorable-matchup "
+        "prop-line edges, the best touchdown-scoring chances, and the safest high-floor, most-consistent "
         "plays. Every number here is explained in more depth on its own tab elsewhere in the app."
     )
     theme.info_popover(
@@ -3185,8 +3249,17 @@ elif tab_side == "🔥 Hot Picks":
                 "opportunity_trend": compute_opportunity_trend(stats_df, hp_snap_counts, player, td_trend_stat, CURRENT_SEASON),
             })
 
-        # ---- Safe plays: High consistency + a favorable upcoming matchup ----
-        avg_fp, _, _, consistency = compute_summary(pdf, "fantasy_points_ppr")
+        # ---- Safe plays: High consistency + an upcoming game ----
+        # Matchup difficulty is shown on the card as CONTEXT but no longer
+        # gates or ranks this list - a walk-forward backtest against the
+        # real 2025 season tested it every way (as the primary sort, as a
+        # stricter cutoff at various thresholds, as a "no really bad
+        # matchup" exclusion filter) and it never separated winners from
+        # losers by more than noise. Consistency itself is where the real,
+        # backtest-confirmed edge lives (see CONSISTENCY_HIGH_CV's
+        # docstring), so that's now both the filter AND the sort key -
+        # most consistent player first, not easiest matchup first.
+        avg_fp, _, _, consistency, cv = compute_summary(pdf, "fantasy_points_ppr")
         # plain=True: this lands in a st.dataframe cell below, which shows
         # HTML source literally instead of rendering it (same reasoning as
         # add_matchup_display's separate plain-text column elsewhere).
@@ -3197,7 +3270,7 @@ elif tab_side == "🔥 Hot Picks":
             matchup_rows.append({
                 "player": player, "player_id": player_id, "team": team, "position": position,
                 "headshot_url": headshot_url, "team_color": team_color,
-                "matchup_label": matchup_label, "matchup_rank": matchup_rank,
+                "matchup_label": matchup_label, "matchup_rank": matchup_rank, "cv": cv,
                 "season_avg_ppr": round(avg_fp, 1),
                 "implied_total": hp_implied_totals.get(team),
                 # A "High consistency" verdict is itself a look backward
@@ -3240,7 +3313,7 @@ elif tab_side == "🔥 Hot Picks":
     section1, section2, section3 = st.columns(3)
     section1.metric("Prop Edges Found", len(edge_rows))
     section2.metric("TD Chances Tracked", len(td_rows))
-    section3.metric("High-Consistency Favorable Matchups", len(matchup_rows))
+    section3.metric("High-Consistency Safe Plays", len(matchup_rows))
 
     # ---- Position mix donut: the one place on this page a donut earns its
     # keep - a real part-to-whole with only 4 possible slices (QB/RB/WR/TE),
@@ -3397,7 +3470,7 @@ elif tab_side == "🔥 Hot Picks":
     st.markdown("##### 📈 Biggest Prop-Line Edges")
     st.caption("Season average vs. the live sportsbook line, for whichever tracked stat shows the biggest gap for that player.")
     if not edge_rows:
-        st.info("No live prop lines available right now to compare against - try \"Refresh prop lines now\" on the Prop Bets side.")
+        st.info("No live prop lines available right now to compare against - try \"Refresh prop lines now\" at the top of the page.")
     else:
         edge_df = pd.DataFrame(edge_rows)
         edge_df["_abs_edge"] = edge_df["edge"].abs()
@@ -3458,7 +3531,7 @@ elif tab_side == "🔥 Hot Picks":
             y=alt.Y("label:N", sort=edge_label_order, title=None),
             color=alt.Color(
                 "direction:N", title=None,
-                scale=alt.Scale(domain=["▲ Over", "▼ Under"], range=["#4CAF50", "#F44336"]),
+                scale=alt.Scale(domain=["▲ Over", "▼ Under"], range=[theme.GOOD, theme.BAD]),
                 legend=alt.Legend(orient="top"),
             ),
             tooltip=[
@@ -3508,7 +3581,7 @@ elif tab_side == "🔥 Hot Picks":
     st.markdown("##### 🎯 Best TD Scoring Chances")
     st.caption("Market-implied probability (includes the sportsbook's margin) of scoring any touchdown, and specifically the first one, this week.")
     if not td_rows:
-        st.info("No live TD odds available right now - try \"Refresh prop lines now\" on the Prop Bets side.")
+        st.info("No live TD odds available right now - try \"Refresh prop lines now\" at the top of the page.")
     else:
         td_df = pd.DataFrame(td_rows)
         td_df["_sort"] = td_df[["anytime_td_pct", "first_td_pct"]].max(axis=1, skipna=True)
@@ -3566,7 +3639,7 @@ elif tab_side == "🔥 Hot Picks":
             y=alt.Y("player:N", sort=td_df.head(10)["player"].tolist(), title=None),
             color=alt.Color(
                 "market:N", title=None,
-                scale=alt.Scale(domain=["🎯 Anytime TD", "🥇 First TD"], range=[theme.ACCENT, theme.WARN]),
+                scale=alt.Scale(domain=["🎯 Anytime TD", "🥇 First TD"], range=[theme.CATEGORY_COLORS["Anytime TD"], theme.CATEGORY_COLORS["First TD"]]),
                 legend=alt.Legend(orient="top"),
             ),
             yOffset="market:N",
@@ -3591,13 +3664,17 @@ elif tab_side == "🔥 Hot Picks":
 
     st.divider()
 
-    # ---- Section 3: Safe Plays (High Consistency + Favorable Matchup) ----
-    st.markdown("##### 🛡️ Safe Plays — High Consistency + Favorable Matchup")
-    st.caption("Reliable, low-variance scorers (season coefficient of variation under 25%) facing the easiest matchups at their position/stat.")
+    # ---- Section 3: Safe Plays (High Consistency, ranked by consistency) ----
+    st.markdown("##### 🛡️ Safe Plays — High Consistency")
+    st.caption(
+        f"Reliable, low-variance scorers (season coefficient of variation under {CONSISTENCY_HIGH_CV:.0%}, "
+        f"{MIN_GAMES_FOR_CONSISTENCY}+ games played), ranked most-consistent first. Matchup is shown for "
+        f"context, not as a ranking factor - a 2025 season backtest found it didn't predict anything here."
+    )
     if not matchup_rows:
-        st.info("No players currently match both a High consistency rating and a favorable upcoming matchup.")
+        st.info("No players currently have a High consistency rating with an upcoming game.")
     else:
-        matchup_df = pd.DataFrame(matchup_rows).sort_values("matchup_rank", ascending=False).head(15)
+        matchup_df = pd.DataFrame(matchup_rows).sort_values("cv", ascending=True).head(15)
 
         st.markdown("###### This week's safest plays")
         safe_card_rows = matchup_df.head(3).to_dict("records")
@@ -3634,7 +3711,8 @@ elif tab_side == "🔥 Hot Picks":
 
         matchup_df["Implied Total"] = matchup_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
         matchup_df["Opportunity"] = matchup_df["opportunity_trend"].apply(opportunity_trend_text)
-        matchup_display = matchup_df[["player", "team", "position", "matchup_label", "season_avg_ppr", "Implied Total", "Opportunity"]].rename(columns={
+        matchup_df["Consistency (CV)"] = matchup_df["cv"].apply(lambda c: f"{c:.2f}" if pd.notna(c) else "—")
+        matchup_display = matchup_df[["player", "team", "position", "Consistency (CV)", "matchup_label", "season_avg_ppr", "Implied Total", "Opportunity"]].rename(columns={
             "player": "Player", "team": "Team", "position": "Pos",
             "matchup_label": "Matchup", "season_avg_ppr": f"{CURRENT_SEASON} Avg PPR",
         })
@@ -3658,7 +3736,7 @@ else:
     st.caption(
         "Every Prop-Line Edge and TD Chance pick the Hot Picks page has surfaced gets saved automatically "
         "the first time that week's page loads, then checked against what actually happened once each "
-        "game goes final. Safe Plays aren't tracked here - \"high consistency + a favorable matchup\" is a "
+        "game goes final. Safe Plays aren't tracked here - \"high consistency\" is a "
         "different kind of claim than a specific Over/Under or scoring prediction, so there's no single "
         "hit/miss to score it against."
     )
@@ -3694,7 +3772,7 @@ else:
         # safe, and it keeps this page visually related to Hot Picks
         # without literally reusing the anytime/first-TD pair (ACCENT vs
         # WARN), which fails the palette validator's CVD-separation check.
-        category_colors = {"Prop Edge": POSITION_COLORS["QB"], "Anytime TD": POSITION_COLORS["WR"], "First TD": POSITION_COLORS["TE"]}
+        category_colors = theme.CATEGORY_COLORS
         # Player headshot + team color/logo lookups, same source as every
         # other card on the site (get_meta merges rosters + team colors by
         # player name; team_logos is the module-level team_abbr -> logo
@@ -3851,7 +3929,7 @@ else:
                     y=alt.Y("count:Q", title="Resolved picks"),
                     color=alt.Color(
                         "Result:N", title=None, sort=["Hit", "Miss", "Push"],
-                        scale=alt.Scale(domain=["Hit", "Miss", "Push"], range=[theme.ACCENT, theme.BAD, theme.SUB]),
+                        scale=alt.Scale(domain=["Hit", "Miss", "Push"], range=[theme.GOOD, theme.BAD, theme.SUB]),
                         legend=alt.Legend(orient="top"),
                     ),
                     order=alt.Order("Result:N", sort="ascending"),

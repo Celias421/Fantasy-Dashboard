@@ -1,92 +1,135 @@
 """
 theme.py
 The Prop Shop's visual identity - brand colors, the global CSS that skins
-Streamlit's native widgets to match, and the logo header shown on every
+Streamlit's native widgets to match, and the wordmark header shown on every
 page. One module so every part of the app pulls from the same palette
 instead of each feature inventing its own colors (the standing rule this
 codebase already follows for behavior applies to styling too).
 
-Colors are sampled directly from the actual logo file (assets/logo.webp)
-rather than eyeballed, so the header and the rest of the UI are a genuine
-color match, not an approximation:
-    green (SHOP lettering)  -> (104, 246, 31) -> #68F61F
-Everything else in the palette (surfaces, borders, muted text) is built
-around that green and the logo's black/white/chalk-gray palette - kept
-deliberately narrow (black, white, green, gray, plus red/amber ONLY for
-semantic meaning) rather than introducing unrelated colors.
+Brand system (v2, Sep 2026 redesign) - replaces the original lime-green
+logo/palette:
+  * Ground: warm near-black, not pure black - reads as deliberate, cinematic.
+  * ONE signature hue: deep brass/gold (#D4A934) - scoreboard/trophy-room
+    feel. Used sparingly for brand moments: the wordmark dot, active nav
+    state, primary buttons, headline metric values, the header rule.
+  * Status colors are SEPARATE from the brand hue: GOOD (green) for hits /
+    upward deltas / favorable, BAD (red) for misses / downward / tough,
+    WARN (amber) for pending. The old palette conflated "brand" and "good"
+    because the brand color happened to be green; with a gold brand that
+    would make every Hit badge read as decoration instead of success, so
+    they're split.
+  * Position colors (QB blood red, RB navy, WR rust, TE emerald) - fixed
+    identity colors, validated for color-vision-deficiency separation and
+    contrast against the dark surface before being adopted.
+  * Type: Big Shoulders Display (condensed, scoreboard-weight) for the
+    wordmark, headings and big numbers; Manrope for body/UI; IBM Plex Mono
+    for tabular data so figures line up.
 """
-
-import base64
-from pathlib import Path
 
 import streamlit as st
 
-LOGO_PATH = Path(__file__).parent / "assets" / "logo.webp"
-
 # ---- Brand palette -----------------------------------------------------
-# Core
-BG = "#0A0C0A"              # app background - near-black, faint green undertone
-SURFACE = "#14170F"          # cards, sidebar, secondary background
-SURFACE_2 = "#1C211A"        # nested/inset surfaces (inputs, code-style chips)
-LINE = "#2B2F26"             # borders/dividers
-INK = "#F4F5F1"              # primary text - warm off-white
-SUB = "#9AA092"              # secondary/muted text - green-gray
+# Core surfaces / ink
+BG = "#0B0A08"               # app background - warm near-black
+SURFACE = "#16140F"          # cards, sidebar, secondary background
+SURFACE_2 = "#1F1C15"        # nested/inset surfaces (inputs, chips)
+LINE = "#332C1D"             # borders/dividers - warm, not gray
+INK = "#F6F3EA"              # primary text - warm off-white
+SUB = "#A39B8A"              # secondary/muted text
 
-# Brand accent (sampled from the logo)
-ACCENT = "#68F61F"
-ACCENT_HOVER = "#4AB116"
-ACCENT_SOFT = "rgba(104, 246, 31, 0.14)"   # badge/chip fills
-ACCENT_SOFT_STRONG = "rgba(104, 246, 31, 0.24)"
+# Brand accent - brass/gold
+ACCENT = "#D4A934"
+ACCENT_HOVER = "#B8901F"
+ACCENT_INK = "#241A05"       # text color ON a solid-accent background
+ACCENT_SOFT = "rgba(212, 169, 52, 0.14)"         # badge/chip fills
+ACCENT_SOFT_STRONG = "rgba(212, 169, 52, 0.30)"
 
-# Semantic (separate from the brand accent - meaning, not decoration)
-BAD = "#E5484D"
-BAD_SOFT = "rgba(229, 72, 77, 0.14)"
+# Semantic status (separate from the brand accent - meaning, not decoration)
+GOOD = "#43C283"
+GOOD_SOFT = "rgba(67, 194, 131, 0.14)"
+GOOD_BORDER = "rgba(67, 194, 131, 0.32)"
+BAD = "#E5555A"
+BAD_SOFT = "rgba(229, 85, 90, 0.14)"
+BAD_BORDER = "rgba(229, 85, 90, 0.32)"
 WARN = "#F5B324"
 WARN_SOFT = "rgba(245, 179, 36, 0.14)"
+WARN_BORDER = "rgba(245, 179, 36, 0.32)"
+
+# Position identity colors - single source of truth. dashboard.py's
+# POSITION_COLORS points here rather than keeping its own copy. Passed a
+# colorblind-safety check (lightness band, chroma floor, CVD separation,
+# normal-vision separation, contrast vs the dark surface) as a set.
+POSITION_COLORS = {
+    "QB": "#C23B34",   # blood red
+    "RB": "#4A66A8",   # navy
+    "WR": "#C1622C",   # burnt rust
+    "TE": "#1F8F62",   # emerald
+}
+
+# Pick-category identity colors (Track Record charts, TD Chances chart) -
+# deliberately NOT borrowed from POSITION_COLORS: under this palette that
+# would paint "Prop Edge" blood red on a hit-rate chart, which reads as
+# "miss". Its own validated set (same checks as the position colors), and
+# the same category wears the same color everywhere in the app.
+CATEGORY_COLORS = {
+    "Prop Edge": "#B08820",    # deep gold
+    "Anytime TD": "#2E9E90",   # teal
+    "First TD": "#8266D4",     # violet
+}
 
 # Matchup-difficulty gradient endpoints (toughest -> easiest), used by
-# matchup_rank_color() in dashboard.py - easiest end is brand-green-tinted
-# rather than a generic pastel green, so that scale reads as "on brand"
-# even though it's a semantic (not decorative) use of color.
-MATCHUP_TOUGH_RGB = (255, 107, 107)
-MATCHUP_EASY_RGB = (142, 248, 87)
+# matchup_rank_color() in dashboard.py. Anchored to the status colors
+# (BAD -> GOOD) rather than the brand accent, since "tough vs easy
+# matchup" is a semantic judgment, not a brand moment.
+MATCHUP_TOUGH_RGB = (229, 85, 90)
+MATCHUP_EASY_RGB = (67, 194, 131)
 
+FONT_DISPLAY = "'Big Shoulders Display', 'Arial Narrow', system-ui, sans-serif"
+FONT_BODY = "'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif"
+FONT_MONO = "'IBM Plex Mono', ui-monospace, 'SFMono-Regular', monospace"
 
-@st.cache_data
-def _logo_data_uri() -> str:
-    """Base64-embeds the logo so it renders reliably via st.markdown HTML
-    regardless of Streamlit Cloud's static file serving - same approach
-    already used throughout this app for badges/cards. Cached so the file
-    is only read+encoded once per session, not on every rerun."""
-    data = LOGO_PATH.read_bytes()
-    encoded = base64.b64encode(data).decode("ascii")
-    return f"data:image/webp;base64,{encoded}"
+_GOOGLE_FONTS_URL = (
+    "https://fonts.googleapis.com/css2?"
+    "family=Big+Shoulders+Display:wght@600;700;800;900"
+    "&family=Manrope:wght@400;500;600;700;800"
+    "&family=IBM+Plex+Mono:wght@400;500;600"
+    "&display=swap"
+)
 
 
 def inject_css() -> None:
     """Global CSS: recolors this app's own custom classes (player-card,
-    badges, deltas - defined here so dashboard.py's inline style block can
-    be dropped in favor of this single source of truth) AND overrides
-    Streamlit's native widgets (buttons, tabs, metrics, dataframes, forms,
-    expanders, alerts, the Fantasy Lineups/Prop Bets radio) via their
-    data-testid attributes, which are far more stable across Streamlit
-    versions than its internal CSS class names. Call once, right after
-    st.set_page_config()."""
+    badges, deltas) AND overrides Streamlit's native widgets (buttons,
+    tabs, metrics, dataframes, forms, expanders, alerts, the site-section
+    radio) via their data-testid attributes, which are far more stable
+    across Streamlit versions than its internal CSS class names. Also loads
+    the brand fonts - previously the CSS named "IBM Plex Sans" but never
+    actually loaded it, so every browser silently fell back to a system
+    font. Call once, right after st.set_page_config()."""
+    # IMPORTANT: this string must START with <style>. st.markdown runs the
+    # text through a markdown parser first; a block opening with <style> is
+    # kept intact until </style> even across blank lines, but a block
+    # opening with anything else (e.g. a <link> tag) ends at the FIRST
+    # blank line - everything after it gets rendered as visible paragraph
+    # text and none of those rules apply. Fonts load via @import inside
+    # the style block for exactly that reason.
     st.markdown(f"""
     <style>
+    @import url('{_GOOGLE_FONTS_URL}');
+
     /* ---- Base type & background -------------------------------------- */
-    html, body, [class*="css"] {{
-        font-family: "IBM Plex Sans", "Source Sans Pro", sans-serif;
+    html, body, [class*="css"], .stApp, .stMarkdown, button, input, textarea, select {{
+        font-family: {FONT_BODY};
     }}
     .stApp {{
         background: {BG};
     }}
+    ::selection {{ background: {ACCENT_SOFT_STRONG}; color: {INK}; }}
 
     /* ---- Global type scale -------------------------------------------
-       This app is used on laptop/desktop monitors, not phones, so text
-       leans larger than Streamlit's own (phone-friendly) defaults across
-       the board - body copy, labels, buttons - rather than the other way
-       around. Tabs and headshots/logos get their own, bigger bump below. */
+       This app is used mostly on laptop/desktop monitors, so text leans
+       larger than Streamlit's own defaults across the board. Nothing a
+       user reads renders below ~13px. */
     html, body {{ font-size: 17px; }}
     [data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li,
     [data-testid="stMarkdownContainer"] span {{
@@ -95,88 +138,132 @@ def inject_css() -> None:
     [data-testid="stWidgetLabel"] p, label {{
         font-size: 1rem !important;
     }}
+    /* ...but the rule above must NOT reach inside headings or metric
+       values: Streamlit wraps heading text in an inner <span> and metric
+       values in an inner <p>, so without this exemption both render at
+       body size even though their containers are sized large. */
+    [data-testid="stMarkdownContainer"] h1 span, [data-testid="stMarkdownContainer"] h2 span,
+    [data-testid="stMarkdownContainer"] h3 span, [data-testid="stMarkdownContainer"] h4 span,
+    [data-testid="stMarkdownContainer"] h5 span,
+    [data-testid="stHeading"] span,
+    [data-testid="stMetricValue"] p, [data-testid="stMetricValue"] span,
+    [data-testid="stMetricValue"] div {{
+        font-size: inherit !important;
+        font-family: inherit !important;
+        font-weight: inherit !important;
+        line-height: inherit !important;
+    }}
     .stSelectbox div, .stMultiSelect div, .stTextInput input, .stNumberInput input {{
         font-size: 0.95rem;
+    }}
+
+    /* Headings: condensed scoreboard display face. Covers st.title /
+       st.header / st.subheader and markdown #/##/### headings. */
+    h1, h2, h3, h4, h5,
+    [data-testid="stHeading"] h1, [data-testid="stHeading"] h2,
+    [data-testid="stHeading"] h3, [data-testid="stHeading"] h4,
+    [data-testid="stMarkdownContainer"] h1, [data-testid="stMarkdownContainer"] h2,
+    [data-testid="stMarkdownContainer"] h3, [data-testid="stMarkdownContainer"] h4,
+    [data-testid="stMarkdownContainer"] h5 {{
+        font-family: {FONT_DISPLAY} !important;
+        font-weight: 800 !important;
+        letter-spacing: .01em;
+        color: {INK};
+    }}
+    [data-testid="stHeading"] h3, [data-testid="stMarkdownContainer"] h3 {{
+        font-size: 1.9rem !important;
+    }}
+    [data-testid="stMarkdownContainer"] h5 {{
+        font-size: 1.35rem !important;
+    }}
+    /* h6 (######) is used across the app for sub-section labels ("This
+       week's biggest edges", "Closing Line Value", "Hit rate by week") -
+       same display face, one step smaller than h5. */
+    h6, [data-testid="stMarkdownContainer"] h6 {{
+        font-family: {FONT_DISPLAY} !important;
+        font-weight: 700 !important;
+        font-size: 1.2rem !important;
+        letter-spacing: .02em;
+        color: {INK};
+    }}
+    [data-testid="stMarkdownContainer"] h6 span {{
+        font-size: inherit !important;
+        font-family: inherit !important;
+    }}
+    code, pre, [data-testid="stCode"] {{
+        font-family: {FONT_MONO} !important;
     }}
 
     /* ---- This app's own component classes ----------------------------- */
     .player-card {{
         background: {SURFACE};
         border: 1px solid {LINE};
-        border-radius: 12px;
+        border-radius: 6px;
         padding: 18px 20px;
         margin-bottom: 14px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.35);
     }}
     .player-card img {{ border-radius: 50%; object-fit: cover; }}
-    .stat-big {{ font-size: 32px; font-weight: 700; margin-top: 8px; color: {INK};
-                 font-variant-numeric: tabular-nums; }}
-    .stat-label {{ font-size: 13px; color: {SUB}; letter-spacing: .02em; text-transform: uppercase; }}
-    .delta-up {{ color: {ACCENT}; font-weight: 600; font-size: 15px; }}
-    .delta-down {{ color: {BAD}; font-weight: 600; font-size: 15px; }}
+    .stat-big {{ font-family: {FONT_DISPLAY}; font-size: 38px; font-weight: 800; margin-top: 8px;
+                 color: {INK}; line-height: 1.05; font-variant-numeric: tabular-nums; }}
+    .stat-label {{ font-size: 13px; color: {SUB}; letter-spacing: .06em; text-transform: uppercase;
+                   font-weight: 600; }}
+    .delta-up {{ color: {GOOD}; font-weight: 700; font-size: 15px; }}
+    .delta-down {{ color: {BAD}; font-weight: 700; font-size: 15px; }}
     .delta-flat {{ color: {SUB}; font-weight: 600; font-size: 15px; }}
     .consistency-badge {{
         display: inline-block; font-size: 13px; padding: 4px 11px;
-        border-radius: 10px; margin-top: 6px; margin-right: 4px;
+        border-radius: 4px; margin-top: 6px; margin-right: 4px;
         background: {SURFACE_2}; color: {SUB}; border: 1px solid {LINE};
     }}
     .matchup-badge {{
         display: inline-block; font-size: 13px; padding: 4px 11px;
-        border-radius: 10px; margin-top: 6px; margin-right: 4px;
+        border-radius: 4px; margin-top: 6px; margin-right: 4px;
         background: {SURFACE_2}; border: 1px solid {LINE};
-        font-family: "IBM Plex Mono", monospace; letter-spacing: .01em;
+        font-family: {FONT_MONO}; letter-spacing: .01em;
         /* text color is set inline per-badge, gradient by matchup difficulty */
     }}
     .injury-badge {{
         display: inline-block; font-size: 13px; padding: 4px 11px;
-        border-radius: 10px; margin-top: 6px; margin-right: 4px;
-        background: {BAD_SOFT}; color: {BAD}; border: 1px solid rgba(229,72,77,.3);
+        border-radius: 4px; margin-top: 6px; margin-right: 4px;
+        background: {BAD_SOFT}; color: {BAD}; border: 1px solid {BAD_BORDER};
     }}
     /* Hot Picks' continuous-improvement loop: how confident to be in a
-       (category, position) segment based on its Track Record hit rate.
-       Shared base + one color variant per tier - same sizing/shape as the
-       other badges above so it sits naturally alongside them on a card. */
+       (category, position) segment based on its Track Record hit rate. */
     .confidence-badge {{
         display: inline-block; font-size: 13px; padding: 4px 11px;
-        border-radius: 10px; margin-top: 6px; margin-right: 4px;
+        border-radius: 4px; margin-top: 6px; margin-right: 4px;
     }}
     .confidence-high {{
-        background: {ACCENT_SOFT}; color: {ACCENT}; border: 1px solid {ACCENT_SOFT_STRONG};
+        background: {GOOD_SOFT}; color: {GOOD}; border: 1px solid {GOOD_BORDER};
     }}
     .confidence-neutral {{
         background: {SURFACE_2}; color: {SUB}; border: 1px solid {LINE};
     }}
     .confidence-low {{
-        background: {BAD_SOFT}; color: {BAD}; border: 1px solid rgba(229,72,77,.3);
+        background: {BAD_SOFT}; color: {BAD}; border: 1px solid {BAD_BORDER};
     }}
     .confidence-new {{
         background: {SURFACE_2}; color: {SUB}; border: 1px dashed {LINE};
     }}
-    /* Track Record's "Most Recent Picks" cards - same badge shape as
-       confidence-badge/matchup-badge above, one color per outcome so a
-       card's result reads at a glance without relying on its (team-color)
-       left border, which is reserved for team identity everywhere else
-       render_hotpick_cards is used. */
+    /* Track Record result badges - one status color per outcome. */
     .result-badge {{
         display: inline-block; font-size: 13px; padding: 4px 11px;
-        border-radius: 10px; margin-top: 6px; margin-right: 4px; font-weight: 600;
+        border-radius: 4px; margin-top: 6px; margin-right: 4px; font-weight: 700;
     }}
     .result-hit {{
-        background: {ACCENT_SOFT}; color: {ACCENT}; border: 1px solid {ACCENT_SOFT_STRONG};
+        background: {GOOD_SOFT}; color: {GOOD}; border: 1px solid {GOOD_BORDER};
     }}
     .result-miss {{
-        background: {BAD_SOFT}; color: {BAD}; border: 1px solid rgba(229,72,77,.3);
+        background: {BAD_SOFT}; color: {BAD}; border: 1px solid {BAD_BORDER};
     }}
     .result-push {{
         background: {SURFACE_2}; color: {SUB}; border: 1px solid {LINE};
     }}
     .result-pending {{
-        background: {WARN_SOFT}; color: {WARN}; border: 1px solid rgba(245,179,36,.3);
+        background: {WARN_SOFT}; color: {WARN}; border: 1px solid {WARN_BORDER};
     }}
     /* Initials avatar shown in place of a headshot when a player has no
-       photo on file (or it fails to load) - keeps every card the same
-       size/shape instead of leaving a blank gap. Used by the Hot Picks
-       page's card grid (render_hotpick_cards / player_avatar_html). */
+       photo on file - keeps every card the same size/shape. */
     .hotpick-avatar-fallback {{
         border-radius: 50%;
         display: flex;
@@ -187,41 +274,55 @@ def inject_css() -> None:
         font-variant-numeric: tabular-nums;
     }}
 
-    /* ---- Header / masthead --------------------------------------------- */
-    /* Logo is a transparent-background wordmark, stretched to span almost
-       the full page width as the main hero banner - sized by width (not a
-       fixed height) so it scales with the page and stays this dominant on
-       any desktop monitor, capped so it doesn't get absurd on ultrawides. */
+    /* ---- Header / wordmark ----------------------------------------------
+       Typographic wordmark replacing the old raster logo image: set in the
+       display face, so it's crisp at any size and needs no image asset. */
     .tps-header {{
-        padding: 14px 0 8px;
-        margin-bottom: 4px;
-        display: flex;
-        justify-content: center;
+        display: flex; align-items: flex-end; justify-content: space-between;
+        flex-wrap: wrap; gap: 8px 24px;
+        padding: 18px 0 12px;
     }}
-    .tps-header img {{
-        display: block;
-        width: 94%;
-        max-width: 1700px;
-        height: auto;
-        object-fit: contain;
+    .tps-wordmark {{
+        font-family: {FONT_DISPLAY};
+        font-weight: 900;
+        font-size: clamp(34px, 4.2vw, 54px);
+        line-height: .92;
+        letter-spacing: .01em;
+        color: {INK};
+        display: flex; align-items: center; gap: 14px;
+        text-transform: uppercase;
     }}
-    @media (max-width: 640px) {{
-        .tps-header img {{ width: 98%; }}
+    /* The global "[data-testid=stMarkdownContainer] span {{ font-size: 1rem }}"
+       rule above would otherwise shrink the wordmark's inner spans back to
+       body size - this out-specifies it so they inherit the display size. */
+    [data-testid="stMarkdownContainer"] .tps-wordmark span {{
+        font-size: inherit !important;
+        font-family: inherit !important;
     }}
-    .tps-tagline {{ color: {SUB}; font-size: 13px; margin: -2px 0 14px 2px; letter-spacing: .01em; }}
+    .tps-wordmark .tps-dot {{
+        width: 13px; height: 13px; border-radius: 50%;
+        background: {ACCENT}; flex: none;
+    }}
+    .tps-wordmark .tps-shop {{ color: {ACCENT}; }}
+    .tps-tagline {{
+        font-family: {FONT_MONO};
+        font-size: 13px; font-weight: 500;
+        color: {SUB}; letter-spacing: .14em; text-transform: uppercase;
+        padding-bottom: 6px;
+    }}
     .tps-divider {{
-        height: 2px; border-radius: 2px; margin: 0 0 18px;
-        background: linear-gradient(90deg, {ACCENT} 0%, rgba(104,246,31,0) 70%);
+        height: 2px; margin: 0 0 18px;
+        background: linear-gradient(90deg, {ACCENT} 0%, rgba(212,169,52,.35) 35%, {LINE} 70%);
     }}
 
     /* ---- Buttons --------------------------------------------------------- */
     .stButton > button, .stFormSubmitButton > button, .stDownloadButton > button {{
-        border-radius: 8px;
+        border-radius: 4px;
         border: 1px solid {LINE};
-        font-weight: 600;
+        font-weight: 700;
         font-size: 15px;
         padding: 10px 18px;
-        transition: border-color .15s ease, transform .05s ease;
+        transition: border-color .15s ease, color .15s ease;
     }}
     .stButton > button:hover, .stFormSubmitButton > button:hover {{
         border-color: {ACCENT};
@@ -229,19 +330,15 @@ def inject_css() -> None:
     }}
     button[kind="primary"], .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {{
         background: {ACCENT} !important;
-        color: #06210A !important;
+        color: {ACCENT_INK} !important;
         border: none !important;
     }}
     button[kind="primary"]:hover {{
         background: {ACCENT_HOVER} !important;
-        color: #06210A !important;
+        color: {ACCENT_INK} !important;
     }}
 
-    /* ---- Tabs --------------------------------------------------------------
-       Default Streamlit packs tabs tightly against the left edge. Spreading
-       them across the full width (space-between the tab list, flex-grow on
-       each tab) makes the tab bar read as a proper section-navigator rather
-       than a cramped row of labels, especially with 6-8 tabs on a wide page. */
+    /* ---- Tabs ------------------------------------------------------------ */
     [data-testid="stTabs"] [role="tablist"] {{
         display: flex;
         width: 100%;
@@ -252,11 +349,12 @@ def inject_css() -> None:
     [data-testid="stTabs"] button[role="tab"] {{
         flex: 1 1 0;
         justify-content: center;
-        font-weight: 600; color: {SUB};
+        font-weight: 700; color: {SUB};
         padding: 16px 16px;
     }}
     [data-testid="stTabs"] button[role="tab"] p {{
-        font-size: 18px !important;
+        font-size: 17px !important;
+        font-weight: 700 !important;
     }}
     [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {{
         color: {INK};
@@ -273,84 +371,119 @@ def inject_css() -> None:
         }}
     }}
 
-    /* ---- Fantasy Lineups / Prop Bets radio -> pill toggle ------------------ */
+    /* ---- Site-section nav (the top-level radio) -------------------------
+       Styled as an underline nav bar rather than a pill toggle: uppercase,
+       tracked labels, a gold underline on the active section. */
+    /* Streamlit shrink-wraps the radio's containers to their content, so
+       the nav's bottom rule would stop short - stretch them full width. */
+    [data-testid="stElementContainer"]:has(> div[data-testid="stRadio"]),
+    div[data-testid="stRadio"] {{
+        width: 100% !important;
+    }}
     div[data-testid="stRadio"] > div[role="radiogroup"] {{
-        gap: 4px; background: {SURFACE}; border: 1px solid {LINE};
-        border-radius: 999px; padding: 4px; display: inline-flex; width: fit-content;
+        gap: 6px 26px; background: transparent; border: none;
+        border-bottom: 1px solid {LINE};
+        border-radius: 0; padding: 0; display: flex; flex-wrap: wrap; width: 100%;
+        margin-bottom: 26px;
     }}
     div[data-testid="stRadio"] label {{
-        border-radius: 999px !important; padding: 9px 20px !important; margin: 0 !important;
-        transition: background .15s ease;
+        border-radius: 0 !important; padding: 10px 2px 11px !important; margin: 0 0 -1px 0 !important;
+        border-bottom: 3px solid transparent; transition: border-color .15s ease;
+    }}
+    /* Hide the radio circle - the gold underline is the indicator. Two
+       selectors because Streamlit's radio DOM differs by version: newer
+       builds render label[data-testid=stRadioOption] > span(input) + div >
+       [div(circle), div(markdown text)]; older baseweb builds render the
+       circle as the label's first child div. */
+    [data-testid="stRadioOption"] > div > div:not([data-testid="stMarkdownContainer"]),
+    div[data-testid="stRadio"] label[data-baseweb="radio"] > div:first-child {{
+        display: none !important;
     }}
     div[data-testid="stRadio"] label p {{
-        font-size: 16px !important;
+        font-size: 15px !important; font-weight: 700 !important;
+        letter-spacing: .06em; text-transform: uppercase; color: {SUB};
     }}
-    div[data-testid="stRadio"] label:has(input:checked) {{
-        background: {ACCENT};
+    div[data-testid="stRadio"] label:hover p {{
+        color: {INK};
     }}
-    div[data-testid="stRadio"] label:has(input:checked) p {{
-        color: #06210A !important; font-weight: 700 !important;
+    div[data-testid="stRadio"] label:has(input:checked),
+    [data-testid="stRadioOption"][data-selected="true"] {{
+        border-bottom-color: {ACCENT};
+    }}
+    div[data-testid="stRadio"] label:has(input:checked) p,
+    [data-testid="stRadioOption"][data-selected="true"] p {{
+        color: {INK} !important;
     }}
 
     /* ---- Metrics --------------------------------------------------------- */
     [data-testid="stMetric"] {{
-        background: {SURFACE}; border: 1px solid {LINE}; border-radius: 10px;
+        background: {SURFACE}; border: 1px solid {LINE}; border-radius: 6px;
         padding: 16px 18px;
     }}
     [data-testid="stMetricValue"] {{
         color: {ACCENT}; font-variant-numeric: tabular-nums;
-        font-size: 2.3rem !important;
+        font-family: {FONT_DISPLAY} !important; font-weight: 800;
+        font-size: 2.6rem !important;
     }}
     [data-testid="stMetricLabel"] p {{
-        font-size: 15px !important;
+        font-size: 14px !important; font-weight: 700 !important;
+        letter-spacing: .05em; text-transform: uppercase; color: {SUB};
     }}
 
-    /* ---- Dataframes / tables ----------------------------------------------- */
+    /* ---- Dataframes / tables --------------------------------------------- */
     [data-testid="stDataFrame"] {{
-        border: 1px solid {LINE}; border-radius: 10px; overflow: hidden;
+        border: 1px solid {LINE}; border-radius: 6px; overflow: hidden;
     }}
 
-    /* ---- Expanders --------------------------------------------------------- */
+    /* ---- Expanders ------------------------------------------------------- */
     [data-testid="stExpander"] {{
-        background: {SURFACE}; border: 1px solid {LINE}; border-radius: 10px;
+        background: {SURFACE}; border: 1px solid {LINE}; border-radius: 6px;
     }}
 
-    /* ---- Forms / inputs ----------------------------------------------------- */
+    /* ---- Popovers (ℹ️ details buttons) ------------------------------------ */
+    [data-testid="stPopover"] button {{
+        border-radius: 4px;
+    }}
+
+    /* ---- Forms / inputs --------------------------------------------------- */
     [data-testid="stForm"] {{
-        background: {SURFACE}; border: 1px solid {LINE}; border-radius: 12px; padding: 18px;
+        background: {SURFACE}; border: 1px solid {LINE}; border-radius: 6px; padding: 18px;
     }}
     .stTextInput input, .stNumberInput input, [data-baseweb="select"] > div {{
         background: {SURFACE_2} !important; border-color: {LINE} !important;
     }}
 
-    /* ---- Alerts (info/warning/success/error) -------------------------------- */
+    /* ---- Alerts (info/warning/success/error) ------------------------------ */
     [data-testid="stAlertContainer"] {{
-        border-radius: 10px; border-width: 1px; border-style: solid;
+        border-radius: 6px; border-width: 1px; border-style: solid;
     }}
 
-    /* ---- Sidebar ------------------------------------------------------------ */
+    /* ---- Sidebar ---------------------------------------------------------- */
     [data-testid="stSidebar"] {{
         background: {SURFACE}; border-right: 1px solid {LINE};
     }}
 
-    /* ---- Multiselect/selectbox selected-value tags --------------------------
-       Streamlit's theme engine fills these solid with primaryColor by
-       default, which reads as too loud repeated 4-5x in the Position
-       filter - softened to a tinted chip so the vivid green stays reserved
-       for primary actions and active states (the pill toggle, active tab,
-       primary buttons), not scattered across every filter tag. */
+    /* ---- Multiselect/selectbox selected-value tags -------------------------
+       Tinted chip rather than a solid fill, so the gold stays reserved for
+       primary actions and active states. */
     [data-testid="stMultiSelectTagsContainer"] [data-tag] {{
-        background: {ACCENT_SOFT_STRONG} !important;
-        border: 1px solid rgba(104, 246, 31, 0.35) !important;
+        background: {ACCENT_SOFT} !important;
+        border: 1px solid {ACCENT_SOFT_STRONG} !important;
+        border-radius: 4px !important;
     }}
     [data-testid="stMultiSelectTagsContainer"] [data-tag] span {{
         color: {ACCENT} !important;
         font-size: 14px !important;
+        font-weight: 600;
     }}
 
-    /* ---- Captions -------------------------------------------------------- */
+    /* ---- Dividers --------------------------------------------------------- */
+    hr {{ border-color: {LINE} !important; }}
+
+    /* ---- Captions --------------------------------------------------------- */
     [data-testid="stCaptionContainer"] p {{
         font-size: 14px !important;
+        color: {SUB};
     }}
     </style>
     """, unsafe_allow_html=True)
@@ -369,13 +502,15 @@ def info_popover(text: str, label: str = "ℹ️ Details", *, use_container_widt
 
 
 def render_header() -> None:
-    """Logo + tagline masthead, shown once at the very top of the page -
-    above the Fantasy Lineups / Prop Bets split, so it's visible on both
-    sides of the site rather than duplicated per-side."""
+    """Typographic wordmark + tagline masthead, shown once at the very top
+    of the page, above the site-section nav. Replaces the original raster
+    logo image (lime-green "SHOP" lettering) - pure HTML/CSS in the brand
+    display face, so there's no image asset to load or keep in sync."""
     st.markdown(
-        f"""
+        """
         <div class="tps-header">
-            <img src="{_logo_data_uri()}" alt="The Prop Shop" />
+            <div class="tps-wordmark"><span class="tps-dot"></span><span>The Prop <span class="tps-shop">Shop</span></span></div>
+            <div class="tps-tagline">Fantasy football &amp; prop analytics</div>
         </div>
         <div class="tps-divider"></div>
         """,
@@ -385,15 +520,12 @@ def render_header() -> None:
 
 def render_footer() -> None:
     """Small credit line at the very bottom of the page - shown once,
-    after everything else has rendered, so it appears on every tab
-    regardless of which side (Fantasy Lineups / Prop Bets) or sub-tab is
-    active. Styled as a quiet, muted caption (same SUB color as the rest
-    of the app's secondary text) rather than a bold callout - a signature,
-    not another banner."""
+    after everything else has rendered, so it appears on every section and
+    sub-tab. Styled as a quiet, muted caption - a signature, not a banner."""
     st.markdown(
         f"""
         <div class="tps-divider" style="margin-top:32px;"></div>
-        <div style="text-align:center; color:{SUB}; font-size:12px; padding:10px 0 18px;">
+        <div style="text-align:center; color:{SUB}; font-size:13px; padding:10px 0 18px; letter-spacing:.04em;">
             Presented to you by: Curtis J Elias
         </div>
         """,
