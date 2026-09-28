@@ -17,6 +17,7 @@ import requests
 import nflreadpy as nfl
 import pandas as pd
 
+from odds_math import summarize_prop_books, typical_price, best_price
 from config import (
     SEASONS, CURRENT_SEASON, STARTERS_PER_POSITION, PROP_MARKET_MAP,
     ANYTIME_TD_MARKET, FIRST_TD_MARKET, ODDS_API_SAFETY_BUFFER,
@@ -303,12 +304,36 @@ def _quota_from_headers(resp) -> dict:
     return {"remaining": remaining, "used": used}
 
 
+# Output columns of load_prop_lines (Sep 2026: price columns added for EV
+# and profit tracking - see odds_math.summarize_prop_books).
+PROP_COLUMNS = [
+    "player", "market", "point", "fair_prob_over", "n_books",
+    "best_over_price", "best_over_book", "best_under_price", "best_under_book",
+    "typical_over_price", "typical_under_price",
+]
+TD_COLUMNS = ["player", "implied_prob", "typical_price", "best_price", "best_book"]
+
+
+def _price_summary(raw: pd.DataFrame, book_col: str) -> pd.DataFrame:
+    """player -> typical (median) and best "Yes" price across books, for
+    the TD markets."""
+    rows = []
+    for player, g in raw.groupby("player"):
+        bp, bb = best_price(dict(zip(g[book_col], g["price"])))
+        rows.append({"player": player, "typical_price": typical_price(g["price"].tolist()),
+                     "best_price": bp, "best_book": bb})
+    return pd.DataFrame(rows, columns=["player", "typical_price", "best_price", "best_book"])
+
+
 def load_prop_lines(api_key: str):
     """Current player prop lines from The Odds API: (props_df, td_df, first_td_df, quota).
 
     props_df covers the point-value markets in PROP_MARKET_MAP (yards,
-    passing TDs, receptions) with columns [player, market, point] - the
-    season average gets compared directly against these.
+    passing TDs, receptions), one row per player/market with the columns in
+    PROP_COLUMNS: the line most books are offering (a real line, not an
+    average), the fair Over chance at that line, and the best + typical
+    price for each side (see odds_math.summarize_prop_books). The season
+    average gets compared directly against that line.
 
     td_df covers ANYTIME_TD_MARKET, and first_td_df covers FIRST_TD_MARKET,
     each with columns [player, implied_prob] (0-100, averaged across
@@ -348,8 +373,8 @@ def load_prop_lines(api_key: str):
     De-vigging: props_df also carries a fair_prob_over column (0-1, may be
     NaN) - the Over side's de-vigged "fair" probability, stripped of the
     book's margin, computed per-bookmaker from that book's own Over/Under
-    prices (see _devig_two_outcome) and then averaged across bookmakers
-    the same way point is. It's NaN whenever no bookmaker offered both
+    prices and then averaged across the bookmakers offering the consensus
+    line (odds_math.summarize_prop_books). It's NaN whenever no bookmaker offered both
     sides' prices for that player/market (only the line itself, not
     prices, is required for the core point comparison, so this stays
     optional rather than dropping the row). first_td_df is similarly
@@ -364,8 +389,8 @@ def load_prop_lines(api_key: str):
     inventing an approximation; it's still fixed here to stop counting a
     "No" outcome (when a book offers one) as if it were another "Yes"
     price when averaging."""
-    prop_columns = ["player", "market", "point", "fair_prob_over"]
-    td_columns = ["player", "implied_prob"]
+    prop_columns = PROP_COLUMNS
+    td_columns = TD_COLUMNS
     empty_quota = {"remaining": None, "used": None, "skipped": False}
     if not api_key:
         return pd.DataFrame(columns=prop_columns), pd.DataFrame(columns=td_columns), pd.DataFrame(columns=td_columns), empty_quota
@@ -465,13 +490,15 @@ def load_prop_lines(api_key: str):
                             except (TypeError, ValueError):
                                 continue
                             if market_key == ANYTIME_TD_MARKET:
-                                td_rows.append({"player": player_name, "implied_prob": implied})
+                                td_rows.append({"player": player_name, "implied_prob": implied,
+                                                "price": price, "book": bookmaker_key})
                             else:
                                 first_td_raw.append({
                                     "event_id": event_id,
                                     "bookmaker": bookmaker_key,
                                     "player": player_name,
                                     "raw_prob": implied,
+                                    "price": price,
                                 })
                         else:
                             # Each player prop market has two outcomes (Over/Under)
@@ -498,35 +525,37 @@ def load_prop_lines(api_key: str):
         # Stop once we've pulled odds for every scheduled event this call found
 
     if prop_temp:
-        prop_rows = []
+        # Group every book's version of the same player/market together,
+        # then summarize (odds_math.summarize_prop_books): the line MOST
+        # books offer - a real, bettable line, never an average of
+        # different books' lines (which used to produce lines like "76.8"
+        # that no book offers) - plus the fair chance from books at that
+        # line and the best/typical price for each side. Sep 2026: this
+        # replaced a plain average of lines and fair probabilities.
+        by_prop = {}
         for (bookmaker_key, market_key, player_name), entry in prop_temp.items():
             if entry["point"] is None:
                 continue
-            fair_prob_over = _devig_two_outcome(entry["over_price"], entry["under_price"])
-            prop_rows.append({
-                "player": player_name,
-                "market": market_key,
-                "point": entry["point"],
-                "fair_prob_over": fair_prob_over,
+            by_prop.setdefault((player_name, market_key), []).append({
+                "book": bookmaker_key, "point": entry["point"],
+                "over_price": entry["over_price"], "under_price": entry["under_price"],
             })
-        props = pd.DataFrame(prop_rows)
-        # Multiple bookmakers may list the same player/market - average
-        # both the line and the de-vigged fair probability across them.
-        # fair_prob_over is NaN for any book that didn't offer both sides;
-        # pandas' mean() skips NaNs automatically, so a player only loses
-        # the de-vig entirely if NO book offered both sides.
-        props = props.groupby(["player", "market"], as_index=False).agg(
-            point=("point", "mean"), fair_prob_over=("fair_prob_over", "mean")
-        )
+        prop_rows = []
+        for (player_name, market_key), books in by_prop.items():
+            summary = summarize_prop_books(books)
+            if summary:
+                prop_rows.append({"player": player_name, "market": market_key, **summary})
+        props = pd.DataFrame(prop_rows, columns=prop_columns)
     else:
         props = pd.DataFrame(columns=prop_columns)
 
     if td_rows:
-        td = pd.DataFrame(td_rows)
+        td_raw = pd.DataFrame(td_rows)
         # Multiple bookmakers may list the same player - average their
         # implied probabilities (not the raw odds, which don't average sensibly)
-        td = td.groupby("player", as_index=False)["implied_prob"].mean()
+        td = td_raw.groupby("player", as_index=False)["implied_prob"].mean()
         td["implied_prob"] = (td["implied_prob"] * 100).round(1)
+        td = td.merge(_price_summary(td_raw, "book"), on="player", how="left")
     else:
         td = pd.DataFrame(columns=td_columns)
 
@@ -543,6 +572,7 @@ def load_prop_lines(api_key: str):
         first_td = first_td_df.groupby("player", as_index=False)["fair_prob"].mean()
         first_td = first_td.rename(columns={"fair_prob": "implied_prob"})
         first_td["implied_prob"] = (first_td["implied_prob"] * 100).round(1)
+        first_td = first_td.merge(_price_summary(first_td_df, "bookmaker"), on="player", how="left")
     else:
         first_td = pd.DataFrame(columns=td_columns)
 
@@ -557,13 +587,17 @@ def _read_prop_lines_cache_file():
     try:
         with open(PROP_LINES_CACHE_PATH, "r") as f:
             raw = json.load(f)
+        # .reindex: a cache file written before a column existed (e.g. the
+        # Sep 2026 price/EV columns) just gets that column as empty, so
+        # older cached pulls keep working - EV simply shows "—" until the
+        # next fresh pull.
         return {
-            "props_df": pd.DataFrame(raw["props"]),
-            "td_df": pd.DataFrame(raw["td"]),
+            "props_df": pd.DataFrame(raw["props"]).reindex(columns=PROP_COLUMNS),
+            "td_df": pd.DataFrame(raw["td"]).reindex(columns=TD_COLUMNS),
             # .get() with a default - a cache file written before the First
             # TD feature existed won't have this key at all, and that's a
             # normal "no first-TD data cached yet" case, not corruption.
-            "first_td_df": pd.DataFrame(raw.get("first_td", [])),
+            "first_td_df": pd.DataFrame(raw.get("first_td", [])).reindex(columns=TD_COLUMNS),
             "quota": raw["quota"],
             "pulled_at": datetime.datetime.fromisoformat(raw["pulled_at"]),
         }

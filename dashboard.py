@@ -34,6 +34,7 @@ from data_loader import (
     load_all_seasons_schedule, clear_nflverse_cache, load_first_td_scorers, load_snap_counts,
 )
 import pick_tracker_store
+from odds_math import expected_value, break_even_prob, profit_on_stake, book_name
 
 st.set_page_config(page_title="The Prop Shop", layout="wide", page_icon="🏈")
 
@@ -221,7 +222,7 @@ def weather_risk_pct(w: dict) -> float:
 
 def status_ramp_color(t: float, high_is_good: bool = True) -> str:
     """Shared red -> amber -> green text color for every graded badge in
-    the app (matchup difficulty, implied total, fair prob, TD probability,
+    the app (matchup difficulty, implied total, EV, TD probability,
     weather risk). t is 0-1 along the scale; high_is_good=False flips it
     for measures where a HIGH value is the bad outcome (weather risk).
     Built entirely from theme status colors, replacing five copies of the
@@ -507,39 +508,55 @@ def implied_total_tier(total) -> str:
 IMPLIED_TOTAL_TIER_RANK = {"high": 0, "neutral": 1, "low": 2}
 
 
-def fair_prob_color(pct: float) -> str:
-    """Same soft red -> yellow -> green gradient style as
-    implied_total_color, but centered on a fair coin flip (50%) instead
-    of a points range - a de-vigged prop's fair probability rarely
-    strays far from 50% (that's what "de-vigged" means: the market's true
-    view, not a book's marked-up price), so the whole visible gradient is
-    compressed into a tight 40-60% band on purpose. Below 40% or above
-    60% just clamps to the end color rather than needing a wider domain
-    that would make ordinary values look washed-out and rare extreme
-    ones indistinguishable from each other."""
-    t = (pct - 40.0) / (60.0 - 40.0)
-    t = min(max(t, 0.0), 1.0)
-    return status_ramp_color(t, high_is_good=True)
+
+def _num(v):
+    """float, or None for missing/NaN - odds columns can be NaN when a
+    cached pull predates them or a book didn't post that side."""
+    try:
+        return None if v is None or pd.isna(v) else float(v)
+    except (TypeError, ValueError):
+        return None
 
 
-def fair_prob_badge_html(fair_prob_over, direction: str, tag: str = "div") -> str:
-    """Small pill showing the de-vigged "fair" probability of THIS pick's
-    own side (Over or Under) hitting - the sportsbook market's true view
-    once its margin is stripped out (see _devig_two_outcome in
-    data_loader.py), as opposed to season-average-vs-line, which is our
-    own model's view. The two can and do disagree - that gap is exactly
-    the point of showing both: a big edge from our model that the market
-    itself sees as close to a coin flip is a very different bet than one
-    the market also leans toward. Purely informational (not a sort
-    factor) since it measures the market's confidence, not our own.
-    Returns "" when unknown - no bookmaker offered both Over and Under
-    prices for this player/market, which happens for thinner markets."""
-    if fair_prob_over is None or pd.isna(fair_prob_over):
+def pick_side_odds(line_row, direction: str) -> dict:
+    """Everything about the side of a prop we're picking (Over or Under):
+    its fair chance (vig removed), the best price and which book has it,
+    the typical price across books, and the EV at the best price.
+    Any piece can be None when books didn't post it - never guessed."""
+    over = direction == "▲ Over"
+    get = line_row.get if hasattr(line_row, "get") else (lambda k, d=None: d)
+    fair_over = _num(get("fair_prob_over"))
+    fair = None if fair_over is None else (fair_over if over else 1.0 - fair_over)
+    best = _num(get("best_over_price" if over else "best_under_price"))
+    book = get("best_over_book" if over else "best_under_book")
+    typical = _num(get("typical_over_price" if over else "typical_under_price"))
+    ev = expected_value(fair, best) if fair is not None and best is not None else None
+    return {
+        "fair": fair, "best_price": int(best) if best is not None else None,
+        "best_book": book if isinstance(book, str) and book else None,
+        "typical_price": int(typical) if typical is not None else None, "ev": ev,
+    }
+
+
+def ev_text(ev, price, book) -> str:
+    """'+4.1% · -105 FanDuel' - EV at the best price, and where to get it."""
+    if ev is None or price is None:
+        return "—"
+    return f"{ev * 100:+.1f}% · {price:+d} {book_name(book)}".strip()
+
+
+def ev_badge_html(ev, price, book, tag: str = "div") -> str:
+    """Small pill: expected value of this pick at the best available
+    price. Replaced the Fair Prob pill (Sep 2026) - EV already folds in the
+    fair chance AND the price, so it answers "is this bet worth making"
+    in one number. Colored red (losing bet) -> amber (about even) ->
+    green (profitable), saturating at ±10%. "" when unknown."""
+    if ev is None or price is None:
         return ""
-    pick_prob = fair_prob_over if direction == "▲ Over" else (1.0 - fair_prob_over)
-    pct = pick_prob * 100
-    title = "The sportsbook market's own de-vigged (margin stripped out) probability that this specific side hits - the market's honest view, separate from our season-average-vs-line model."
-    return pill_badge_html(f"🎯 Fair {pct:.0f}%", fair_prob_color(pct), tag, title=title)
+    color = status_ramp_color((ev + 0.10) / 0.20, high_is_good=True)
+    title = (f"Expected value at the best price ({price:+d} at {book_name(book)}): the average profit per $1 "
+             f"if the betting market's fair chance is right. Positive = profitable over the long run.")
+    return pill_badge_html(f"💰 EV {ev * 100:+.1f}% ({price:+d} {book_name(book)})", color, tag, title=title)
 
 
 OPPORTUNITY_TREND_LAST_N = 3
@@ -979,6 +996,11 @@ def snapshot_hotpicks_for_tracking(edge_rows: list, td_rows: list, schedule_df: 
             "detail": {
                 "stat": row["stat"], "stat_col": row["stat_col"], "prop_line": row["prop_line"],
                 "season_avg_at_pull": row["season_avg"], "direction": row["direction"],
+                # Sep 2026: prices at snapshot time. "price" (the typical
+                # price across books) is what Track Record's profit uses -
+                # it measures the pick, not line-shopping luck.
+                "price": row.get("typical_price"), "best_price": row.get("best_price"),
+                "best_book": row.get("best_book"), "ev": row.get("ev"), "fair_prob": row.get("fair_prob_pick"),
             },
             "game_id": game[0], "kickoff": game[1], "status": "Pending", "actual": {}, "resolved_at": "",
         })
@@ -991,7 +1013,8 @@ def snapshot_hotpicks_for_tracking(edge_rows: list, td_rows: list, schedule_df: 
                 "id": str(uuid.uuid4()), "season": season, "week": week, "category": "td_anytime",
                 "player": row["player"], "player_id": row.get("player_id", ""),
                 "team": row["team"], "position": row["position"],
-                "detail": {"predicted_pct": row["anytime_td_pct"]},
+                "detail": {"predicted_pct": row["anytime_td_pct"],
+                           "price": int(row["anytime_price"]) if row.get("anytime_price") is not None else None},
                 "game_id": game[0], "kickoff": game[1], "status": "Pending", "actual": {}, "resolved_at": "",
             })
         if row.get("first_td_pct") is not None:
@@ -999,7 +1022,8 @@ def snapshot_hotpicks_for_tracking(edge_rows: list, td_rows: list, schedule_df: 
                 "id": str(uuid.uuid4()), "season": season, "week": week, "category": "td_first",
                 "player": row["player"], "player_id": row.get("player_id", ""),
                 "team": row["team"], "position": row["position"],
-                "detail": {"predicted_pct": row["first_td_pct"]},
+                "detail": {"predicted_pct": row["first_td_pct"],
+                           "price": int(row["first_price"]) if row.get("first_price") is not None else None},
                 "game_id": game[0], "kickoff": game[1], "status": "Pending", "actual": {}, "resolved_at": "",
             })
 
@@ -1183,6 +1207,35 @@ def resolve_pending_picks() -> tuple:
     if updated:
         pick_tracker_store.update_picks(st.secrets, updated)
     return len(updated), len(pending) - len(updated)
+
+
+PROFIT_STAKE = 10.0  # flat stake per pick for Track Record's profit view
+
+
+def pick_profit(pick: dict, stake: float = PROFIT_STAKE):
+    """Profit of a flat bet on one resolved pick at the price recorded when
+    it was saved (the typical price across books). None when the pick is
+    still Pending or has no recorded price - picks saved before prices
+    were tracked (Sep 2026) have none, and are never guessed."""
+    price = (pick.get("detail") or {}).get("price")
+    if pick.get("status") not in ("Hit", "Miss", "Push") or price is None:
+        return None
+    try:
+        return profit_on_stake(stake, float(price), pick["status"])
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def compute_profit(picks: list, category: str = None, stake: float = PROFIT_STAKE) -> dict:
+    """{profit, staked, roi, n, unpriced} over resolved picks in a category."""
+    resolved = [p for p in picks if p.get("status") in ("Hit", "Miss", "Push")
+                and (category is None or p.get("category") == category)]
+    results = [pick_profit(p, stake) for p in resolved]
+    priced = [r for r in results if r is not None]
+    staked = stake * len(priced)
+    total = sum(priced)
+    return {"profit": total, "staked": staked, "roi": (total / staked * 100) if staked else None,
+            "n": len(priced), "unpriced": len(results) - len(priced)}
 
 
 def compute_hit_rate(resolved_picks: list, category: str = None):
@@ -2632,14 +2685,11 @@ elif tab_side == "🎯 Props":
             # it's shown tagged to the live line it came from, not
             # silently re-attached to whatever they typed.
             live_line_val = None
-            live_fair_prob_over = None
+            live_odds_row = None
             if not live_match.empty:
                 default_line = round(float(live_match["point"].iloc[0]), 1)
                 live_line_val = default_line
-                if "fair_prob_over" in live_match.columns:
-                    raw_fpo = live_match["fair_prob_over"].iloc[0]
-                    if pd.notna(raw_fpo):
-                        live_fair_prob_over = float(raw_fpo)
+                live_odds_row = live_match.iloc[0].to_dict()
             elif prop_stat and not prop_pdf.empty:
                 default_line = round(float(prop_pdf[prop_stat].mean()), 1)
             else:
@@ -2652,12 +2702,22 @@ elif tab_side == "🎯 Props":
             if next_matchup:
                 next_text, next_rank = next_matchup
                 st.markdown(matchup_badge_html(f"Next: {next_text}", next_rank, tag="span"), unsafe_allow_html=True)
-            if live_fair_prob_over is not None:
-                st.markdown(
-                    fair_prob_badge_html(live_fair_prob_over, "▲ Over", tag="span")
-                    + f' <span class="stat-label">market fair prob at the live line ({live_line_val:.1f})</span>',
-                    unsafe_allow_html=True,
-                )
+            if live_odds_row is not None:
+                # Both sides at the live line: best price, where it is, and
+                # the EV there - so this page answers "is either side of
+                # this line worth betting?" (Sep 2026, replaced Fair Prob).
+                side_badges = []
+                for side in ("▲ Over", "▼ Under"):
+                    o = pick_side_odds(live_odds_row, side)
+                    badge = ev_badge_html(o["ev"], o["best_price"], o["best_book"], tag="span")
+                    if badge:
+                        side_badges.append(f'<span class="stat-label">{side}</span> {badge}')
+                if side_badges:
+                    st.markdown(
+                        "&nbsp;&nbsp;".join(side_badges)
+                        + f' <span class="stat-label">at the live line ({live_line_val:.1f})</span>',
+                        unsafe_allow_html=True,
+                    )
             prop_pdf = prop_pdf.copy()
             prop_pdf["result"] = prop_pdf[prop_stat].apply(
                 lambda x: "✅ Over" if x > prop_line else ("❌ Under" if x < prop_line else "➖ Push")
@@ -3285,12 +3345,20 @@ elif tab_side == "🔥 Hot Picks":
     )
     _guide_2 = (
         (
-        "**🎯 Fair Prob - the betting market's true opinion of this pick** (Prop-Line Edges only). "
-        "Sportsbooks build a small profit into every line, so their odds always add up to a bit over 100%. "
-        "We take that profit back out to show the real chance, according to the market, that this pick "
-        "hits. If a pick shows a big edge but its Fair Prob is near 50%, the market sees it as closer to a "
-        "coin flip than our numbers suggest - worth knowing before you bet. It doesn't change the order of "
-        "the list. No badge means the sportsbooks didn't post both sides of that bet."
+        "**💰 EV - is this bet actually worth making?** (Prop-Line Edges only.) EV combines two things "
+        "into one number:\n\n"
+        "1. **The real chance the pick wins.** Sportsbooks build a small profit into every line, so their "
+        "odds always add up to a bit over 100%. We take that profit back out to get the betting market's "
+        "honest estimate.\n"
+        "2. **The best price any sportsbook is offering** for that side (shown in the badge, e.g. "
+        "\"-105 FanDuel\").\n\n"
+        "EV is the average profit per $1 bet if that chance is right. Example: a 55% chance at -110 odds = "
+        "**+5.0%**. Every price has a break-even win rate (-110 needs 52.4%, +100 needs 50%, -150 needs 60%); "
+        "positive EV means the chance beats it. Negative EV means the sportsbook's cut outweighs the edge, "
+        "even if the edge looks big.\n\n"
+        "Good to know: real edges are usually small (+1-5%) and prices move, so refresh the odds right "
+        "before betting. The best price may be at a sportsbook you don't use; check your own book's price. "
+        "EV doesn't change the order of the list. No badge means the sportsbooks didn't post both sides."
     )
     )
     _guide_3 = (
@@ -3404,8 +3472,11 @@ elif tab_side == "🔥 Hot Picks":
                 if pd.notna(raw_fpo):
                     fair_prob_over = float(raw_fpo)
             if best_edge is None or abs(delta) > abs(best_edge["delta"]):
-                best_edge = {"stat": stat, "avg": avg_val, "line": line_val, "delta": delta, "fair_prob_over": fair_prob_over}
+                best_edge = {"stat": stat, "avg": avg_val, "line": line_val, "delta": delta,
+                             "fair_prob_over": fair_prob_over, "odds_row": match.iloc[0].to_dict()}
         if best_edge:
+            _dir = "▲ Over" if best_edge["delta"] > 0 else "▼ Under"
+            _odds = pick_side_odds(best_edge["odds_row"], _dir)
             edge_rows.append({
                 "player": player, "player_id": player_id, "team": team, "position": position,
                 "headshot_url": headshot_url, "team_color": team_color,
@@ -3414,9 +3485,13 @@ elif tab_side == "🔥 Hot Picks":
                 "season_avg": round(best_edge["avg"], 1),
                 "prop_line": round(best_edge["line"], 1),
                 "edge": round(best_edge["delta"], 1),
-                "direction": "▲ Over" if best_edge["delta"] > 0 else "▼ Under",
+                "direction": _dir,
                 "implied_total": hp_implied_totals.get(team),
                 "fair_prob_over": best_edge["fair_prob_over"],
+                # Sep 2026: EV at the best price for the picked side, plus
+                # the typical price (what Track Record uses for profit).
+                "ev": _odds["ev"], "best_price": _odds["best_price"], "best_book": _odds["best_book"],
+                "typical_price": _odds["typical_price"], "fair_prob_pick": _odds["fair"],
                 "opportunity_trend": compute_opportunity_trend(stats_df, hp_snap_counts, player, best_edge["stat"], CURRENT_SEASON),
             })
 
@@ -3436,6 +3511,10 @@ elif tab_side == "🔥 Hot Picks":
                 "player": player, "player_id": player_id, "team": team, "position": position,
                 "headshot_url": headshot_url, "team_color": team_color,
                 "anytime_td_pct": anytime_pct, "first_td_pct": first_pct,
+                # Typical "Yes" price across books - what Track Record uses
+                # to compute profit on these picks (Sep 2026).
+                "anytime_price": _num(anytime_match["typical_price"].iloc[0]) if not anytime_match.empty and "typical_price" in anytime_match.columns else None,
+                "first_price": _num(first_match["typical_price"].iloc[0]) if not first_match.empty and "typical_price" in first_match.columns else None,
                 "implied_total": hp_implied_totals.get(team),
                 "opportunity_trend": compute_opportunity_trend(stats_df, hp_snap_counts, player, td_trend_stat, CURRENT_SEASON),
             })
@@ -3604,7 +3683,7 @@ elif tab_side == "🔥 Hot Picks":
                     f'<span class="stat-label">({CURRENT_SEASON} avg {edge["season_avg"]:.1f}, '
                     f'edge {edge["edge"]:+.1f})</span></div>'
                 )
-                badges_html += fair_prob_badge_html(edge.get("fair_prob_over"), edge["direction"])
+                badges_html += ev_badge_html(edge.get("ev"), edge.get("best_price"), edge.get("best_book"))
             if td:
                 if td["anytime_td_pct"] is not None:
                     badges_html += anytime_td_badge_html(td["anytime_td_pct"])
@@ -3659,9 +3738,10 @@ elif tab_side == "🔥 Hot Picks":
 
     # ---- Section 1: Biggest Prop-Line Edges ----
     st.markdown("##### 📈 Biggest Prop-Line Edges")
-    st.caption("Where a player's average this season is furthest from the number the sportsbook set. A big "
-        "gap is worth a look: ▲ **Over** if he's been beating the line, ▼ **Under** if he's been falling "
-        "short of it.")
+    st.caption("Where a player's average this season is furthest from the line most sportsbooks are "
+        "offering. A big gap is worth a look: ▲ **Over** if he's been beating the line, ▼ **Under** if he's "
+        "been falling short of it. **EV** then tells you whether it's actually worth betting at the best "
+        "price available - see ℹ️ Badge guide.")
     if not edge_rows:
         st.info("No live prop lines available right now to compare against - try \"Refresh prop lines now\" at the top of the page.")
     else:
@@ -3700,7 +3780,7 @@ elif tab_side == "🔥 Hot Picks":
                 f'{row["prop_line"]:.1f} (avg {row["season_avg"]:.1f})</span></div>'
                 f'{confidence_badge_html(row.get("confidence"))}'
                 f'{implied_total_badge_html(row.get("implied_total"))}'
-                f'{fair_prob_badge_html(row.get("fair_prob_over"), row["direction"])}'
+                f'{ev_badge_html(row.get("ev"), row.get("best_price"), row.get("best_book"))}'
                 f'{opportunity_trend_badge_html(row.get("opportunity_trend"))}'
             )
 
@@ -3753,14 +3833,13 @@ elif tab_side == "🔥 Hot Picks":
 
         edge_df["Confidence"] = edge_df["confidence"].apply(_confidence_label_text)
         edge_df["Implied Total"] = edge_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
-        edge_df["Fair Prob"] = edge_df.apply(
-            lambda r: (f"{(r['fair_prob_over'] if r['direction'] == '▲ Over' else 1.0 - r['fair_prob_over']) * 100:.0f}%"
-                       if pd.notna(r.get("fair_prob_over")) else "—"),
+        edge_df["EV"] = edge_df.apply(
+            lambda r: ev_text(_num(r.get("ev")), None if _num(r.get("best_price")) is None else int(r["best_price"]), r.get("best_book")),
             axis=1,
         )
         edge_df["Opportunity"] = edge_df["opportunity_trend"].apply(opportunity_trend_text)
         edge_df["opp"] = edge_df["team"].map(hp_opp_lookup)
-        edge_display = edge_df[["headshot_url", "player", "position", "team", "opp", "stat", "season_avg", "prop_line", "edge", "direction", "Confidence", "Implied Total", "Fair Prob", "Opportunity"]].rename(columns={
+        edge_display = edge_df[["headshot_url", "player", "position", "team", "opp", "stat", "season_avg", "prop_line", "edge", "direction", "Confidence", "Implied Total", "EV", "Opportunity"]].rename(columns={
             "headshot_url": "Headshot", "player": "Player", "team": "Team", "opp": "Opp", "position": "Pos", "stat": "Stat",
             "season_avg": f"{CURRENT_SEASON} Avg", "prop_line": "Prop Line", "edge": "Edge", "direction": "Direction",
         })
@@ -3913,9 +3992,10 @@ elif tab_side == "🔥 Hot Picks":
         render_player_table(matchup_display)
 
     st.caption(
-        "All percentages and betting lines come straight from the sportsbooks (including their built-in "
-        "profit) - they aren't Prop Shop predictions. \"Edge\" and \"Matchup\" numbers are calculated "
-        "exactly the same way here as on the Research and Props pages."
+        "Betting lines and prices come straight from the sportsbooks - each line shown is the one most "
+        "books are offering, not an average. TD percentages include the books' built-in profit; EV has it "
+        "taken out. None of these are Prop Shop predictions. \"Edge\" and \"Matchup\" numbers are "
+        "calculated exactly the same way here as on the Research and Props pages."
     )
 
 else:
@@ -3929,8 +4009,9 @@ else:
     st.subheader("📊 Track Record")
     st.caption(
         "Every Prop-Line Edge and TD pick from Hot Picks is saved automatically the first time Hot Picks "
-        "is opened each week. After the games are over, click **Check results now** and each pick is "
-        "marked **Hit** or **Miss** based on what actually happened. Safe Plays aren't tracked here - "
+        "is opened each week, along with its odds at that moment. After the games are over, click **Check "
+        "results now** and each pick is marked **Hit** or **Miss** based on what actually happened - and "
+        "the page shows what betting every pick would have won or lost. Safe Plays aren't tracked here - "
         "\"this player is steady\" isn't a bet that clearly wins or loses."
     )
 
@@ -4024,6 +4105,43 @@ else:
                 "Show only Pending", use_container_width=True, key="tr_tile_pending",
                 type="primary" if pending_is_active else "secondary",
                 on_click=_filter_to_pending,
+            )
+
+        # ---- Profit at a flat $10 a pick (Sep 2026) ----
+        # Hit rate alone can mislead (55% at -130 still loses money), so
+        # this shows what the picks would actually have made at the price
+        # recorded when each was saved.
+        st.markdown(f"###### 💵 Profit at ${PROFIT_STAKE:.0f} a pick")
+        pf1, pf2, pf3 = st.columns(3)
+        for col, cat, label in ((pf1, "edge", "Prop Edges"), (pf2, "td_anytime", "Anytime TD"), (pf3, "td_first", "First TD")):
+            with col:
+                pr = compute_profit(all_picks, cat)
+                if pr["n"]:
+                    sign = "+" if pr["profit"] >= 0 else "−"
+                    st.metric(label, f"{sign}${abs(pr['profit']):,.2f}",
+                              f"{pr['roi']:+.1f}% return · {pr['n']} bet{'s' if pr['n'] != 1 else ''}", delta_color="normal")
+                else:
+                    st.metric(label, "—", "no priced results yet", delta_color="off")
+        unpriced_total = sum(compute_profit(all_picks, c)["unpriced"] for c in ("edge", "td_anytime", "td_first"))
+        profit_note_col, profit_info_col = st.columns([5, 1])
+        with profit_note_col:
+            if unpriced_total:
+                st.caption(f"{unpriced_total} finished pick(s) were saved before prices were recorded, so they're "
+                           f"left out of profit (they still count toward hit rate).")
+        with profit_info_col:
+            theme.info_popover(
+                f"**Profit** shows what you'd have won or lost betting **${PROFIT_STAKE:.0f} on every pick** in "
+                f"that category.\n\n"
+                f"- Each pick uses the **typical price across sportsbooks** at the moment it was saved - not "
+                f"the best one - so this measures how good the picks are, not how good the line shopping was.\n"
+                f"- A win pays at that price (e.g. $10 at -110 wins $9.09), a loss costs the $10, and a push "
+                f"gives it back.\n"
+                f"- **Return** is profit ÷ total bet. Anything above 0% beat the sportsbooks' built-in cut.\n\n"
+                f"Why this matters: hit rate alone can fool you. At -130 odds you need to win 56.5% just to "
+                f"break even, so a 55% hit rate would still lose money.\n\n"
+                f"Note: every player with touchdown odds is tracked in the two TD categories, not just the best "
+                f"ones, so those mostly show how the betting market itself does - expect a small loss there.",
+                label="ℹ️ About profit", use_container_width=True,
             )
 
         # ---- Closing Line Value ----
@@ -4250,7 +4368,12 @@ else:
                 "Team": p["team"],
                 "Opp": _pick_opponent(p),
                 "Prediction": prediction,
+                "Odds": f"{int(p['detail']['price']):+d}" if (p.get("detail") or {}).get("price") is not None else "—",
                 "Actual": actual_text, "Result": p["status"],
+                f"${PROFIT_STAKE:.0f} P/L": (
+                    "—" if pick_profit(p) is None
+                    else f"{'+' if pick_profit(p) >= 0 else '−'}${abs(pick_profit(p)):.2f}"
+                ),
                 "CLV": f"{pick_clv:+.1f} {clv_unit}" if pick_clv is not None else "—",
             })
         hist_df = pd.DataFrame(hist_rows)
