@@ -460,9 +460,32 @@ def inject_css() -> None:
         background: {SURFACE}; border: 1px solid {LINE}; border-radius: 6px;
     }}
 
-    /* ---- Popovers (ℹ️ details buttons) ------------------------------------ */
-    [data-testid="stPopover"] button {{
-        border-radius: 4px;
+    /* ---- Popovers (ℹ️ details buttons) ------------------------------------
+       These are reference/help buttons, not actions - styled small and
+       quiet (compact, muted text, hairline border) so they sit out of the
+       way instead of reading like primary controls. */
+    [data-testid="stPopoverButton"], [data-testid="stPopover"] > div > button {{
+        border-radius: 4px !important;
+        padding: 3px 10px !important;
+        min-height: 0 !important;
+        background: transparent !important;
+        border: 1px solid {LINE} !important;
+        color: {SUB} !important;
+    }}
+    [data-testid="stPopoverButton"] p, [data-testid="stPopover"] > div > button p {{
+        font-size: 13px !important;
+        font-weight: 600 !important;
+        color: {SUB} !important;
+    }}
+    [data-testid="stPopoverButton"]:hover, [data-testid="stPopover"] > div > button:hover {{
+        border-color: {ACCENT} !important;
+    }}
+    [data-testid="stPopoverButton"]:hover p, [data-testid="stPopover"] > div > button:hover p {{
+        color: {ACCENT} !important;
+    }}
+    /* Popover panel itself: roomy enough for the longer explanations. */
+    [data-testid="stPopoverBody"] {{
+        max-width: 620px;
     }}
 
     /* ---- Forms / inputs --------------------------------------------------- */

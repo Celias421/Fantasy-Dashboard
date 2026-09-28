@@ -3140,13 +3140,14 @@ elif tab_side == "🔥 Hot Picks":
     # get_first_td_odds) as the rest of the site, so a "hot pick" here is
     # never a separate/stale computation from what the Overview or First TD
     # tabs would tell you about the same player.
-    st.subheader("🔥 Hot Picks")
-    st.caption(
-        "A league-wide scouting view, refreshed from the same live data as the rest of the site: the biggest "
-        "prop-line edges, the best touchdown-scoring chances, and the safest high-floor, most-consistent "
-        "plays. Every number here is explained in more depth on its own tab elsewhere in the app."
-    )
-    theme.info_popover(
+    # Header row: title on the left, ONE compact "Badge guide" popover on the
+    # right. (Sep 2026: this used to be four separate full-size "About ..."
+    # buttons stacked down the page before any content - same explanations,
+    # now grouped under one small button so the page starts with the picks.)
+    hp_title_col, hp_guide_col = st.columns([6, 1])
+    with hp_title_col:
+        st.subheader("🔥 Hot Picks")
+    _guide_0 = (
         f"**Confidence badges** are this page's continuous-improvement loop: every time it loads, it re-reads "
         f"Track Record's resolved (Hit/Miss) pick history and groups it by category + position - for example, "
         f"\"Prop Edges, RB\" or \"First TD, WR.\" Once a segment has **{CONFIDENCE_MIN_N}+ resolved picks**, it's "
@@ -3154,20 +3155,18 @@ elif tab_side == "🔥 Hot Picks":
         f"or ➖ **Even** (in between); fewer than {CONFIDENCE_MIN_N} resolved picks shows 🆕 **New** instead, since "
         f"a small sample isn't trustworthy yet. Hot segments are sorted toward the top of Prop-Line Edges and TD "
         f"Scoring Chances, cold segments toward the bottom - **nothing is ever hidden**, only re-ordered and "
-        f"labeled. Safe Plays isn't tracked in Track Record (see that tab for why), so it has no confidence badge.",
-        label="ℹ️ About Confidence badges",
+        f"labeled. Safe Plays isn't tracked in Track Record (see that tab for why), so it has no confidence badge."
     )
-    theme.info_popover(
+    _guide_1 = (
         "**📈 Implied Total badges** show a team's Vegas-implied point total for its game this week - the "
         "over/under split by the spread, a well-known handicapping proxy for how good an offensive environment "
         "a team is expected to be in. It's a second re-ranking signal alongside Confidence: a good environment "
         "(26+ implied points) floats a pick toward the top, a weak one (19 or below) sinks it, same **re-order, "
         "never hide** rule. A team on a bye or without a posted line yet just has no badge - that's a data gap, "
         "not a signal the environment is bad. Confidence (this segment's own history) is checked first; implied "
-        "total only breaks ties within a confidence tier.",
-        label="ℹ️ About Implied Total badges",
+        "total only breaks ties within a confidence tier."
     )
-    theme.info_popover(
+    _guide_2 = (
         "**🎯 Fair Prob badges** (Prop-Line Edges only) show the sportsbook market's own de-vigged probability "
         "that this pick's specific side (Over or Under) hits - the book's raw Over/Under prices always sum to "
         "a bit over 100% because of the book's built-in margin, so this strips that margin back out first, the "
@@ -3175,10 +3174,9 @@ elif tab_side == "🔥 Hot Picks":
         "our season-average-vs-line edge: our model can show a big edge on a side the market itself still sees "
         "as close to a coin flip (or vice versa), and that gap is worth knowing. Purely informational - it "
         "doesn't affect sorting, since it measures the market's confidence, not a track record. No badge means "
-        "no bookmaker posted both sides' prices for that player/market this week.",
-        label="ℹ️ About Fair Prob badges",
+        "no bookmaker posted both sides' prices for that player/market this week."
     )
-    theme.info_popover(
+    _guide_3 = (
         f"**📈/📉 Role trending badges** compare a player's opportunity metric (target share for receiving "
         f"stats, snap share otherwise) over their last {OPPORTUNITY_TREND_LAST_N} games to their own full-"
         f"{CURRENT_SEASON}-season average of that same metric - a flat season average can't show a role that's "
@@ -3186,8 +3184,21 @@ elif tab_side == "🔥 Hot Picks":
         f"percentage points either way (smaller swings are shown as \"stable\" in the dataframe below, not "
         f"flagged as a card badge) and only once a player has played 2+ games this season - there's nothing to "
         f"compare against before that. Purely informational context for why a season average might be about to "
-        f"catch up (or might already be stale), not a sort factor.",
-        label="ℹ️ About Role Trending badges",
+        f"catch up (or might already be stale), not a sort factor."
+    )
+    with hp_guide_col:
+        theme.info_popover(
+            "#### Badge guide\n\n"
+            + _guide_0 + "\n\n---\n\n"
+            + _guide_1 + "\n\n---\n\n"
+            + _guide_2 + "\n\n---\n\n"
+            + _guide_3,
+            label="ℹ️ Badge guide", use_container_width=True,
+        )
+    st.caption(
+        "A league-wide scouting view, refreshed from the same live data as the rest of the site: the biggest "
+        "prop-line edges, the best touchdown-scoring chances, and the safest high-floor, most-consistent "
+        "plays. Every number here is explained in more depth on its own tab elsewhere in the app."
     )
 
     hp1, hp2 = st.columns(2)
