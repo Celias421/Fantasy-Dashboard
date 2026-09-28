@@ -152,6 +152,27 @@ def inject_css() -> None:
     .confidence-new {{
         background: {SURFACE_2}; color: {SUB}; border: 1px dashed {LINE};
     }}
+    /* Track Record's "Most Recent Picks" cards - same badge shape as
+       confidence-badge/matchup-badge above, one color per outcome so a
+       card's result reads at a glance without relying on its (team-color)
+       left border, which is reserved for team identity everywhere else
+       render_hotpick_cards is used. */
+    .result-badge {{
+        display: inline-block; font-size: 13px; padding: 4px 11px;
+        border-radius: 10px; margin-top: 6px; margin-right: 4px; font-weight: 600;
+    }}
+    .result-hit {{
+        background: {ACCENT_SOFT}; color: {ACCENT}; border: 1px solid {ACCENT_SOFT_STRONG};
+    }}
+    .result-miss {{
+        background: {BAD_SOFT}; color: {BAD}; border: 1px solid rgba(229,72,77,.3);
+    }}
+    .result-push {{
+        background: {SURFACE_2}; color: {SUB}; border: 1px solid {LINE};
+    }}
+    .result-pending {{
+        background: {WARN_SOFT}; color: {WARN}; border: 1px solid rgba(245,179,36,.3);
+    }}
     /* Initials avatar shown in place of a headshot when a player has no
        photo on file (or it fails to load) - keeps every card the same
        size/shape instead of leaving a blank gap. Used by the Hot Picks

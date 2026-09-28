@@ -3209,6 +3209,22 @@ else:
         first_pct, first_hits, first_n = compute_hit_rate(resolved_picks, "td_first")
 
         category_labels = {"edge": "Prop Edge", "td_anytime": "Anytime TD", "td_first": "First TD"}
+        category_order = ["Prop Edge", "Anytime TD", "First TD"]
+        # Fixed-order categorical colors for the 3 tracked pick categories,
+        # reusing 3 of the 4 already-validated colorblind-safe hues from
+        # POSITION_COLORS (see that dict's own comment) rather than picking
+        # new ones - these never share a chart with positions, so reuse is
+        # safe, and it keeps this page visually related to Hot Picks
+        # without literally reusing the anytime/first-TD pair (ACCENT vs
+        # WARN), which fails the palette validator's CVD-separation check.
+        category_colors = {"Prop Edge": POSITION_COLORS["QB"], "Anytime TD": POSITION_COLORS["WR"], "First TD": POSITION_COLORS["TE"]}
+        # Player headshot + team color/logo lookups, same source as every
+        # other card on the site (get_meta merges rosters + team colors by
+        # player name; team_logos is the module-level team_abbr -> logo
+        # Series built once near team_logo_html). Tracked picks only store
+        # player/team/position, not display info, so this join is what
+        # lets the History table and Most Recent Picks cards show photos.
+        tr_meta = get_meta().drop_duplicates(subset="player").set_index("player")
 
         # Clicking a tile filters the History table below to just that
         # category (Pending instead sets the Result filter to Pending
@@ -3263,6 +3279,127 @@ else:
             )
 
         st.divider()
+
+        # ---- Trend + breakdown charts ----
+        # Built from resolved_picks only (Push excluded from the hit-rate
+        # line the same way compute_hit_rate excludes it everywhere else;
+        # the breakdown bar shows all three outcomes since that one IS
+        # about composition, not a rate).
+        chart_col1, chart_col2 = st.columns(2)
+        with chart_col1:
+            st.markdown("###### Hit rate by week")
+            scored_picks = [p for p in resolved_picks if p["status"] in ("Hit", "Miss")]
+            if not scored_picks:
+                st.caption("Not enough resolved picks yet to chart a trend.")
+            else:
+                trend_src = pd.DataFrame([
+                    {
+                        "season": p["season"], "week": p["week"],
+                        "period": f"{p['season']} Wk {p['week']}",
+                        "category": category_labels.get(p["category"], p["category"]),
+                        "hit": 1 if p["status"] == "Hit" else 0,
+                    }
+                    for p in scored_picks
+                ])
+                period_order = (
+                    trend_src[["season", "week", "period"]].drop_duplicates()
+                    .sort_values(["season", "week"])["period"].tolist()
+                )
+                trend_df = trend_src.groupby(["period", "category"], as_index=False).agg(hits=("hit", "sum"), n=("hit", "count"))
+                trend_df["hit_rate"] = trend_df["hits"] / trend_df["n"] * 100
+                trend_line = alt.Chart(trend_df).mark_line(point=alt.OverlayMarkDef(size=60), strokeWidth=2).encode(
+                    x=alt.X("period:N", title=None, sort=period_order),
+                    y=alt.Y("hit_rate:Q", title="Hit rate", scale=alt.Scale(domain=[0, 100])),
+                    color=alt.Color(
+                        "category:N", title=None, sort=category_order,
+                        scale=alt.Scale(domain=category_order, range=[category_colors[c] for c in category_order]),
+                        legend=alt.Legend(orient="top"),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("period:N", title="Week"), alt.Tooltip("category:N", title="Category"),
+                        alt.Tooltip("hit_rate:Q", title="Hit rate", format=".0f"),
+                        alt.Tooltip("n:Q", title="Resolved picks"),
+                    ],
+                ).properties(height=260)
+                st.altair_chart(trend_line, use_container_width=True)
+
+        with chart_col2:
+            st.markdown("###### Results by category")
+            breakdown_src = pd.DataFrame([
+                {"category": category_labels.get(p["category"], p["category"]), "Result": p["status"]}
+                for p in all_picks if p["status"] in ("Hit", "Miss", "Push")
+            ])
+            if breakdown_src.empty:
+                st.caption("Not enough resolved picks yet to chart a breakdown.")
+            else:
+                breakdown_df = breakdown_src.groupby(["category", "Result"], as_index=False).size().rename(columns={"size": "count"})
+                # Status colors (reserved - never reused for identity elsewhere
+                # on this page), same green/red the rest of the app already
+                # uses for Hit/Miss-shaped outcomes (delta-up/down, confidence
+                # badges), plus a neutral gray for Push.
+                breakdown_bar = alt.Chart(breakdown_df).mark_bar(cornerRadiusEnd=3).encode(
+                    x=alt.X("category:N", title=None, sort=category_order),
+                    y=alt.Y("count:Q", title="Resolved picks"),
+                    color=alt.Color(
+                        "Result:N", title=None, sort=["Hit", "Miss", "Push"],
+                        scale=alt.Scale(domain=["Hit", "Miss", "Push"], range=[theme.ACCENT, theme.BAD, theme.SUB]),
+                        legend=alt.Legend(orient="top"),
+                    ),
+                    order=alt.Order("Result:N", sort="ascending"),
+                    tooltip=[alt.Tooltip("category:N", title="Category"), alt.Tooltip("Result:N", title="Result"), alt.Tooltip("count:Q", title="Count")],
+                ).properties(height=260)
+                breakdown_text = breakdown_bar.mark_text(color=theme.INK, fontWeight=600, dy=2).encode(
+                    text=alt.Text("count:Q"),
+                    order=alt.Order("Result:N", sort="ascending"),
+                )
+                st.altair_chart(breakdown_bar + breakdown_text, use_container_width=True)
+
+        st.divider()
+
+        # ---- Most Recent Picks: headshot + team-logo cards, same large-card
+        # component (render_hotpick_cards/player_avatar_html) used on Hot
+        # Picks, Game Center, Lineup Optimizer and the First TD podium - so a
+        # tracked pick looks like the same site everywhere, per the standing
+        # "large card + headshot" consistency rule. Capped at 8 (2 rows of
+        # 4) and sorted most-recent-first; the full unfiltered list is still
+        # the History table below.
+        st.markdown("###### 🕒 Most Recent Picks")
+        recent_source = sorted(all_picks, key=lambda x: (x["season"], x["week"]), reverse=True)[:8]
+        recent_rows = []
+        for p in recent_source:
+            meta_row = tr_meta.loc[p["player"]] if p["player"] in tr_meta.index else None
+            detail = p.get("detail", {})
+            actual = p.get("actual", {})
+            if p["category"] == "edge":
+                prediction = f"{detail.get('direction', '')} {detail.get('prop_line', '')} {detail.get('stat', '')}"
+                actual_text = f"Actual: {actual['actual_value']:.1f}" if "actual_value" in actual else "Actual: —"
+            elif p["category"] == "td_anytime":
+                prediction = f"Anytime TD ({detail.get('predicted_pct', 0):.0f}% implied)"
+                actual_text = f"Actual: {actual['actual_tds']} TD{'s' if actual.get('actual_tds') != 1 else ''}" if "actual_tds" in actual else "Actual: —"
+            else:
+                prediction = f"First TD ({detail.get('predicted_pct', 0):.0f}% implied)"
+                actual_text = {"Hit": "Actual: Scored first", "Miss": "Actual: Did not score first"}.get(p["status"], "Actual: —")
+            result_cls = {"Hit": "result-hit", "Miss": "result-miss", "Push": "result-push", "Pending": "result-pending"}[p["status"]]
+            result_icon = {"Hit": "✅", "Miss": "❌", "Push": "➖", "Pending": "⏳"}[p["status"]]
+            recent_rows.append({
+                "player": p["player"], "team": p["team"], "position": p.get("position", ""),
+                "headshot_url": meta_row.get("headshot_url") if meta_row is not None else None,
+                "team_color": (meta_row.get("team_color") if meta_row is not None else None) or "#444444",
+                "_prediction": prediction, "_actual": actual_text, "_result_cls": result_cls, "_result_icon": result_icon,
+                "_result": p["status"], "_week_label": f"{p['season']} Wk {p['week']}",
+            })
+
+        def _recent_pick_body(row: dict) -> str:
+            return (
+                f'<div class="stat-label" style="margin-top:8px;">{row["_week_label"]}</div>'
+                f'<div style="margin-top:2px; font-size:14px;">{row["_prediction"]}</div>'
+                f'<div class="stat-label" style="margin-top:2px; text-transform:none;">{row["_actual"]}</div>'
+                f'<div class="result-badge {row["_result_cls"]}">{row["_result_icon"]} {row["_result"]}</div>'
+            )
+
+        render_hotpick_cards(recent_rows, body_fn=_recent_pick_body, cols_per_row=4, headshot_px=96)
+
+        st.divider()
         header_col, clear_col = st.columns([5, 1])
         with header_col:
             if active_category:
@@ -3293,7 +3430,11 @@ else:
                     actual_text = "Did not score first"
                 else:
                     actual_text = "—"
+            meta_row = tr_meta.loc[p["player"]] if p["player"] in tr_meta.index else None
+            raw_headshot = meta_row.get("headshot_url") if meta_row is not None else None
             hist_rows.append({
+                "Headshot": sized_headshot(raw_headshot, 40) if raw_headshot and pd.notna(raw_headshot) else None,
+                "Logo": team_logos.get(p["team"]) if pd.notna(team_logos.get(p["team"])) else None,
                 "Season": p["season"], "Week": p["week"], "Category": category_labels.get(p["category"], p["category"]),
                 "Player": p["player"], "Team": p["team"], "Prediction": prediction,
                 "Actual": actual_text, "Result": p["status"],
@@ -3306,7 +3447,13 @@ else:
         display_df = hist_df[hist_df["Result"].isin(result_filter)] if result_filter else hist_df
         if active_category:
             display_df = display_df[display_df["Category"] == category_labels[active_category]]
-        st.dataframe(display_df, use_container_width=True, hide_index=True, row_height=38)
+        st.dataframe(
+            display_df, use_container_width=True, hide_index=True, row_height=38,
+            column_config={
+                "Headshot": st.column_config.ImageColumn(width="small"),
+                "Logo": st.column_config.ImageColumn(width="small"),
+            },
+        )
 
     if pick_tracker_store.using_local_fallback(st.secrets):
         st.caption(
