@@ -887,6 +887,35 @@ def resolve_pending_picks() -> tuple:
     return len(updated), len(pending) - len(updated)
 
 
+def compute_hit_rate(resolved_picks: list, category: str = None):
+    """Hit rate (0-100) over a list of already-resolved (non-Pending)
+    picks, optionally narrowed to one pick_tracker_store category -
+    Pushes are excluded from the denominator (a Push is neither a hit nor
+    a miss), same convention a sportsbook uses for its own record. Shared
+    by the Track Record tab and the Home page's KPI tile so "hit rate"
+    means exactly the same thing in both places. Returns (pct_or_None,
+    hits, scored_count) - pct is None when there's nothing scored yet."""
+    scored = [
+        p for p in resolved_picks
+        if p["status"] in ("Hit", "Miss") and (category is None or p["category"] == category)
+    ]
+    if not scored:
+        return None, 0, 0
+    hits = sum(1 for p in scored if p["status"] == "Hit")
+    return hits / len(scored) * 100, hits, len(scored)
+
+
+def count_resolvable_picks(picks: list, schedule_df: pd.DataFrame) -> int:
+    """How many still-Pending picks have a game that's already final -
+    i.e. how many "🔄 Check results now" on Track Record would actually
+    resolve right now. Read-only mirror of resolve_pending_picks's own
+    pending/final-games logic, used just for the Home page's alert nudge
+    so it doesn't need to actually mutate anything to know there's
+    something worth checking."""
+    final_games = set(schedule_df[schedule_df["home_score"].notna()]["game_id"])
+    return sum(1 for p in picks if p["status"] == "Pending" and p.get("game_id") in final_games)
+
+
 theme.info_popover(
     f"**Current season:** {CURRENT_SEASON}. Trend charts include prior seasons' data for longer-term context.",
     label="ℹ️ Season info",
@@ -1254,7 +1283,7 @@ def render_lineup_tab():
 
 
 tab_side = st.radio(
-    "Site section", ["🏈 Fantasy Lineups", "🎯 Prop Bets", "🔥 Hot Picks", "📊 Track Record"],
+    "Site section", ["🏠 Home", "🏈 Fantasy Lineups", "🎯 Prop Bets", "🔥 Hot Picks", "📊 Track Record"],
     horizontal=True, key="site_side", label_visibility="collapsed",
 )
 st.divider()
@@ -1267,8 +1296,8 @@ elif tab_side == "🎯 Prop Bets":
     tab_props, tab_firsttd, tab_game, tab_slips = st.tabs(
         ["🎯 Prop Comparator", "🥇 First TD", "🏟️ Game Center", "🧾 Bet Slip Tracker"]
     )
-# 🔥 Hot Picks and 📊 Track Record have no sub-tabs of their own - each is
-# one combined page, rendered further down in its own
+# 🏠 Home, 🔥 Hot Picks and 📊 Track Record have no sub-tabs of their own -
+# each is one combined page, rendered further down in its own
 # `elif tab_side == "...":` branch.
 
 if st.session_state.pop("show_jump_toast", False):
@@ -1294,7 +1323,152 @@ def jump_to_game_center(week, game_label):
     st.session_state["show_jump_toast"] = True
     st.session_state["site_side"] = "🎯 Prop Bets"
 
-if tab_side == "🏈 Fantasy Lineups":
+def _home_jump(label: str) -> None:
+    """Button callback for the Home page's quick-nav row. Same reasoning
+    as jump_to_game_center above: this has to run as an on_click callback
+    (which Streamlit runs BEFORE the next rerun), not as a plain
+    if-button-clicked assignment in the main script body - the "site
+    section" radio (key="site_side") has already been instantiated by the
+    time this code would otherwise run, and reassigning an instantiated
+    widget's session_state key mid-script raises
+    StreamlitWidgetAlreadyInstantiatedError."""
+    st.session_state["site_side"] = label
+
+
+if tab_side == "🏠 Home":
+    # ---------------- Home (alerts + at-a-glance briefing) ----------------
+    st.subheader("🏠 Home")
+    st.caption("What needs your attention right now, plus quick links to everything else.")
+
+    home_schedule = get_schedule()
+    home_rosters = roster_store.load_rosters(st.secrets)
+    rostered_players = {p for r in home_rosters for p in r["players"]}
+    home_injuries = get_injuries()
+    home_picks = pick_tracker_store.load_picks(st.secrets)
+
+    # severity: "bad" (red) > "warn" (amber) > "good" (green) - sorted so
+    # the most urgent thing on the page is always the first thing seen.
+    alerts = []
+
+    if rostered_players and not home_injuries.empty:
+        rostered_inj = home_injuries[
+            home_injuries["player"].isin(rostered_players)
+            & home_injuries["report_status"].isin(["Out", "Doubtful", "Questionable", "Injured Reserve", "IR"])
+        ]
+        for _, inj_row in rostered_inj.iterrows():
+            sev = "bad" if inj_row["report_status"] in ("Out", "Injured Reserve", "IR") else "warn"
+            detail = f" — {inj_row['report_primary_injury']}" if pd.notna(inj_row.get("report_primary_injury")) else ""
+            alerts.append((
+                sev, "🩹",
+                f"<b>{inj_row['player']}</b> ({inj_row['team']}) is <b>{inj_row['report_status']}</b>{detail} "
+                f"— on one of your rosters.",
+            ))
+
+    if rostered_players:
+        teams_this_week = teams_playing_this_week(home_schedule)
+        bye_rows = current_season_df[
+            current_season_df["player"].isin(rostered_players) & ~current_season_df["team"].isin(teams_this_week)
+        ][["player", "team"]].drop_duplicates()
+        for _, bye_row in bye_rows.iterrows():
+            alerts.append((
+                "warn", "🛌",
+                f"<b>{bye_row['player']}</b> ({bye_row['team']}) is on a <b>bye</b> this week — not eligible to start.",
+            ))
+
+    if ODDS_API_KEY and get_prop_lines_are_stale():
+        alerts.append((
+            "warn", "🔑",
+            f"Prop odds couldn't refresh this cycle — showing lines from "
+            f"{get_prop_lines_updated_at().strftime('%a %-I:%M %p')} instead of a live pull.",
+        ))
+
+    resolvable_n = count_resolvable_picks(home_picks, home_schedule)
+    if resolvable_n:
+        alerts.append((
+            "good", "📊",
+            f"<b>{resolvable_n} tracked pick(s)</b> have final scores waiting — hit "
+            f"<b>Check results now</b> on Track Record to grade them.",
+        ))
+
+    sev_style = {"bad": theme.BAD, "warn": theme.WARN, "good": theme.ACCENT}
+    sev_soft = {"bad": theme.BAD_SOFT, "warn": theme.WARN_SOFT, "good": theme.ACCENT_SOFT}
+    sev_order = {"bad": 0, "warn": 1, "good": 2}
+
+    if not alerts:
+        st.success("✅ All clear — no rostered-player injuries, byes, or stale data to flag right now.")
+    else:
+        for sev, icon, text in sorted(alerts, key=lambda a: sev_order[a[0]]):
+            alert_html = (
+                f'<div class="player-card" style="border-left: 4px solid {sev_style[sev]}; '
+                f'background: {sev_soft[sev]}; display:flex; align-items:center; gap:14px; '
+                f'padding:14px 20px; margin-bottom:10px;">'
+                f'<div style="font-size:24px; flex-shrink:0;">{icon}</div>'
+                f'<div style="font-size:15px;">{text}</div>'
+                f"</div>"
+            )
+            st.markdown(alert_html, unsafe_allow_html=True)
+
+    st.divider()
+
+    kc1, kc2, kc3, kc4 = st.columns(4)
+    kc1.metric("Tracked starters", int(current_season_df["player"].nunique()))
+
+    upcoming_games = home_schedule[home_schedule["home_score"].isna()]
+    next_week = int(upcoming_games["week"].min()) if not upcoming_games.empty else None
+    games_n = int((upcoming_games["week"] == next_week).sum()) if next_week is not None else 0
+    kc2.metric(f"Week {next_week} games" if next_week is not None else "Games this week", games_n if next_week is not None else "—")
+
+    resolved_all = [p for p in home_picks if p["status"] != "Pending"]
+    overall_pct, overall_hits, overall_n = compute_hit_rate(resolved_all)
+    kc3.metric(
+        "Overall hit rate", f"{overall_pct:.0f}%" if overall_pct is not None else "—",
+        f"{overall_hits}/{overall_n} resolved" if overall_n else "no picks yet", delta_color="off",
+    )
+
+    if not ODDS_API_KEY:
+        freshness = "No API key"
+    else:
+        freshness = "Stale" if get_prop_lines_are_stale() else "Fresh"
+    kc4.metric("Prop odds", freshness)
+
+    st.divider()
+
+    anytime_td_home = get_anytime_td_odds()
+    if not anytime_td_home.empty:
+        top_td = anytime_td_home.sort_values("implied_prob", ascending=False).iloc[0]
+        top_match = current_season_df[current_season_df["player"] == top_td["player"]]
+        if not top_match.empty:
+            info_row = top_match.iloc[0]
+            st.markdown("##### 🔥 Today's top mover")
+            spotlight_row = {
+                "player": top_td["player"], "team": info_row["team"], "position": info_row["position"],
+                "headshot_url": info_row.get("headshot_url"), "team_color": info_row.get("team_color") or "#444444",
+                "implied_prob": float(top_td["implied_prob"]),
+            }
+            render_hotpick_cards(
+                [spotlight_row],
+                body_fn=lambda row: (
+                    f'<div class="stat-big">{row["implied_prob"]:.0f}%</div>'
+                    f'<div class="stat-label">Anytime TD chance — highest on the board right now</div>'
+                ),
+                cols_per_row=1, headshot_px=128,
+            )
+            st.divider()
+
+    st.markdown("##### Jump to")
+    nav_targets = [
+        ("🏈 Fantasy Lineups", "Rosters, lineups, matchups & injuries"),
+        ("🎯 Prop Bets", "Prop comparator, First TD, Game Center"),
+        ("🔥 Hot Picks", "This week's best edges & TD chances"),
+        ("📊 Track Record", "Hit rates on everything tracked"),
+    ]
+    nav_cols = st.columns(4)
+    for nav_col, (nav_label, nav_desc) in zip(nav_cols, nav_targets):
+        with nav_col:
+            st.button(nav_label, use_container_width=True, key=f"home_nav_{nav_label}", on_click=_home_jump, args=(nav_label,))
+            st.caption(nav_desc)
+
+elif tab_side == "🏈 Fantasy Lineups":
     # ---------------- Overview (current season only) ----------------
     with tab_overview:
         st.sidebar.header("Filters")
@@ -2873,27 +3047,74 @@ else:
         resolved_picks = [p for p in all_picks if p["status"] != "Pending"]
         pending_count = len(all_picks) - len(resolved_picks)
 
-        def _hit_rate(category: str):
-            scored = [p for p in resolved_picks if p["category"] == category and p["status"] in ("Hit", "Miss")]
-            if not scored:
-                return None, 0, 0
-            hits = sum(1 for p in scored if p["status"] == "Hit")
-            return hits / len(scored) * 100, hits, len(scored)
-
-        edge_pct, edge_hits, edge_n = _hit_rate("edge")
-        any_pct, any_hits, any_n = _hit_rate("td_anytime")
-        first_pct, first_hits, first_n = _hit_rate("td_first")
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Prop Edges", f"{edge_pct:.0f}%" if edge_pct is not None else "—", f"{edge_hits}/{edge_n} resolved" if edge_n else "no results yet", delta_color="off")
-        m2.metric("Anytime TD", f"{any_pct:.0f}%" if any_pct is not None else "—", f"{any_hits}/{any_n} resolved" if any_n else "no results yet", delta_color="off")
-        m3.metric("First TD", f"{first_pct:.0f}%" if first_pct is not None else "—", f"{first_hits}/{first_n} resolved" if first_n else "no results yet", delta_color="off")
-        m4.metric("Pending", pending_count)
-
-        st.divider()
-        st.markdown("##### History")
+        edge_pct, edge_hits, edge_n = compute_hit_rate(resolved_picks, "edge")
+        any_pct, any_hits, any_n = compute_hit_rate(resolved_picks, "td_anytime")
+        first_pct, first_hits, first_n = compute_hit_rate(resolved_picks, "td_first")
 
         category_labels = {"edge": "Prop Edge", "td_anytime": "Anytime TD", "td_first": "First TD"}
+
+        # Clicking a tile filters the History table below to just that
+        # category (Pending instead sets the Result filter to Pending
+        # only) - a second click on the SAME tile clears it. This has to
+        # go through session_state in an on_click callback, not a plain
+        # "if st.button(...):" check, for the same reason jump_to_game_center
+        # and _home_jump do: the History table's "Result" multiselect
+        # (key="tr_result_filter") gets instantiated further down in this
+        # same script pass, and reassigning an already-instantiated
+        # widget's session_state key mid-script raises
+        # StreamlitWidgetAlreadyInstantiatedError. A callback runs BEFORE
+        # the next rerun, so it's always safe.
+        def _toggle_category_filter(category: str) -> None:
+            current = st.session_state.get("tr_category_filter")
+            st.session_state["tr_category_filter"] = None if current == category else category
+
+        def _filter_to_pending() -> None:
+            st.session_state["tr_category_filter"] = None
+            st.session_state["tr_result_filter"] = ["Pending"]
+
+        active_category = st.session_state.get("tr_category_filter")
+        pending_is_active = active_category is None and st.session_state.get("tr_result_filter") == ["Pending"]
+
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("Prop Edges", f"{edge_pct:.0f}%" if edge_pct is not None else "—", f"{edge_hits}/{edge_n} resolved" if edge_n else "no results yet", delta_color="off")
+            st.button(
+                "Show only Prop Edges", use_container_width=True, key="tr_tile_edge",
+                type="primary" if active_category == "edge" else "secondary",
+                on_click=_toggle_category_filter, args=("edge",),
+            )
+        with m2:
+            st.metric("Anytime TD", f"{any_pct:.0f}%" if any_pct is not None else "—", f"{any_hits}/{any_n} resolved" if any_n else "no results yet", delta_color="off")
+            st.button(
+                "Show only Anytime TD", use_container_width=True, key="tr_tile_anytime",
+                type="primary" if active_category == "td_anytime" else "secondary",
+                on_click=_toggle_category_filter, args=("td_anytime",),
+            )
+        with m3:
+            st.metric("First TD", f"{first_pct:.0f}%" if first_pct is not None else "—", f"{first_hits}/{first_n} resolved" if first_n else "no results yet", delta_color="off")
+            st.button(
+                "Show only First TD", use_container_width=True, key="tr_tile_first",
+                type="primary" if active_category == "td_first" else "secondary",
+                on_click=_toggle_category_filter, args=("td_first",),
+            )
+        with m4:
+            st.metric("Pending", pending_count)
+            st.button(
+                "Show only Pending", use_container_width=True, key="tr_tile_pending",
+                type="primary" if pending_is_active else "secondary",
+                on_click=_filter_to_pending,
+            )
+
+        st.divider()
+        header_col, clear_col = st.columns([5, 1])
+        with header_col:
+            if active_category:
+                st.markdown(f"##### History — filtered to **{category_labels[active_category]}**")
+            else:
+                st.markdown("##### History")
+        with clear_col:
+            if active_category:
+                st.button("✕ Clear filter", key="tr_clear_category", on_click=_toggle_category_filter, args=(active_category,))
         hist_rows = []
         for p in sorted(all_picks, key=lambda x: (x["season"], x["week"], x["player"]), reverse=True):
             detail = p.get("detail", {})
@@ -2926,6 +3147,8 @@ else:
             "Result", ["Hit", "Miss", "Push", "Pending"], default=["Hit", "Miss", "Push", "Pending"], key="tr_result_filter",
         )
         display_df = hist_df[hist_df["Result"].isin(result_filter)] if result_filter else hist_df
+        if active_category:
+            display_df = display_df[display_df["Category"] == category_labels[active_category]]
         st.dataframe(display_df, use_container_width=True, hide_index=True, row_height=38)
 
     if pick_tracker_store.using_local_fallback(st.secrets):
