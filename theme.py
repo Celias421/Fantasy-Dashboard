@@ -83,6 +83,10 @@ CATEGORY_COLORS = {
 # matchup" is a semantic judgment, not a brand moment.
 MATCHUP_TOUGH_RGB = (229, 85, 90)
 MATCHUP_EASY_RGB = (67, 194, 131)
+# Midpoint of every red -> amber -> green badge gradient in the app
+# (matchup difficulty, implied totals, fair prob, TD probability, weather
+# risk) - same amber as WARN, so the whole ramp is built from status colors.
+RAMP_MID_RGB = (245, 179, 36)
 
 FONT_DISPLAY = "'Big Shoulders Display', 'Arial Narrow', system-ui, sans-serif"
 FONT_BODY = "'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif"
@@ -328,14 +332,30 @@ def inject_css() -> None:
         border-color: {ACCENT};
         color: {ACCENT};
     }}
-    button[kind="primary"], .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {{
+    /* Form submit buttons (st.form_submit_button) are tagged
+       kind="primaryFormSubmit" / "secondaryFormSubmit", not "primary" -
+       without these selectors "Save slip" / "Save roster" fell back to
+       Streamlit's own primaryColor instead of the brand gold. */
+    button[kind="primary"], button[kind="primaryFormSubmit"],
+    .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"],
+    .stFormSubmitButton > button[kind="primaryFormSubmit"] {{
         background: {ACCENT} !important;
         color: {ACCENT_INK} !important;
         border: none !important;
     }}
-    button[kind="primary"]:hover {{
+    button[kind="primary"]:hover, button[kind="primaryFormSubmit"]:hover {{
         background: {ACCENT_HOVER} !important;
         color: {ACCENT_INK} !important;
+    }}
+    button[kind="primary"] p, button[kind="primaryFormSubmit"] p {{
+        color: {ACCENT_INK} !important;
+        font-weight: 700 !important;
+    }}
+    button[kind="secondaryFormSubmit"] {{
+        border-radius: 4px; border: 1px solid {LINE}; font-weight: 700;
+    }}
+    button[kind="secondaryFormSubmit"]:hover {{
+        border-color: {ACCENT}; color: {ACCENT};
     }}
 
     /* ---- Tabs ------------------------------------------------------------ */

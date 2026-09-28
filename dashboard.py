@@ -219,21 +219,29 @@ def weather_risk_pct(w: dict) -> float:
     return max(wind_pct, rain_pct)
 
 
+def status_ramp_color(t: float, high_is_good: bool = True) -> str:
+    """Shared red -> amber -> green text color for every graded badge in
+    the app (matchup difficulty, implied total, fair prob, TD probability,
+    weather risk). t is 0-1 along the scale; high_is_good=False flips it
+    for measures where a HIGH value is the bad outcome (weather risk).
+    Built entirely from theme status colors, replacing five copies of the
+    same interpolation that each hardcoded the old palette's pastel stops."""
+    t = min(max(t, 0.0), 1.0)
+    lo, mid, hi = theme.MATCHUP_TOUGH_RGB, theme.RAMP_MID_RGB, theme.MATCHUP_EASY_RGB
+    if not high_is_good:
+        lo, hi = hi, lo
+    c0, c1, local_t = (lo, mid, t / 0.5) if t <= 0.5 else (mid, hi, (t - 0.5) / 0.5)
+    r, g, b = (round(c0[i] + (c1[i] - c0[i]) * local_t) for i in range(3))
+    return f"rgb({r},{g},{b})"
+
+
 def severity_color(pct: float) -> str:
     """Soft green (0, calm) -> yellow -> soft red (100, severe). Same
     pastel style as matchup_rank_color but inverted, for anything where a
     HIGH number is the bad outcome (wind/rain risk) rather than a low
     one (defensive rank)."""
     t = min(max(pct, 0.0), 100.0) / 100.0
-    stops = [(0.0, (143, 214, 168)), (0.5, (255, 209, 102)), (1.0, (255, 107, 107))]
-    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
-        if t0 <= t <= t1:
-            local_t = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
-            r = round(c0[0] + (c1[0] - c0[0]) * local_t)
-            g = round(c0[1] + (c1[1] - c0[1]) * local_t)
-            b = round(c0[2] + (c1[2] - c0[2]) * local_t)
-            return f"rgb({r},{g},{b})"
-    return "rgb(255,107,107)"
+    return status_ramp_color(t, high_is_good=False)
 
 
 def weather_badge(home_team: str, gameday, roof, location: str):
@@ -427,15 +435,7 @@ def matchup_rank_color(rank: int, max_rank: int = 32) -> str:
     (difficulty), not decoration."""
     t = (rank - 1) / max(max_rank - 1, 1)
     t = min(max(t, 0.0), 1.0)
-    stops = [(0.0, theme.MATCHUP_TOUGH_RGB), (0.5, (255, 209, 102)), (1.0, theme.MATCHUP_EASY_RGB)]
-    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
-        if t0 <= t <= t1:
-            local_t = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
-            r = round(c0[0] + (c1[0] - c0[0]) * local_t)
-            g = round(c0[1] + (c1[1] - c0[1]) * local_t)
-            b = round(c0[2] + (c1[2] - c0[2]) * local_t)
-            return f"rgb({r},{g},{b})"
-    return "rgb(143,214,168)"
+    return status_ramp_color(t, high_is_good=True)
 
 
 def pill_badge_html(label: str, color: str, tag: str = "div", title: str | None = None) -> str:
@@ -473,15 +473,7 @@ def implied_total_color(total: float) -> str:
     implied total actually covers in a normal week (~14 to ~31)."""
     t = (total - 14.0) / (31.0 - 14.0)
     t = min(max(t, 0.0), 1.0)
-    stops = [(0.0, theme.MATCHUP_TOUGH_RGB), (0.5, (255, 209, 102)), (1.0, theme.MATCHUP_EASY_RGB)]
-    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
-        if t0 <= t <= t1:
-            local_t = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
-            r = round(c0[0] + (c1[0] - c0[0]) * local_t)
-            g = round(c0[1] + (c1[1] - c0[1]) * local_t)
-            b = round(c0[2] + (c1[2] - c0[2]) * local_t)
-            return f"rgb({r},{g},{b})"
-    return "rgb(143,214,168)"
+    return status_ramp_color(t, high_is_good=True)
 
 
 def implied_total_badge_html(total, tag: str = "div") -> str:
@@ -527,15 +519,7 @@ def fair_prob_color(pct: float) -> str:
     ones indistinguishable from each other."""
     t = (pct - 40.0) / (60.0 - 40.0)
     t = min(max(t, 0.0), 1.0)
-    stops = [(0.0, theme.MATCHUP_TOUGH_RGB), (0.5, (255, 209, 102)), (1.0, theme.MATCHUP_EASY_RGB)]
-    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
-        if t0 <= t <= t1:
-            local_t = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
-            r = round(c0[0] + (c1[0] - c0[0]) * local_t)
-            g = round(c0[1] + (c1[1] - c0[1]) * local_t)
-            b = round(c0[2] + (c1[2] - c0[2]) * local_t)
-            return f"rgb({r},{g},{b})"
-    return "rgb(143,214,168)"
+    return status_ramp_color(t, high_is_good=True)
 
 
 def fair_prob_badge_html(fair_prob_over, direction: str, tag: str = "div") -> str:
@@ -660,15 +644,7 @@ def probability_color(pct: float) -> str:
     HIGH number reads as green - matching how people expect a
     probability to read (unlike severity_color, where high is bad)."""
     t = min(max(pct, 0.0), 100.0) / 100.0
-    stops = [(0.0, (255, 107, 107)), (0.5, (255, 209, 102)), (1.0, (143, 214, 168))]
-    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
-        if t0 <= t <= t1:
-            local_t = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
-            r = round(c0[0] + (c1[0] - c0[0]) * local_t)
-            g = round(c0[1] + (c1[1] - c0[1]) * local_t)
-            b = round(c0[2] + (c1[2] - c0[2]) * local_t)
-            return f"rgb({r},{g},{b})"
-    return "rgb(143,214,168)"
+    return status_ramp_color(t, high_is_good=True)
 
 
 def anytime_td_badge_html(pct: float, tag: str = "div") -> str:
@@ -2071,7 +2047,7 @@ elif tab_side == "🔍 Research":
 
                 period_order = chronological_order(pdf_full)
                 stat_title = stat.replace("_", " ").title()
-                line = alt.Chart(pdf_full).mark_line(point=True, color=theme.ACCENT).encode(
+                line = alt.Chart(pdf_full).mark_line(point=alt.OverlayMarkDef(color=theme.ACCENT, filled=True, size=55), color=theme.ACCENT).encode(
                     x=alt.X("period:N", sort=period_order, title=None),
                     y=alt.Y(f"{stat}:Q", title=stat_title),
                     tooltip=[
@@ -3013,7 +2989,7 @@ elif tab_side == "🎯 Props":
             settled_sorted = hist_df[hist_df["result"].isin(["Won", "Lost", "Cashed Out"])].sort_values("date").copy()
             if not settled_sorted.empty:
                 settled_sorted["cumulative_profit"] = settled_sorted["profit"].cumsum()
-                profit_chart = alt.Chart(settled_sorted).mark_line(point=True, color=theme.ACCENT).encode(
+                profit_chart = alt.Chart(settled_sorted).mark_line(point=alt.OverlayMarkDef(color=theme.ACCENT, filled=True, size=55), color=theme.ACCENT).encode(
                     x=alt.X("date:T", title="Date"),
                     y=alt.Y("cumulative_profit:Q", title="Cumulative profit ($)"),
                     tooltip=["date", "sportsbook", "result", alt.Tooltip("profit:Q", format="$.2f"), alt.Tooltip("cumulative_profit:Q", format="$.2f", title="Running total")],
@@ -3030,7 +3006,7 @@ elif tab_side == "🎯 Props":
 
             edited = st.data_editor(
                 edit_df,
-                use_container_width=True, hide_index=True, key="slip_editor", row_height=40,
+                width="content", hide_index=True, key="slip_editor", row_height=40,
                 column_order=["date", "sportsbook", "bet_type", "legs", "odds", "stake", "potential_payout", "result", "actual_payout", "notes"],
                 column_config={
                     "id": st.column_config.TextColumn(disabled=True),
@@ -3065,8 +3041,92 @@ elif tab_side == "🎯 Props":
                 else:
                     st.info("No changes to save.")
 
+            # First leg included so two slips with the same date/book/stake
+            # (common: several $2.50 singles in one night) aren't identical
+            # entries in the Edit/Delete pickers.
+            def _slip_label(s):
+                legs = s.get("legs") or []
+                first = (legs[0] if isinstance(legs, list) and legs else str(legs or "")).strip()
+                first = (first[:42] + "…") if len(first) > 43 else first
+                more = f" +{len(legs) - 1} more" if isinstance(legs, list) and len(legs) > 1 else ""
+                return f"{s['date']} · {first or s['bet_type']}{more} · ${s['stake']:.2f} · {s['result']}"
+            slip_labels = {s["id"]: _slip_label(s) for s in slips}
+
+            # Full edit of an already-saved slip (Sep 2026). The table above
+            # only edits result/payout; this edits EVERY field. save_slip
+            # upserts by id, so the slip is replaced in place - never
+            # duplicated - and created_at is preserved. The form's key and
+            # every widget key carry the slip id, so switching the picker
+            # to a different slip loads that slip's values fresh instead of
+            # keeping the previous slip's edits.
+            _flash = st.session_state.pop("slip_edit_flash", None)
+            if _flash:
+                st.success(_flash, icon="✅")
+            with st.expander("✏️ Edit a slip"):
+                edit_id = st.selectbox("Slip to edit", list(slip_labels.keys()), format_func=lambda i: slip_labels[i], key="slip_edit_pick")
+                es = next(s for s in slips if s["id"] == edit_id)
+                try:
+                    es_date = datetime.date.fromisoformat(str(es.get("date", ""))[:10])
+                except ValueError:
+                    es_date = datetime.date.today()
+                with st.form(f"slip_edit_form_{edit_id}"):
+                    e1, e2, e3 = st.columns(3)
+                    with e1:
+                        e_date = st.date_input("Date placed", value=es_date, key=f"se_date_{edit_id}")
+                        e_sb = st.selectbox(
+                            "Sportsbook", slip_store.SPORTSBOOKS,
+                            index=slip_store.SPORTSBOOKS.index(es["sportsbook"]) if es.get("sportsbook") in slip_store.SPORTSBOOKS else len(slip_store.SPORTSBOOKS) - 1,
+                            key=f"se_sb_{edit_id}",
+                        )
+                        e_result = st.selectbox(
+                            "Result", slip_store.RESULTS,
+                            index=slip_store.RESULTS.index(es["result"]) if es.get("result") in slip_store.RESULTS else 0,
+                            key=f"se_result_{edit_id}",
+                        )
+                    with e2:
+                        e_bt = st.selectbox(
+                            "Bet type", slip_store.BET_TYPES,
+                            index=slip_store.BET_TYPES.index(es["bet_type"]) if es.get("bet_type") in slip_store.BET_TYPES else 0,
+                            key=f"se_bt_{edit_id}",
+                        )
+                        e_odds = st.text_input("Odds (American, e.g. +450 or -110)", value=str(es.get("odds", "") or ""), key=f"se_odds_{edit_id}")
+                        e_actual = st.number_input("Actual payout ($)", min_value=0.0, value=float(es.get("actual_payout") or 0.0), step=1.0, key=f"se_actual_{edit_id}")
+                    with e3:
+                        e_stake = st.number_input("Stake ($)", min_value=0.0, value=float(es.get("stake") or 0.0), step=1.0, key=f"se_stake_{edit_id}")
+                        e_pot = st.number_input("Potential payout ($)", min_value=0.0, value=float(es.get("potential_payout") or 0.0), step=1.0, key=f"se_pot_{edit_id}")
+                    e_legs = st.text_area(
+                        "Legs (one per line)",
+                        value="\n".join(es["legs"]) if isinstance(es.get("legs"), list) else str(es.get("legs") or ""),
+                        height=120, key=f"se_legs_{edit_id}",
+                    )
+                    e_notes = st.text_input("Notes (optional)", value=str(es.get("notes", "") or ""), key=f"se_notes_{edit_id}")
+                    if st.form_submit_button("💾 Save changes", type="primary"):
+                        if e_stake <= 0:
+                            st.error("Stake must be more than $0.")
+                        else:
+                            updated = dict(es)  # keeps id + created_at
+                            updated.update({
+                                "date": e_date.isoformat(),
+                                "sportsbook": e_sb,
+                                "bet_type": e_bt,
+                                "legs": [l.strip() for l in e_legs.splitlines() if l.strip()],
+                                "odds": e_odds.strip(),
+                                "stake": float(e_stake),
+                                "potential_payout": float(e_pot),
+                                "result": e_result,
+                                "actual_payout": float(e_actual),
+                                "notes": e_notes.strip(),
+                            })
+                            ok, msg = slip_store.save_slip(st.secrets, updated)
+                            if ok:
+                                # Shown after the rerun (a message printed right
+                                # before st.rerun() would vanish instantly).
+                                st.session_state["slip_edit_flash"] = f"Slip updated. {msg if msg != 'Saved.' else ''}".strip()
+                                st.rerun()
+                            else:
+                                st.error(msg)
+
             with st.expander("Delete a slip"):
-                slip_labels = {s["id"]: f"{s['date']} · {s['sportsbook']} · {s['bet_type']} · ${s['stake']:.2f} · {s['result']}" for s in slips}
                 del_id = st.selectbox("Slip", list(slip_labels.keys()), format_func=lambda i: slip_labels[i], key="slip_delete_pick")
                 if st.button("🗑️ Delete this slip"):
                     slip_store.delete_slip(st.secrets, del_id)
