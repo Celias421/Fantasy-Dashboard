@@ -32,7 +32,7 @@ DEFAULT_LINEUP_SETTINGS = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 2}
 # the first deploy after adding this feature: the app defaults to showing
 # the Fantasy Lineups side on every load, which immediately calls into this
 # module, so a hang here is a hang for every single visitor, forever.
-_SHEETS_TIMEOUT_SECONDS = 8
+_SHEETS_TIMEOUT_SECONDS = 15
 
 # Set whenever the Sheets connection attempt fails or times out, so the app
 # can show *why* instead of just "isn't configured yet" - that message was
@@ -169,13 +169,21 @@ def _sheets_load(worksheet) -> list:
 
 
 def _sheets_save(worksheet, rosters: list) -> None:
+    """Batched into ONE update() call instead of one append_row() per
+    row - see pick_tracker_store._sheets_save's docstring for why the
+    old per-row-append pattern is a real bug (it silently loses data
+    once a sheet grows past what fits in the save timeout), not just a
+    style choice. Rosters are capped at MAX_ROSTERS so this was less
+    exposed than the picks table, but the fix is identical and cheap."""
     worksheet.clear()
-    worksheet.append_row(["id", "name", "players_json", "lineup_settings_json"])
-    for r in rosters:
-        worksheet.append_row([
+    rows = [["id", "name", "players_json", "lineup_settings_json"]] + [
+        [
             r["id"], r["name"], json.dumps(r["players"]),
             json.dumps(_normalize_lineup_settings(r.get("lineup_settings"))),
-        ])
+        ]
+        for r in rosters
+    ]
+    worksheet.update(rows)
 
 
 def load_rosters(st_secrets) -> list:

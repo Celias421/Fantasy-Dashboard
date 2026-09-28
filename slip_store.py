@@ -25,7 +25,7 @@ SPORTSBOOKS = [
 BET_TYPES = ["Single", "Parlay", "Same Game Parlay", "Teaser", "Round Robin", "Other"]
 RESULTS = ["Pending", "Won", "Lost", "Push", "Cashed Out"]
 
-_SHEETS_TIMEOUT_SECONDS = 8
+_SHEETS_TIMEOUT_SECONDS = 15
 _last_error = None
 
 _COLUMNS = [
@@ -145,10 +145,14 @@ def _slip_to_row(s: dict) -> list:
 
 
 def _sheets_save(worksheet, slips: list) -> None:
+    """Batched into ONE update() call instead of one append_row() per
+    row - see pick_tracker_store._sheets_save's docstring for why the
+    old per-row-append pattern is a real bug (it silently loses data
+    once a sheet grows past what fits in the save timeout), not just a
+    style choice."""
     worksheet.clear()
-    worksheet.append_row(_COLUMNS)
-    for s in slips:
-        worksheet.append_row(_slip_to_row(s))
+    rows = [_COLUMNS] + [_slip_to_row(s) for s in slips]
+    worksheet.update(rows)
 
 
 def load_slips(st_secrets) -> list:

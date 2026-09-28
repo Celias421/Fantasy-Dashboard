@@ -21,7 +21,7 @@ LOCAL_FALLBACK_PATH = "data/tracked_picks_local.json"
 CATEGORIES = ["edge", "td_anytime", "td_first"]
 STATUSES = ["Pending", "Hit", "Miss", "Push"]
 
-_SHEETS_TIMEOUT_SECONDS = 8
+_SHEETS_TIMEOUT_SECONDS = 15
 _last_error = None
 
 _COLUMNS = [
@@ -146,10 +146,21 @@ def _pick_to_row(p: dict) -> list:
 
 
 def _sheets_save(worksheet, picks: list) -> None:
+    """Rewrites the whole sheet in ONE batched API call instead of one
+    append_row() per row (the previous approach). That N+1-call pattern
+    is what actually caused tracked results to vanish: every save was
+    wrapped in an 8-second hard timeout (_SHEETS_TIMEOUT_SECONDS), and
+    once the pick history grew past a couple dozen rows - trivial after
+    a few weeks of a full slate - the sequential round-trips blew past
+    8 seconds, the daemon thread got abandoned mid-write (sometimes
+    after clear() had already wiped the sheet but before the rewrite
+    finished), and the save silently fell through to the local,
+    redeploy-losing fallback file. A single update() call for the whole
+    grid stays well under the timeout no matter how much history has
+    piled up, and it can't leave the sheet half-written."""
     worksheet.clear()
-    worksheet.append_row(_COLUMNS)
-    for p in picks:
-        worksheet.append_row(_pick_to_row(p))
+    rows = [_COLUMNS] + [_pick_to_row(p) for p in picks]
+    worksheet.update(rows)
 
 
 def load_picks(st_secrets) -> list:
