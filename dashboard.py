@@ -1448,6 +1448,134 @@ def team_logo_html(team, px: int = 30) -> str:
     )
 
 
+# ---------------- Standard player table (Sep 2026) ----------------
+# The house layout for EVERY table that lists players, taken from the
+# Track Record History table:
+#
+#   [context columns, if any] → Headshot → Player → Pos → Team → Opp → details
+#
+# - Team and Opp are shown as team LOGOS (one column each), not text.
+# - Headshots are 40px; row height 38px; the table is sized to its content
+#   (no dead space to the right).
+# Callers pass plain values - "Headshot" = the raw headshot URL (or None),
+# "Team" / "Opp" = team abbreviations - and this converts them to images,
+# so every player table looks and behaves the same. New player tables
+# should go through this rather than calling st.dataframe directly.
+PLAYER_TABLE_IDENTITY_COLS = ("Headshot", "Player", "Pos", "Team", "Opp")
+
+
+def _team_logo_url(team):
+    """Logo URL for a team abbreviation, or None (blank cell) if unknown."""
+    if team is None or (isinstance(team, float) and pd.isna(team)) or team == "":
+        return None
+    url = team_logos.get(team)
+    return url if url is not None and pd.notna(url) else None
+
+
+def render_player_table(df: pd.DataFrame, *, lead_cols=(), column_config=None) -> None:
+    out = df.copy()
+    if "Headshot" in out.columns:
+        out["Headshot"] = out["Headshot"].apply(
+            lambda u: sized_headshot(u, 40) if isinstance(u, str) and u else None
+        )
+    for col in ("Team", "Opp"):
+        if col in out.columns:
+            out[col] = out[col].apply(_team_logo_url)
+    lead = [c for c in lead_cols if c in out.columns]
+    identity = [c for c in PLAYER_TABLE_IDENTITY_COLS if c in out.columns and c not in lead]
+    rest = [c for c in out.columns if c not in lead and c not in identity]
+    config = {
+        "Headshot": st.column_config.ImageColumn("Headshot", width="small"),
+        "Team": st.column_config.ImageColumn("Team", width="small", help="Player's team"),
+        "Opp": st.column_config.ImageColumn("Opp", width="small", help="Opponent in that game"),
+    }
+    config.update(column_config or {})
+    st.dataframe(
+        out, width="content", hide_index=True, row_height=38,
+        column_order=lead + identity + rest, column_config=config,
+    )
+
+
+# ---------------- Roster alerts (Sep 2026) ----------------
+# Injury designations and byes for players on YOUR saved rosters. One row
+# per (roster, player), so a player on two rosters shows under each - the
+# alert always says which roster it's about. Used by the compact strip at
+# the top of the Lineups page and the one-line summary on the Dashboard.
+ROSTER_ALERT_STATUSES = {
+    # status: (severity, sort order)
+    "Out": ("bad", 0), "Injured Reserve": ("bad", 0), "IR": ("bad", 0),
+    "Doubtful": ("warn", 1), "Questionable": ("warn", 2), "Bye": ("bye", 3),
+}
+
+
+def get_roster_alerts(rosters: list) -> list:
+    if not rosters:
+        return []
+    injuries = get_injuries()
+    teams_this_week = teams_playing_this_week(get_schedule())
+    latest_team = (
+        current_season_df.sort_values(["season", "week"]).groupby("player")["team"].last().to_dict()
+        if not current_season_df.empty else {}
+    )
+    injured = {}
+    if not injuries.empty:
+        for _, r in injuries.iterrows():
+            if r["report_status"] in ROSTER_ALERT_STATUSES:
+                detail = r.get("report_primary_injury")
+                injured[r["player"]] = (r["report_status"], detail if pd.notna(detail) else "", r["team"])
+    alerts = []
+    for roster in rosters:
+        for player in roster.get("players", []):
+            if player in injured:
+                status, detail, team = injured[player]
+            else:
+                team = latest_team.get(player)
+                if not team or team in teams_this_week:
+                    continue
+                status, detail = "Bye", ""
+            sev, order = ROSTER_ALERT_STATUSES[status]
+            alerts.append({"roster": roster["name"], "player": player, "team": team,
+                           "status": status, "detail": detail, "sev": sev, "order": order})
+    return sorted(alerts, key=lambda a: (a["roster"].lower(), a["order"], a["player"]))
+
+
+def roster_alert_counts(alerts: list) -> str:
+    """e.g. '2 out · 3 questionable/doubtful · 1 on bye'"""
+    n_out = sum(a["sev"] == "bad" for a in alerts)
+    n_q = sum(a["status"] in ("Doubtful", "Questionable") for a in alerts)
+    n_bye = sum(a["status"] == "Bye" for a in alerts)
+    parts = [f"{n_out} out" if n_out else "", f"{n_q} questionable/doubtful" if n_q else "",
+             f"{n_bye} on bye" if n_bye else ""]
+    return " · ".join(p for p in parts if p)
+
+
+def render_roster_alerts_strip() -> None:
+    """Compact, collapsed-by-default strip at the top of the Lineups page:
+    the label carries the counts at a glance, and opening it shows a tight
+    list grouped under each roster's name."""
+    from html import escape
+    rosters = roster_store.load_rosters(st.secrets)
+    if not rosters:
+        return
+    alerts = get_roster_alerts(rosters)
+    if not alerts:
+        st.caption("✅ No injuries or byes on your rosters this week.")
+        return
+    with st.expander(f"🩹 Roster alerts · {roster_alert_counts(alerts)}", expanded=False):
+        parts = []
+        for roster_name in sorted({a["roster"] for a in alerts}, key=str.lower):
+            parts.append(f'<div class="ra-roster">{escape(roster_name)}</div>')
+            for a in (x for x in alerts if x["roster"] == roster_name):
+                tag = "IR" if a["status"] in ("Injured Reserve", "IR") else a["status"].upper()
+                detail = f' · {escape(str(a["detail"]))}' if a["detail"] else ""
+                parts.append(
+                    f'<div class="ra-row"><div class="ra-pill ra-{a["sev"]}">{tag}</div>'
+                    f'<div class="ra-name">{escape(a["player"])}</div>'
+                    f'<div class="ra-sub">{escape(str(a["team"]))}{detail}</div></div>'
+                )
+        st.markdown("".join(parts), unsafe_allow_html=True)
+
+
 def render_rosters_tab():
     """Create/edit/select up to roster_store.MAX_ROSTERS named rosters -
     just storage and management for now (see roster_store.py for why this
@@ -1567,6 +1695,7 @@ def compute_lineup_projections(roster_players: list) -> pd.DataFrame:
     defense_ranks = get_defense_ranks()
     schedule = get_schedule()
     next_opp_map = build_next_opponent_map(schedule)
+    _opp_lookup = dict(zip(next_opp_map["team"], next_opp_map["opponent"]))  # team -> this week's opponent
     teams_this_week = teams_playing_this_week(schedule)
     injuries = get_injuries()
 
@@ -1613,6 +1742,7 @@ def compute_lineup_projections(roster_players: list) -> pd.DataFrame:
             "opponent_plain": matchup_plain[0] if matchup_plain else None,
             "season_avg": round(season_avg, 1), "matchup_rank": rank, "proj_points": proj,
             "injury_status": inj_status, "note": note, "headshot_url": headshot_url,
+            "opp_team": _opp_lookup.get(team),
         })
     return pd.DataFrame(rows)
 
@@ -1718,20 +1848,19 @@ def render_lineup_tab():
     display[["opponent_plain", "matchup_rank", "injury_status", "note"]] = (
         display[["opponent_plain", "matchup_rank", "injury_status", "note"]].fillna("")
     )
-    st.dataframe(
-        display[["in_lineup", "player", "position", "team", "opponent_plain", "proj_points", "season_avg", "matchup_rank", "injury_status", "note"]]
+    if "opp_team" not in display.columns:
+        display["opp_team"] = None
+    render_player_table(
+        display[["in_lineup", "headshot_url", "player", "position", "team", "opp_team", "proj_points", "season_avg", "opponent_plain", "matchup_rank", "injury_status", "note"]]
         .rename(columns={
-            "in_lineup": "Start", "player": "Player", "position": "Pos", "team": "Team",
-            "opponent_plain": "Next opp", "proj_points": "Proj", "season_avg": "Szn avg",
-            "matchup_rank": "Opp rank", "injury_status": "Injury", "note": "Note",
+            "in_lineup": "Start", "headshot_url": "Headshot", "player": "Player", "position": "Pos",
+            "team": "Team", "opp_team": "Opp", "opponent_plain": "Matchup", "proj_points": "Proj",
+            "season_avg": "Szn avg", "matchup_rank": "Opp rank", "injury_status": "Injury", "note": "Note",
         }),
-        width="content", hide_index=True, row_height=38,
+        lead_cols=["Start"],
         column_config={
             "Start": st.column_config.TextColumn(width="small"),
-            "Player": st.column_config.TextColumn(width=200),
-            "Pos": st.column_config.TextColumn(width="small"),
-            "Team": st.column_config.TextColumn(width="small"),
-            "Next opp": st.column_config.TextColumn(width=270),
+            "Matchup": st.column_config.TextColumn(width=270),
             "Proj": st.column_config.NumberColumn(width="small"),
             "Szn avg": st.column_config.NumberColumn(width="small"),
             "Opp rank": st.column_config.NumberColumn(width="small"),
@@ -1767,6 +1896,7 @@ if tab_side == "🔍 Research":
         ["📋 Overview", "🔍 Player Deep Dive", "🩹 Injuries", "🗓️ Matchups"]
     )
 elif tab_side == "🏈 Lineups":
+    render_roster_alerts_strip()
     tab_rosters, tab_lineup = st.tabs(
         ["👥 My Rosters", "🏆 Lineup Optimizer"]
     )
@@ -1820,38 +1950,20 @@ if tab_side == "🏠 Dashboard":
 
     home_schedule = get_schedule()
     home_rosters = roster_store.load_rosters(st.secrets)
-    rostered_players = {p for r in home_rosters for p in r["players"]}
-    home_injuries = get_injuries()
     home_picks = pick_tracker_store.load_picks(st.secrets)
 
     # severity: "bad" (red) > "warn" (amber) > "good" (green) - sorted so
     # the most urgent thing on the page is always the first thing seen.
     alerts = []
 
-    if rostered_players and not home_injuries.empty:
-        rostered_inj = home_injuries[
-            home_injuries["player"].isin(rostered_players)
-            & home_injuries["report_status"].isin(["Out", "Doubtful", "Questionable", "Injured Reserve", "IR"])
-        ]
-        for _, inj_row in rostered_inj.iterrows():
-            sev = "bad" if inj_row["report_status"] in ("Out", "Injured Reserve", "IR") else "warn"
-            detail = f" — {inj_row['report_primary_injury']}" if pd.notna(inj_row.get("report_primary_injury")) else ""
-            alerts.append((
-                sev, "🩹",
-                f"<b>{inj_row['player']}</b> ({inj_row['team']}) is <b>{inj_row['report_status']}</b>{detail} "
-                f"— on one of your rosters.",
-            ))
-
-    if rostered_players:
-        teams_this_week = teams_playing_this_week(home_schedule)
-        bye_rows = current_season_df[
-            current_season_df["player"].isin(rostered_players) & ~current_season_df["team"].isin(teams_this_week)
-        ][["player", "team"]].drop_duplicates()
-        for _, bye_row in bye_rows.iterrows():
-            alerts.append((
-                "warn", "🛌",
-                f"<b>{bye_row['player']}</b> ({bye_row['team']}) is on a <b>bye</b> this week — not eligible to start.",
-            ))
+    # Roster injuries/byes: the full per-roster list lives in the compact
+    # strip at the top of the Lineups page (Sep 2026) - here it's one line.
+    home_roster_alerts = get_roster_alerts(home_rosters)
+    if home_roster_alerts:
+        alerts.append((
+            "bad" if any(a["sev"] == "bad" for a in home_roster_alerts) else "warn", "🩹",
+            f"<b>Roster alerts:</b> {roster_alert_counts(home_roster_alerts)} — see the <b>Lineups</b> page for which roster.",
+        ))
 
     if ODDS_API_KEY and get_prop_lines_are_stale():
         alerts.append((
@@ -1873,18 +1985,22 @@ if tab_side == "🏠 Dashboard":
     sev_order = {"bad": 0, "warn": 1, "good": 2}
 
     if not alerts:
-        st.success("✅ All clear — no rostered-player injuries, byes, or stale data to flag right now.")
+        st.markdown(
+            f'<div class="dash-alert" style="border-left: 3px solid {theme.GOOD}; background: {theme.GOOD_SOFT};">'
+            f'<div class="dash-alert-icon">✅</div><div class="dash-alert-text">All clear — no roster injuries, '
+            f'byes, or stale data to flag right now.</div></div>',
+            unsafe_allow_html=True,
+        )
     else:
         for sev, icon, text in sorted(alerts, key=lambda a: sev_order[a[0]]):
             alert_html = (
-                f'<div class="player-card" style="border-left: 4px solid {sev_style[sev]}; '
-                f'background: {sev_soft[sev]}; display:flex; align-items:center; gap:14px; '
-                f'padding:14px 20px; margin-bottom:10px;">'
-                f'<div style="font-size:24px; flex-shrink:0;">{icon}</div>'
-                f'<div style="font-size:15px;">{text}</div>'
+                f'<div class="dash-alert" style="border-left: 3px solid {sev_style[sev]}; background: {sev_soft[sev]};">'
+                f'<div class="dash-alert-icon">{icon}</div><div class="dash-alert-text">{text}</div>'
                 f"</div>"
             )
             st.markdown(alert_html, unsafe_allow_html=True)
+        if home_roster_alerts:
+            st.button("🏈 Open Lineups →", key="home_open_lineups", on_click=_home_jump, args=("🏈 Lineups",))
 
     st.divider()
 
@@ -2235,7 +2351,6 @@ elif tab_side == "🔍 Research":
             inj_df["status_rank"] = inj_df["report_status"].map(STATUS_ORDER).fillna(3)
             tracked_players = set(current_season_df["player"].unique())
             inj_df["Tracked"] = inj_df["player"].isin(tracked_players).map({True: "✅", False: ""})
-            inj_df["Team Logo"] = inj_df["team"].map(team_logos)
             inj_df["Status"] = inj_df["report_status"].apply(
                 lambda s: f"{STATUS_EMOJI.get(s, '⚪')} {s}" if pd.notna(s) else "—"
             )
@@ -2265,28 +2380,23 @@ elif tab_side == "🔍 Research":
                 st.info("No players match the current filters.")
             else:
                 st.caption(f"{len(filtered_inj)} players")
-                display_cols = ["Tracked", "player", "Team Logo", "team"]
+                # Standard player table (see render_player_table): no
+                # Opp column here - an injury report isn't about a game.
+                display_cols = ["player", "team"]
                 if "position" in filtered_inj.columns:
                     display_cols.append("position")
-                display_cols += ["Status", "report_primary_injury", "practice_status"]
+                display_cols += ["Status", "report_primary_injury", "practice_status", "Tracked"]
                 rename_map = {
                     "player": "Player", "team": "Team", "position": "Pos",
                     "report_primary_injury": "Injury", "practice_status": "Practice",
                 }
                 shown = filtered_inj[display_cols].rename(columns=rename_map)
-                st.dataframe(
-                    shown, width="content", hide_index=True, row_height=44,
-                    column_config={
-                        "Tracked": st.column_config.TextColumn(width="small"),
-                        "Player": st.column_config.TextColumn(width=200),
-                        "Team Logo": st.column_config.ImageColumn(" ", width=70),
-                        "Team": st.column_config.TextColumn(width="small"),
-                        "Pos": st.column_config.TextColumn(width="small"),
-                        "Status": st.column_config.TextColumn(width=140),
-                        "Injury": st.column_config.TextColumn(width=180),
-                        "Practice": st.column_config.TextColumn(width=240),
-                    },
-                )
+                render_player_table(shown, column_config={
+                    "Tracked": st.column_config.TextColumn(width="small"),
+                    "Status": st.column_config.TextColumn(width=140),
+                    "Injury": st.column_config.TextColumn(width=180),
+                    "Practice": st.column_config.TextColumn(width=240),
+                })
                 st.caption(
                     "🔴 Out  🟠 Doubtful  🟡 Questionable  ⚪ other designation (e.g. Probable). "
                     "✅ Tracked = one of this app's auto-tracked starters."
@@ -2677,6 +2787,7 @@ elif tab_side == "🎯 Props":
                     "headshot_url": first_row.get("headshot_url"),
                     "team_color": first_row.get("team_color") or "#444444",
                     "opponent": opponent_text,
+                    "opp_team": opp_row["opponent"].iloc[0] if not opp_row.empty else None,
                     "kickoff": kickoff,
                     "first_td_pct": first_pct,
                     "anytime_td_pct": anytime_pct,
@@ -2726,23 +2837,20 @@ elif tab_side == "🎯 Props":
 
                     st.markdown("##### Full board")
                     display_cols = filtered[[
-                        "player", "team", "position", "opponent", "kickoff",
+                        "headshot_url", "player", "position", "team", "opp_team", "kickoff",
                         "first_td_pct", "anytime_td_pct", "share_of_anytime", "season_tds", "tds_per_game",
                     ]].rename(columns={
-                        "player": "Player", "team": "Team", "position": "Pos", "opponent": "Opponent",
-                        "kickoff": "Kickoff", "first_td_pct": "First TD %", "anytime_td_pct": "Anytime TD %",
-                        "share_of_anytime": "Share of Anytime %", "season_tds": f"{CURRENT_SEASON} TDs",
-                        "tds_per_game": "TDs/Game",
+                        "headshot_url": "Headshot", "player": "Player", "team": "Team", "position": "Pos",
+                        "opp_team": "Opp", "kickoff": "Kickoff", "first_td_pct": "First TD %",
+                        "anytime_td_pct": "Anytime TD %", "share_of_anytime": "Share of Anytime %",
+                        "season_tds": f"{CURRENT_SEASON} TDs", "tds_per_game": "TDs/Game",
                     })
-                    st.dataframe(
-                        display_cols, width="content", hide_index=True, row_height=38,
-                        column_config={
-                            "First TD %": st.column_config.NumberColumn(format="%.0f%%"),
-                            "Anytime TD %": st.column_config.NumberColumn(format="%.0f%%"),
-                            "Share of Anytime %": st.column_config.NumberColumn(format="%.0f%%"),
-                            "TDs/Game": st.column_config.NumberColumn(format="%.2f"),
-                        },
-                    )
+                    render_player_table(display_cols, column_config={
+                        "First TD %": st.column_config.NumberColumn(format="%.0f%%"),
+                        "Anytime TD %": st.column_config.NumberColumn(format="%.0f%%"),
+                        "Share of Anytime %": st.column_config.NumberColumn(format="%.0f%%"),
+                        "TDs/Game": st.column_config.NumberColumn(format="%.2f"),
+                    })
                     st.caption(
                         "**Share of Anytime %** compares a player's chance to score *first* with his chance to score "
                         "*at all*. Example: a 10% first-TD chance ÷ a 40% anytime chance = 25%. A high number "
@@ -3223,6 +3331,7 @@ elif tab_side == "🔥 Hot Picks":
     hp_defense_ranks = get_defense_ranks()
     hp_schedule = get_schedule()
     hp_next_opp_map = build_next_opponent_map(hp_schedule)
+    hp_opp_lookup = dict(zip(hp_next_opp_map["team"], hp_next_opp_map["opponent"]))  # team -> this week's opponent
     hp_prop_lines = get_prop_lines()
     hp_anytime_td = get_anytime_td_odds()
     hp_first_td = get_first_td_odds()
@@ -3650,14 +3759,12 @@ elif tab_side == "🔥 Hot Picks":
             axis=1,
         )
         edge_df["Opportunity"] = edge_df["opportunity_trend"].apply(opportunity_trend_text)
-        edge_display = edge_df[["player", "team", "position", "stat", "season_avg", "prop_line", "edge", "direction", "Confidence", "Implied Total", "Fair Prob", "Opportunity"]].rename(columns={
-            "player": "Player", "team": "Team", "position": "Pos", "stat": "Stat",
+        edge_df["opp"] = edge_df["team"].map(hp_opp_lookup)
+        edge_display = edge_df[["headshot_url", "player", "position", "team", "opp", "stat", "season_avg", "prop_line", "edge", "direction", "Confidence", "Implied Total", "Fair Prob", "Opportunity"]].rename(columns={
+            "headshot_url": "Headshot", "player": "Player", "team": "Team", "opp": "Opp", "position": "Pos", "stat": "Stat",
             "season_avg": f"{CURRENT_SEASON} Avg", "prop_line": "Prop Line", "edge": "Edge", "direction": "Direction",
         })
-        st.dataframe(
-            edge_display, width="content", hide_index=True, row_height=38,
-            column_config={"Edge": st.column_config.NumberColumn(format="%+.1f")},
-        )
+        render_player_table(edge_display, column_config={"Edge": st.column_config.NumberColumn(format="%+.1f")})
 
     st.divider()
 
@@ -3736,17 +3843,15 @@ elif tab_side == "🔥 Hot Picks":
         td_df["Confidence"] = td_df["confidence"].apply(_confidence_label_text)
         td_df["Implied Total"] = td_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
         td_df["Opportunity"] = td_df["opportunity_trend"].apply(opportunity_trend_text)
-        td_display = td_df[["player", "team", "position", "anytime_td_pct", "first_td_pct", "Confidence", "Implied Total", "Opportunity"]].rename(columns={
-            "player": "Player", "team": "Team", "position": "Pos",
+        td_df["opp"] = td_df["team"].map(hp_opp_lookup)
+        td_display = td_df[["headshot_url", "player", "position", "team", "opp", "anytime_td_pct", "first_td_pct", "Confidence", "Implied Total", "Opportunity"]].rename(columns={
+            "headshot_url": "Headshot", "player": "Player", "team": "Team", "opp": "Opp", "position": "Pos",
             "anytime_td_pct": "Anytime TD %", "first_td_pct": "First TD %",
         })
-        st.dataframe(
-            td_display, width="content", hide_index=True, row_height=38,
-            column_config={
-                "Anytime TD %": st.column_config.NumberColumn(format="%.0f%%"),
-                "First TD %": st.column_config.NumberColumn(format="%.0f%%"),
-            },
-        )
+        render_player_table(td_display, column_config={
+            "Anytime TD %": st.column_config.NumberColumn(format="%.0f%%"),
+            "First TD %": st.column_config.NumberColumn(format="%.0f%%"),
+        })
 
     st.divider()
 
@@ -3800,11 +3905,12 @@ elif tab_side == "🔥 Hot Picks":
         matchup_df["Implied Total"] = matchup_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
         matchup_df["Opportunity"] = matchup_df["opportunity_trend"].apply(opportunity_trend_text)
         matchup_df["Consistency (CV)"] = matchup_df["cv"].apply(lambda c: f"{c:.2f}" if pd.notna(c) else "—")
-        matchup_display = matchup_df[["player", "team", "position", "Consistency (CV)", "matchup_label", "season_avg_ppr", "Implied Total", "Opportunity"]].rename(columns={
-            "player": "Player", "team": "Team", "position": "Pos",
+        matchup_df["opp"] = matchup_df["team"].map(hp_opp_lookup)
+        matchup_display = matchup_df[["headshot_url", "player", "position", "team", "opp", "Consistency (CV)", "matchup_label", "season_avg_ppr", "Implied Total", "Opportunity"]].rename(columns={
+            "headshot_url": "Headshot", "player": "Player", "team": "Team", "opp": "Opp", "position": "Pos",
             "matchup_label": "Matchup", "season_avg_ppr": f"{CURRENT_SEASON} Avg PPR",
         })
-        st.dataframe(matchup_display, width="content", hide_index=True, row_height=38)
+        render_player_table(matchup_display)
 
     st.caption(
         "All percentages and betting lines come straight from the sportsbooks (including their built-in "
@@ -4112,10 +4218,6 @@ else:
             away, home = teams
             return home if pick.get("team") == away else away if pick.get("team") == home else None
 
-        def _logo(team):
-            url = team_logos.get(team) if team else None
-            return url if url is not None and pd.notna(url) else None
-
         hist_rows = []
         for p in sorted(all_picks, key=lambda x: (x["season"], x["week"], x["player"]), reverse=True):
             detail = p.get("detail", {})
@@ -4143,10 +4245,10 @@ else:
             clv_unit = "pts" if p["category"] == "edge" else "pp"
             hist_rows.append({
                 "Season": p["season"], "Week": p["week"], "Category": category_labels.get(p["category"], p["category"]),
-                "Headshot": sized_headshot(raw_headshot, 40) if raw_headshot and pd.notna(raw_headshot) else None,
+                "Headshot": raw_headshot if isinstance(raw_headshot, str) else None,
                 "Player": p["player"],
-                "Team": _logo(p["team"]),
-                "Opp": _logo(_pick_opponent(p)),
+                "Team": p["team"],
+                "Opp": _pick_opponent(p),
                 "Prediction": prediction,
                 "Actual": actual_text, "Result": p["status"],
                 "CLV": f"{pick_clv:+.1f} {clv_unit}" if pick_clv is not None else "—",
@@ -4159,19 +4261,8 @@ else:
         display_df = hist_df[hist_df["Result"].isin(result_filter)] if result_filter else hist_df
         if active_category:
             display_df = display_df[display_df["Category"] == category_labels[active_category]]
-        # Column order is the standard layout (Sep 2026): pick context
-        # first (season/week/category), then who (photo, name, team logo,
-        # opponent logo), then the call and how it turned out.
-        st.dataframe(
-            display_df, width="content", hide_index=True, row_height=38,
-            column_order=["Season", "Week", "Category", "Headshot", "Player", "Team", "Opp",
-                          "Prediction", "Actual", "Result", "CLV"],
-            column_config={
-                "Headshot": st.column_config.ImageColumn(width="small"),
-                "Team": st.column_config.ImageColumn("Team", width="small", help="Player's team"),
-                "Opp": st.column_config.ImageColumn("Opp", width="small", help="Opponent in that game"),
-            },
-        )
+        # The original standard player table - see render_player_table.
+        render_player_table(display_df, lead_cols=["Season", "Week", "Category"])
 
     if pick_tracker_store.using_local_fallback(st.secrets):
         st.caption(

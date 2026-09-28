@@ -278,6 +278,35 @@ def inject_css() -> None:
         font-variant-numeric: tabular-nums;
     }}
 
+    /* ---- Dashboard alerts: compact single-line notices ------------------- */
+    .dash-alert {{
+        display: flex; align-items: center; gap: 10px;
+        padding: 8px 14px; margin-bottom: 6px; border-radius: 4px;
+    }}
+    [data-testid="stMarkdownContainer"] .dash-alert-icon {{ font-size: 16px !important; flex-shrink: 0; }}
+    [data-testid="stMarkdownContainer"] .dash-alert-text {{ font-size: 14px !important; color: {INK}; }}
+
+    /* ---- Roster alerts strip (Lineups page) ------------------------------ */
+    [data-testid="stMarkdownContainer"] .ra-roster {{
+        font-family: {FONT_MONO}; font-size: 12px !important; font-weight: 600;
+        letter-spacing: .08em; text-transform: uppercase; color: {ACCENT};
+        margin: 12px 0 4px;
+    }}
+    [data-testid="stMarkdownContainer"] .ra-roster:first-child {{ margin-top: 0; }}
+    .ra-row {{
+        display: flex; align-items: center; gap: 10px;
+        padding: 5px 0; border-bottom: 1px solid {LINE};
+    }}
+    [data-testid="stMarkdownContainer"] .ra-pill {{
+        font-family: {FONT_MONO}; font-size: 11px !important; font-weight: 700;
+        padding: 2px 0; width: 104px; text-align: center; border-radius: 3px; flex-shrink: 0;
+    }}
+    .ra-bad {{ background: {BAD_SOFT}; color: {BAD}; border: 1px solid {BAD_BORDER}; }}
+    .ra-warn {{ background: {WARN_SOFT}; color: {WARN}; border: 1px solid {WARN_BORDER}; }}
+    .ra-bye {{ background: {SURFACE_2}; color: {SUB}; border: 1px solid {LINE}; }}
+    [data-testid="stMarkdownContainer"] .ra-name {{ font-size: 14px !important; font-weight: 700; color: {INK}; }}
+    [data-testid="stMarkdownContainer"] .ra-sub {{ font-size: 13px !important; color: {SUB}; }}
+
     /* ---- Header / wordmark ----------------------------------------------
        Typographic wordmark replacing the old raster logo image: set in the
        display face, so it's crisp at any size and needs no image asset. */
