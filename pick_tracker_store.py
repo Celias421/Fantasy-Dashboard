@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 LOCAL_FALLBACK_PATH = "data/tracked_picks_local.json"
 
-CATEGORIES = ["edge", "td_anytime", "td_first"]
+CATEGORIES = ["edge", "td_anytime", "td_first", "safe"]
 STATUSES = ["Pending", "Hit", "Miss", "Push"]
 
 _SHEETS_TIMEOUT_SECONDS = 15
@@ -219,6 +219,14 @@ def season_week_already_tracked(st_secrets, season: int, week: int) -> bool:
     page reload never double-tracks the same week's picks."""
     existing = load_picks(st_secrets)
     return any(p.get("season") == season and p.get("week") == week for p in existing)
+
+
+def tracked_categories(st_secrets, season: int, week: int) -> set:
+    """Which pick categories already have a snapshot for this (season,
+    week). Lets a category added later (e.g. Safe Plays, Sep 2026) start
+    tracking mid-week without re-saving the categories already saved."""
+    return {p.get("category") for p in load_picks(st_secrets)
+            if p.get("season") == season and p.get("week") == week}
 
 
 def using_local_fallback(st_secrets) -> bool:

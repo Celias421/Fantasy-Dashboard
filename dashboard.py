@@ -954,16 +954,27 @@ def render_hotpick_cards(rows: list, body_fn, cols_per_row: int = 4, headshot_px
                 st.markdown(card_html, unsafe_allow_html=True)
 
 
-def snapshot_hotpicks_for_tracking(edge_rows: list, td_rows: list, schedule_df: pd.DataFrame) -> None:
+# Safe Plays are scored "no disaster week": a Hit when the player scores at
+# least this share of his season average (PPR) at the time of the pick -
+# the same no_bust test the 2025 walk-forward backtest used.
+SAFE_PLAY_FLOOR_PCT = 0.5
+
+
+def snapshot_hotpicks_for_tracking(edge_rows: list, td_rows: list, schedule_df: pd.DataFrame, safe_rows: list = ()) -> None:
     """Silently save a snapshot of this week's Prop-Line Edge and TD
     Chance (Anytime + First) picks to the pick tracker, the first time
     the Hot Picks page loads after last week's snapshot - so Track
     Record can later check what actually happened. Idempotent per
     (season, week): season_week_already_tracked short-circuits every
     subsequent page load that same week, so reloading the page (or
-    several people opening it) never double-counts a week's picks. Safe
-    Plays isn't tracked - the user asked to track Prop Edges and TD
-    Chances specifically.
+    several people opening it) never double-counts a week's picks. The
+    check is per CATEGORY (pick_tracker_store.tracked_categories), so a
+    category added later starts tracking without re-saving the others.
+
+    Safe Plays (Sep 2026) are tracked too, scored on the same "no disaster
+    week" test the 2025 backtest used: a Hit if the player scores at least
+    SAFE_PLAY_FLOOR_PCT of his season average at the time of the pick.
+    They carry no price (not a bet), so they never enter profit.
 
     `edge_rows`/`td_rows` must be the FULL, unfiltered set (every
     position/team) - see the call site's comment for why a
@@ -974,10 +985,16 @@ def snapshot_hotpicks_for_tracking(edge_rows: list, td_rows: list, schedule_df: 
     week = int(upcoming["week"].min())
     season = CURRENT_SEASON
 
-    if pick_tracker_store.season_week_already_tracked(st.secrets, season, week):
+    already = pick_tracker_store.tracked_categories(st.secrets, season, week)
+    if {"edge", "td_anytime", "td_first", "safe"} <= already:
         return
 
     this_week = upcoming[upcoming["week"] == week]
+    # Skip games already under way: a pick saved after kickoff isn't a
+    # prediction. (Games with no posted time yet are kept.)
+    kickoffs = _game_kickoff_timestamps(schedule_df)
+    now_et = _now_eastern()
+    this_week = this_week[[not (kickoffs.get(g) is not None and now_et >= kickoffs[g]) for g in this_week["game_id"]]]
     team_game = {}
     for _, g in this_week.iterrows():
         kickoff = format_kickoff(g.get("gameday"), g.get("gametime"))
@@ -1027,8 +1044,31 @@ def snapshot_hotpicks_for_tracking(edge_rows: list, td_rows: list, schedule_df: 
                 "game_id": game[0], "kickoff": game[1], "status": "Pending", "actual": {}, "resolved_at": "",
             })
 
+    for row in safe_rows:
+        game = team_game.get(row["team"])
+        if not game or row.get("season_avg_ppr") is None:
+            continue
+        avg = float(row["season_avg_ppr"])
+        new_picks.append({
+            "id": str(uuid.uuid4()), "season": season, "week": week, "category": "safe",
+            "player": row["player"], "player_id": row.get("player_id", ""),
+            "team": row["team"], "position": row["position"],
+            "detail": {"season_avg_ppr": round(avg, 1), "floor_ppr": round(avg * SAFE_PLAY_FLOOR_PCT, 1),
+                       "cv": round(float(row["cv"]), 3) if row.get("cv") is not None else None},
+            "game_id": game[0], "kickoff": game[1], "status": "Pending", "actual": {}, "resolved_at": "",
+        })
+
+    # Only categories not yet saved for this week - never double-count.
+    new_picks = [p for p in new_picks if p["category"] not in already]
     if new_picks:
         pick_tracker_store.add_picks(st.secrets, new_picks)
+
+
+def _now_eastern() -> pd.Timestamp:
+    """Current time in US Eastern, tz-naive - nflverse game times are
+    Eastern, and the hosted server's clock is UTC (comparing the two
+    directly was 4-5 hours off)."""
+    return pd.Timestamp.now(tz="America/New_York").tz_localize(None)
 
 
 def _game_kickoff_timestamps(schedule_df: pd.DataFrame) -> dict:
@@ -1083,7 +1123,7 @@ def update_closing_lines(picks: list, prop_lines_df: pd.DataFrame, anytime_td_df
         return
 
     kickoffs = _game_kickoff_timestamps(schedule_df)
-    now = pd.Timestamp.now()
+    now = _now_eastern()
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     updated = []
@@ -1160,15 +1200,35 @@ def resolve_pending_picks() -> tuple:
     if not resolvable:
         return 0, len(pending)
 
+    def _stats_ready(df):
+        # (week, team) pairs that have ANY stat rows. nflverse publishes
+        # weekly stats a few hours to a day after the final score, so a
+        # final game with no rows yet for that team means "not published",
+        # not "player did nothing" - those picks wait instead of being
+        # wrongly marked Miss.
+        return set(zip(df["season"], df["week"], df["team"])) if not df.empty else set()
+
+    def _key(p):
+        return (p.get("season"), p["week"], p.get("team"))
+
+    # All loaded seasons (not just the current one), so a pick still
+    # pending when the season rolls over can still be graded.
     stats_df = get_stats()
-    stats_df = stats_df[stats_df["season"] == CURRENT_SEASON]
+    ready = _stats_ready(stats_df)
+    if any(_key(p) not in ready for p in resolvable if p["category"] != "td_first"):
+        get_stats.clear()  # cached up to an hour - pull fresh once
+        stats_df = get_stats()
+        ready = _stats_ready(stats_df)
     first_td_df = get_first_td_scorers()
     first_td_by_game = first_td_df.set_index("game_id")["first_td_player_id"].to_dict() if not first_td_df.empty else {}
 
     updated = []
     for pick in resolvable:
+        if pick["category"] != "td_first" and _key(pick) not in ready:
+            continue  # stats not published yet - leave Pending, check again later
         actual_row = stats_df[
             (stats_df["player_id"] == pick["player_id"]) & (stats_df["week"] == pick["week"])
+            & (stats_df["season"] == pick.get("season", CURRENT_SEASON))
         ] if pick.get("player_id") else pd.DataFrame()
 
         if pick["category"] == "edge":
@@ -1193,6 +1253,17 @@ def resolve_pending_picks() -> tuple:
                       int(actual_row.get("receiving_tds", pd.Series([0])).fillna(0).iloc[0])
                 status = "Hit" if tds > 0 else "Miss"
                 actual = {"actual_tds": tds}
+
+        elif pick["category"] == "safe":
+            floor = (pick.get("detail") or {}).get("floor_ppr")
+            if actual_row.empty or "fantasy_points_ppr" not in actual_row.columns or floor is None:
+                # Team's stats are in but he has no line: he didn't play.
+                # You'd have benched him, so it doesn't count either way.
+                status, actual = "Push", {"note": "Did not play"}
+            else:
+                pts = float(actual_row["fantasy_points_ppr"].fillna(0).iloc[0])
+                status = "Hit" if pts >= float(floor) else "Miss"
+                actual = {"actual_ppr": round(pts, 1)}
 
         else:  # td_first
             scorer_id = first_td_by_game.get(pick.get("game_id"))
@@ -1313,6 +1384,151 @@ def compute_clv_summary(picks: list) -> dict:
     return {cat: {"avg_clv": sum(vals) / len(vals), "n": len(vals)} for cat, vals in buckets.items()}
 
 
+# ---- Historical views (Sep 2026) ----
+# Pure functions over the saved picks list - Track Record's season
+# selector, season-so-far lines, week-by-week table, position scorecard
+# and season comparison all come from these. Kept free of Streamlit so
+# they're unit-tested (tests/test_history.py).
+CATEGORY_LABELS = {"edge": "Prop Edge", "td_anytime": "Anytime TD", "td_first": "First TD", "safe": "Safe Play"}
+BET_CATEGORIES = ("edge", "td_anytime", "td_first")   # have prices -> profit
+ALL_CATEGORIES = BET_CATEGORIES + ("safe",)
+POSITION_ORDER = ["QB", "RB", "WR", "TE"]
+
+
+def filter_picks_by_season(picks: list, season) -> list:
+    """season=None means all seasons."""
+    return list(picks) if season is None else [p for p in picks if p.get("season") == season]
+
+
+def _record_text(hits: int, misses: int, pushes: int = 0) -> str:
+    return f"{hits}-{misses}" + (f"-{pushes}" if pushes else "")
+
+
+def compute_running_by_week(picks: list) -> pd.DataFrame:
+    """One row per (season, week, category) with that week's own record and
+    the running totals up to and including it: cum_rate (season-so-far hit
+    rate) and cum_profit (running $ at the flat stake; bets only). Running
+    totals restart each season. Columns: season, week, period, category,
+    week_hits, week_n, week_profit, cum_hits, cum_n, cum_rate, cum_profit."""
+    rows = []
+    for p in picks:
+        if p.get("status") not in ("Hit", "Miss", "Push") or p.get("category") not in CATEGORY_LABELS:
+            continue
+        prof = pick_profit(p) if p["category"] in BET_CATEGORIES else None
+        rows.append({"season": p["season"], "week": p["week"], "category": p["category"],
+                     "hit": p["status"] == "Hit", "scored": p["status"] in ("Hit", "Miss"),
+                     "profit": prof if prof is not None else 0.0, "priced": prof is not None})
+    cols = ["season", "week", "period", "category", "week_hits", "week_n", "week_profit", "week_priced",
+            "cum_hits", "cum_n", "cum_rate", "cum_profit", "cum_priced"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(rows)
+    wk = (df.groupby(["season", "week", "category"], as_index=False)
+            .agg(week_hits=("hit", "sum"), week_n=("scored", "sum"), week_profit=("profit", "sum"),
+                 week_priced=("priced", "sum"))
+            .sort_values(["season", "category", "week"]))
+    wk["cum_hits"] = wk.groupby(["season", "category"])["week_hits"].cumsum()
+    wk["cum_n"] = wk.groupby(["season", "category"])["week_n"].cumsum()
+    wk["cum_profit"] = wk.groupby(["season", "category"])["week_profit"].cumsum()
+    wk["cum_priced"] = wk.groupby(["season", "category"])["week_priced"].cumsum()
+    wk["cum_rate"] = (wk["cum_hits"] / wk["cum_n"].where(wk["cum_n"] > 0) * 100)
+    wk["period"] = wk["season"].astype(str) + " Wk " + wk["week"].astype(str)
+    wk["category"] = wk["category"].map(CATEGORY_LABELS)
+    return wk.sort_values(["season", "week", "category"])[cols].reset_index(drop=True)
+
+
+def _group_stats(group: list) -> dict:
+    hits = sum(1 for p in group if p["status"] == "Hit")
+    misses = sum(1 for p in group if p["status"] == "Miss")
+    pushes = sum(1 for p in group if p["status"] == "Push")
+    scored = hits + misses
+    priced = [pick_profit(p) for p in group if p.get("category") in BET_CATEGORIES]
+    priced = [x for x in priced if x is not None]
+    profit = sum(priced) if priced else None
+    return {"hits": hits, "misses": misses, "pushes": pushes, "n": scored,
+            "record": _record_text(hits, misses, pushes),
+            "hit_pct": hits / scored * 100 if scored else None,
+            "profit": profit, "roi": (profit / (PROFIT_STAKE * len(priced)) * 100) if priced else None}
+
+
+def compute_position_scorecard(picks: list) -> pd.DataFrame:
+    """Category x position record, hit %, $ profit and return over resolved
+    picks - the same (category, position) segments that drive Hot Picks'
+    Confidence badges, so this is where those badges come from."""
+    buckets: dict = {}
+    for p in picks:
+        if p.get("status") in ("Hit", "Miss", "Push") and p.get("category") in CATEGORY_LABELS:
+            buckets.setdefault((p["category"], p.get("position") or "—"), []).append(p)
+    rows = []
+    for (cat, pos), group in buckets.items():
+        st_ = _group_stats(group)
+        rows.append({"category": CATEGORY_LABELS[cat], "position": pos,
+                     "tier": confidence_tier(st_["hit_pct"] or 0, st_["n"]) if cat != "safe" else None,
+                     **st_})
+    cols = ["category", "position", "record", "hits", "misses", "pushes", "n", "hit_pct", "profit", "roi", "tier"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(rows)[cols]
+    df["_c"] = df["category"].map({v: i for i, v in enumerate(CATEGORY_LABELS.values())})
+    df["_p"] = df["position"].map({v: i for i, v in enumerate(POSITION_ORDER)}).fillna(9)
+    return df.sort_values(["_c", "_p"]).drop(columns=["_c", "_p"]).reset_index(drop=True)
+
+
+def compute_season_summary(picks: list) -> pd.DataFrame:
+    """One row per (season, category): record, hit %, profit, return."""
+    buckets: dict = {}
+    for p in picks:
+        if p.get("status") in ("Hit", "Miss", "Push") and p.get("category") in CATEGORY_LABELS:
+            buckets.setdefault((p["season"], p["category"]), []).append(p)
+    rows = [{"season": season, "category": CATEGORY_LABELS[cat], **_group_stats(g)}
+            for (season, cat), g in buckets.items()]
+    cols = ["season", "category", "record", "hits", "misses", "pushes", "n", "hit_pct", "profit", "roi"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(rows)[cols]
+    df["_c"] = df["category"].map({v: i for i, v in enumerate(CATEGORY_LABELS.values())})
+    return df.sort_values(["season", "_c"], ascending=[False, True]).drop(columns="_c").reset_index(drop=True)
+
+
+def compute_weekly_table(picks: list) -> pd.DataFrame:
+    """Week-by-week record per category plus that week's $ total (bets
+    only), newest week first - the "how did each week go" view."""
+    wk = compute_running_by_week(picks)
+    if wk.empty:
+        return pd.DataFrame()
+    out = []
+    for (season, week), g in wk.groupby(["season", "week"]):
+        row = {"Season": int(season), "Week": int(week)}
+        for label in CATEGORY_LABELS.values():
+            r = g[g["category"] == label]
+            if r.empty or int(r["week_n"].iloc[0]) == 0:
+                row[label] = "—"
+            else:
+                h, n = int(r["week_hits"].iloc[0]), int(r["week_n"].iloc[0])
+                row[label] = f"{h}-{n - h} ({h / n * 100:.0f}%)"
+        bet_rows = g[g["category"].isin([CATEGORY_LABELS[c] for c in BET_CATEGORIES])]
+        row["Week $"] = float(bet_rows["week_profit"].sum()) if bet_rows["week_priced"].sum() else None
+        out.append(row)
+    return pd.DataFrame(out).sort_values(["Season", "Week"], ascending=False).reset_index(drop=True)
+
+
+def _money_text(v) -> str:
+    """+$9.09 / −$10.00 / — (missing), same style as the History table."""
+    if v is None or pd.isna(v):
+        return "—"
+    return f"{'+' if v >= 0 else '−'}${abs(v):,.2f}"
+
+
+def _pct_text(v) -> str:
+    return "—" if v is None or pd.isna(v) else f"{v:+.1f}%"
+
+
+def _table_height(n_rows: int, cap: int = 24) -> int:
+    """st.dataframe height that shows every row (up to `cap`) with no
+    inner scrollbar - 35px rows + header + border."""
+    return 35 * (min(n_rows, cap) + 1) + 3
+
+
 def count_resolvable_picks(picks: list, schedule_df: pd.DataFrame) -> int:
     """How many still-Pending picks have a game that's already final -
     i.e. how many "🔄 Check results now" on Track Record would actually
@@ -1361,9 +1577,9 @@ def compute_segment_confidence(picks: list, min_n: int = CONFIDENCE_MIN_N) -> di
     (confidence_badge_html renders it, the Section 1/2 sort keys use the
     tier), so a segment that's actually been missing sinks toward the
     bottom of its list and one that's been hitting rises - without ever
-    hiding a pick outright. Safe Plays has no entry here on purpose (that
-    category isn't tracked in Track Record at all - "high consistency"
-    has no single hit/miss to score).
+    hiding a pick outright. Safe Plays ("safe") are tracked since Sep 2026
+    and land in their own ("safe", pos) keys here, but Hot Picks never
+    looks those up - they don't get a Confidence badge.
 
     Returns {(category, position): {"pct": float, "n": int, "tier": str}}
     - a missing key means zero resolved picks for that segment yet, which
@@ -2065,7 +2281,7 @@ if tab_side == "🏠 Dashboard":
     games_n = int((upcoming_games["week"] == next_week).sum()) if next_week is not None else 0
     kc2.metric(f"Week {next_week} games" if next_week is not None else "Games this week", games_n if next_week is not None else "—")
 
-    resolved_all = [p for p in home_picks if p["status"] != "Pending"]
+    resolved_all = [p for p in home_picks if p["status"] != "Pending" and p.get("category") in BET_CATEGORIES]
     overall_pct, overall_hits, overall_n = compute_hit_rate(resolved_all)
     kc3.metric(
         "Overall hit rate", f"{overall_pct:.0f}%" if overall_pct is not None else "—",
@@ -3330,8 +3546,9 @@ elif tab_side == "🔥 Hot Picks":
         f"for RBs\"). Once a group has at least **{CONFIDENCE_MIN_N} finished picks** it gets a label: 🔥 **Hot** "
         f"= hitting {CONFIDENCE_HIGH_PCT:.0f}% or more, 🧊 **Cold** = hitting {CONFIDENCE_LOW_PCT:.0f}% or less, "
         f"➖ **Even** = in between. Under {CONFIDENCE_MIN_N} finished picks it shows 🆕 **New** - too early to "
-        f"judge. Hot groups move up the lists and cold ones move down, but **nothing is ever hidden**. Safe "
-        f"Plays don't get this badge because they aren't win-or-lose picks."
+        f"judge. Hot groups move up the lists and cold ones move down, but **nothing is ever hidden**. Only "
+        f"**this season's** picks count, so each new season starts fresh. The full breakdown is on Track "
+        f"Record → **By position**. Safe Plays are tracked there too, but don't get this badge."
     )
     )
     _guide_1 = (
@@ -3409,7 +3626,11 @@ elif tab_side == "🔥 Hot Picks":
     # live on every page load (automatic rollout, per the user's choice) and
     # bucket hit rate by (category, position). Used below to re-SORT and
     # BADGE Sections 1/2 and Suggested Bets - never to filter/hide anything.
-    hp_segment_confidence = compute_segment_confidence(pick_tracker_store.load_picks(st.secrets))
+    # Current season only (Sep 2026): last year's segments shouldn't carry
+    # badges into a new year of rosters and roles.
+    hp_segment_confidence = compute_segment_confidence(
+        filter_picks_by_season(pick_tracker_store.load_picks(st.secrets), CURRENT_SEASON)
+    )
     # Vegas-implied team totals for this week (see build_team_implied_totals'
     # docstring for the spread/total math) - a second re-ranking signal
     # alongside confidence, this one about THIS week's specific game
@@ -3554,7 +3775,9 @@ elif tab_side == "🔥 Hot Picks":
     # applying the position/team display filter below - see the loop's
     # comment above for why. A no-op after the first page load of the
     # week (season_week_already_tracked short-circuits it).
-    snapshot_hotpicks_for_tracking(edge_rows, td_rows, get_schedule())
+    # Safe Plays: the same top-15 list the page shows (steadiest first).
+    safe_track_rows = sorted(matchup_rows, key=lambda r: r["cv"] if r.get("cv") is not None else 9)[:15]
+    snapshot_hotpicks_for_tracking(edge_rows, td_rows, get_schedule(), safe_track_rows)
 
     # Opportunistic Closing Line Value capture - re-stamps every still-
     # Pending pick's "closing" line/probability from this same page
@@ -3698,8 +3921,8 @@ elif tab_side == "🔥 Hot Picks":
             # Confidence badge: edge's segment takes priority (it's the
             # more specific claim - an exact stat line vs. a TD market),
             # then TD's driving category, then none for a matchup-only row
-            # (Safe Plays isn't tracked in Track Record, so there's no
-            # segment to look up). Informational only - this panel keeps
+            # (Safe Plays are tracked, but aren't a bet type and never
+            # get a Confidence badge). Informational only - this panel keeps
             # its existing alphabetical (position, player) sort below.
             conf_segment = None
             if edge:
@@ -3941,7 +4164,9 @@ elif tab_side == "🔥 Hot Picks":
         f"game. To make the list, a player's weekly score typically stays within about "
         f"{CONSISTENCY_HIGH_CV:.0%} of his average, over at least {MIN_GAMES_FOR_CONSISTENCY} games. Steadiest "
         f"first. The matchup is shown for context only - when we tested this against the entire 2025 "
-        f"season, the matchup didn't help predict who would come through."
+        f"season, the matchup didn't help predict who would come through. These are tracked on Track "
+        f"Record: a Safe Play counts as a hit if he scores at least {SAFE_PLAY_FLOOR_PCT:.0%} of his "
+        f"season average (no disaster week)."
     )
     if not matchup_rows:
         st.info("No players currently have a High consistency rating with an upcoming game.")
@@ -4008,64 +4233,59 @@ else:
     # whatever's been snapshotted and resolved so far.
     st.subheader("📊 Track Record")
     st.caption(
-        "Every Prop-Line Edge and TD pick from Hot Picks is saved automatically the first time Hot Picks "
-        "is opened each week, along with its odds at that moment. After the games are over, click **Check "
-        "results now** and each pick is marked **Hit** or **Miss** based on what actually happened - and "
-        "the page shows what betting every pick would have won or lost. Safe Plays aren't tracked here - "
-        "\"this player is steady\" isn't a bet that clearly wins or loses."
+        "Every Prop Edge, TD pick and Safe Play from Hot Picks is saved automatically the first time Hot Picks "
+        "is opened each week (before kickoff), along with its odds at that moment. After the games, click "
+        "**Check results now** and each pick is marked **Hit** or **Miss** based on what actually happened. "
+        "Pick a season below to see how it's going - or **All seasons** for the long-run picture."
     )
 
-    if st.button("🔄 Check results now"):
+    all_picks = pick_tracker_store.load_picks(st.secrets)
+    category_labels = CATEGORY_LABELS
+    category_order = list(CATEGORY_LABELS.values())
+    category_colors = theme.CATEGORY_COLORS
+
+    # ---- Season selector + Check results (one row) ----
+    # Defaults to the current season so the numbers describe THIS year's
+    # logic; "All seasons" is the long-run view. Every tile, chart and
+    # table below follows this choice.
+    pick_seasons = sorted({int(p["season"]) for p in all_picks} | {CURRENT_SEASON}, reverse=True)
+    season_options = [str(s) for s in pick_seasons] + ["All seasons"]
+    if st.session_state.get("tr_season") not in season_options:
+        st.session_state["tr_season"] = str(CURRENT_SEASON)
+    sel_col, check_col = st.columns([3, 1], vertical_alignment="bottom")
+    with sel_col:
+        season_choice = st.segmented_control("Season", season_options, key="tr_season") or str(CURRENT_SEASON)
+    with check_col:
+        check_clicked = st.button("🔄 Check results now", use_container_width=True)
+    if check_clicked:
         resolved, still_pending = resolve_pending_picks()
         if resolved:
-            st.success(f"Resolved {resolved} pick(s) against final scores. {still_pending} still waiting on a final score.")
+            st.success(f"Graded {resolved} pick(s). {still_pending} still waiting on a final score or stats.")
         elif still_pending:
-            st.info(f"Nothing newly final yet - {still_pending} pick(s) still waiting on a final score.")
+            st.info(f"Nothing new to grade yet - {still_pending} pick(s) are waiting on a final score, or on "
+                    f"the game's stats being published (usually a few hours to a day after it ends).")
         else:
             st.info("No pending picks to check.")
         st.rerun()
 
-    all_picks = pick_tracker_store.load_picks(st.secrets)
+    view_season = None if season_choice == "All seasons" else int(season_choice)
+    view_picks = filter_picks_by_season(all_picks, view_season)
+    season_phrase = "across all seasons" if view_season is None else f"in {view_season}"
 
-    if not all_picks:
-        st.info("No picks tracked yet - check back after the Hot Picks page has loaded at least once this week.")
+    if not view_picks:
+        st.info(
+            f"No picks tracked {season_phrase} yet - they're saved automatically the first time Hot Picks "
+            f"is opened each week."
+        )
     else:
-        resolved_picks = [p for p in all_picks if p["status"] != "Pending"]
-        pending_count = len(all_picks) - len(resolved_picks)
-
-        edge_pct, edge_hits, edge_n = compute_hit_rate(resolved_picks, "edge")
-        any_pct, any_hits, any_n = compute_hit_rate(resolved_picks, "td_anytime")
-        first_pct, first_hits, first_n = compute_hit_rate(resolved_picks, "td_first")
-
-        category_labels = {"edge": "Prop Edge", "td_anytime": "Anytime TD", "td_first": "First TD"}
-        category_order = ["Prop Edge", "Anytime TD", "First TD"]
-        # Fixed-order categorical colors for the 3 tracked pick categories,
-        # reusing 3 of the 4 already-validated colorblind-safe hues from
-        # POSITION_COLORS (see that dict's own comment) rather than picking
-        # new ones - these never share a chart with positions, so reuse is
-        # safe, and it keeps this page visually related to Hot Picks
-        # without literally reusing the anytime/first-TD pair (ACCENT vs
-        # WARN), which fails the palette validator's CVD-separation check.
-        category_colors = theme.CATEGORY_COLORS
-        # Player headshot + team color/logo lookups, same source as every
-        # other card on the site (get_meta merges rosters + team colors by
-        # player name; team_logos is the module-level team_abbr -> logo
-        # Series built once near team_logo_html). Tracked picks only store
-        # player/team/position, not display info, so this join is what
-        # lets the History table and Most Recent Picks cards show photos.
+        resolved_picks = [p for p in view_picks if p["status"] != "Pending"]
+        pending_count = len(view_picks) - len(resolved_picks)
+        # Player headshot + team lookups for the cards and History table.
         tr_meta = get_meta().drop_duplicates(subset="player").set_index("player")
 
-        # Clicking a tile filters the History table below to just that
-        # category (Pending instead sets the Result filter to Pending
-        # only) - a second click on the SAME tile clears it. This has to
-        # go through session_state in an on_click callback, not a plain
-        # "if st.button(...):" check, for the same reason jump_to_game_center
-        # and _home_jump do: the History table's "Result" multiselect
-        # (key="tr_result_filter") gets instantiated further down in this
-        # same script pass, and reassigning an already-instantiated
-        # widget's session_state key mid-script raises
-        # StreamlitWidgetAlreadyInstantiatedError. A callback runs BEFORE
-        # the next rerun, so it's always safe.
+        # Clicking a tile filters the History table below to that category
+        # (Pending sets the Result filter instead); a second click clears it.
+        # Must be on_click callbacks - see jump_to_game_center for why.
         def _toggle_category_filter(category: str) -> None:
             current = st.session_state.get("tr_category_filter")
             st.session_state["tr_category_filter"] = None if current == category else category
@@ -4077,58 +4297,43 @@ else:
         active_category = st.session_state.get("tr_category_filter")
         pending_is_active = active_category is None and st.session_state.get("tr_result_filter") == ["Pending"]
 
-        m1, m2, m3, m4 = st.columns(4)
-        with m1:
-            st.metric("Prop Edges", f"{edge_pct:.0f}%" if edge_pct is not None else "—", f"{edge_hits}/{edge_n} resolved" if edge_n else "no results yet", delta_color="off")
+        # ---- Hit-rate tiles ----
+        tile_cols = st.columns(5)
+        tile_defs = [("edge", "Prop Edges"), ("td_anytime", "Anytime TD"), ("td_first", "First TD"), ("safe", "Safe Plays")]
+        for col, (cat, label) in zip(tile_cols, tile_defs):
+            with col:
+                pct, hits, n = compute_hit_rate(resolved_picks, cat)
+                st.metric(label, f"{pct:.0f}%" if pct is not None else "—",
+                          f"{hits}-{n - hits} record" if n else "no results yet", delta_color="off", delta_arrow="off")
+                st.button(
+                    "Filter", use_container_width=True, key=f"tr_tile_{cat}",
+                    type="primary" if active_category == cat else "secondary",
+                    on_click=_toggle_category_filter, args=(cat,), help=f"Show only {label} in History",
+                )
+        with tile_cols[4]:
+            st.metric("Pending", pending_count, "waiting on games" if pending_count else "all graded",
+                      delta_color="off", delta_arrow="off")
             st.button(
-                "Show only Prop Edges", use_container_width=True, key="tr_tile_edge",
-                type="primary" if active_category == "edge" else "secondary",
-                on_click=_toggle_category_filter, args=("edge",),
-            )
-        with m2:
-            st.metric("Anytime TD", f"{any_pct:.0f}%" if any_pct is not None else "—", f"{any_hits}/{any_n} resolved" if any_n else "no results yet", delta_color="off")
-            st.button(
-                "Show only Anytime TD", use_container_width=True, key="tr_tile_anytime",
-                type="primary" if active_category == "td_anytime" else "secondary",
-                on_click=_toggle_category_filter, args=("td_anytime",),
-            )
-        with m3:
-            st.metric("First TD", f"{first_pct:.0f}%" if first_pct is not None else "—", f"{first_hits}/{first_n} resolved" if first_n else "no results yet", delta_color="off")
-            st.button(
-                "Show only First TD", use_container_width=True, key="tr_tile_first",
-                type="primary" if active_category == "td_first" else "secondary",
-                on_click=_toggle_category_filter, args=("td_first",),
-            )
-        with m4:
-            st.metric("Pending", pending_count)
-            st.button(
-                "Show only Pending", use_container_width=True, key="tr_tile_pending",
+                "Filter", use_container_width=True, key="tr_tile_pending",
                 type="primary" if pending_is_active else "secondary",
-                on_click=_filter_to_pending,
+                on_click=_filter_to_pending, help="Show only Pending picks in History",
             )
 
-        # ---- Profit at a flat $10 a pick (Sep 2026) ----
-        # Hit rate alone can mislead (55% at -130 still loses money), so
-        # this shows what the picks would actually have made at the price
-        # recorded when each was saved.
+        # ---- Profit at a flat $10 a pick ----
+        # Hit rate alone can mislead (55% at -130 still loses money). Safe
+        # Plays aren't bets, so they have no profit.
         st.markdown(f"###### 💵 Profit at ${PROFIT_STAKE:.0f} a pick")
-        pf1, pf2, pf3 = st.columns(3)
+        pf1, pf2, pf3, pf_info = st.columns([1, 1, 1, 1], vertical_alignment="center")
         for col, cat, label in ((pf1, "edge", "Prop Edges"), (pf2, "td_anytime", "Anytime TD"), (pf3, "td_first", "First TD")):
             with col:
-                pr = compute_profit(all_picks, cat)
+                pr = compute_profit(view_picks, cat)
                 if pr["n"]:
                     sign = "+" if pr["profit"] >= 0 else "−"
                     st.metric(label, f"{sign}${abs(pr['profit']):,.2f}",
                               f"{pr['roi']:+.1f}% return · {pr['n']} bet{'s' if pr['n'] != 1 else ''}", delta_color="normal")
                 else:
                     st.metric(label, "—", "no priced results yet", delta_color="off")
-        unpriced_total = sum(compute_profit(all_picks, c)["unpriced"] for c in ("edge", "td_anytime", "td_first"))
-        profit_note_col, profit_info_col = st.columns([5, 1])
-        with profit_note_col:
-            if unpriced_total:
-                st.caption(f"{unpriced_total} finished pick(s) were saved before prices were recorded, so they're "
-                           f"left out of profit (they still count toward hit rate).")
-        with profit_info_col:
+        with pf_info:
             theme.info_popover(
                 f"**Profit** shows what you'd have won or lost betting **${PROFIT_STAKE:.0f} on every pick** in "
                 f"that category.\n\n"
@@ -4139,22 +4344,21 @@ else:
                 f"- **Return** is profit ÷ total bet. Anything above 0% beat the sportsbooks' built-in cut.\n\n"
                 f"Why this matters: hit rate alone can fool you. At -130 odds you need to win 56.5% just to "
                 f"break even, so a 55% hit rate would still lose money.\n\n"
+                f"Safe Plays aren't bets, so they don't have a profit number - just a hit rate.\n\n"
                 f"Note: every player with touchdown odds is tracked in the two TD categories, not just the best "
                 f"ones, so those mostly show how the betting market itself does - expect a small loss there.",
                 label="ℹ️ About profit", use_container_width=True,
             )
+        unpriced_total = sum(compute_profit(view_picks, c)["unpriced"] for c in BET_CATEGORIES)
+        if unpriced_total:
+            st.caption(f"{unpriced_total} finished pick(s) were saved before prices were recorded, so they're "
+                       f"left out of profit (they still count toward hit rate).")
 
         # ---- Closing Line Value ----
-        # Independent of hit rate above - this measures whether the
-        # market itself moved toward agreeing with each pick, not
-        # whether it actually hit. See compute_clv's docstring for the
-        # full explanation and the units (points for Prop Edge,
-        # percentage points for the two TD categories - never combined
-        # into one blended number since they're not the same unit).
-        clv_summary = compute_clv_summary(all_picks)
+        clv_summary = compute_clv_summary(view_picks)
         if clv_summary:
             st.markdown("###### 📉 Closing Line Value")
-            clv1, clv2, clv3 = st.columns(3)
+            clv1, clv2, clv3, clv_info = st.columns([1, 1, 1, 1], vertical_alignment="center")
             clv_cols = {"edge": (clv1, "Prop Edge", "pts"), "td_anytime": (clv2, "Anytime TD", "pp"), "td_first": (clv3, "First TD", "pp")}
             for cat, (col, label, unit) in clv_cols.items():
                 with col:
@@ -4163,129 +4367,182 @@ else:
                         st.metric(f"{label} avg CLV", f"{seg['avg_clv']:+.1f} {unit}", f"{seg['n']} tracked", delta_color="off")
                     else:
                         st.metric(f"{label} avg CLV", "—", "no closing lines captured yet", delta_color="off")
-            theme.info_popover(
-                "**Closing Line Value (CLV) - did the betting market end up agreeing with us?**\n\n"
-                "After we make a pick, the sportsbook's line keeps moving until kickoff as bets come in. "
-                "If it moves *toward* our pick - say we picked Over 60.5 yards and the line rises to "
-                "64.5 - that's a positive number: the market came around to our side. If it moves away, "
-                "it's negative. For touchdown picks it's the change in the scoring chance, in "
-                "percentage points.\n\n"
-                "Serious bettors watch this closely because it shows skill over the long run, even in "
-                "weeks when the results themselves are just bad luck.\n\n"
-                "One note: the \"closing\" line here is the last line the app saw before kickoff - close "
-                "to the final line, but not exact. If nobody opened the app between the pick and "
-                "kickoff, that pick has no CLV.",
-                label="ℹ️ About Closing Line Value",
-            )
+            with clv_info:
+                theme.info_popover(
+                    "**Closing Line Value (CLV) - did the betting market end up agreeing with us?**\n\n"
+                    "After we make a pick, the sportsbook's line keeps moving until kickoff as bets come in. "
+                    "If it moves *toward* our pick - say we picked Over 60.5 yards and the line rises to "
+                    "64.5 - that's a positive number: the market came around to our side. If it moves away, "
+                    "it's negative. For touchdown picks it's the change in the scoring chance, in "
+                    "percentage points.\n\n"
+                    "Serious bettors watch this closely because it shows skill over the long run, even in "
+                    "weeks when the results themselves are just bad luck.\n\n"
+                    "One note: the \"closing\" line here is the last line the app saw before kickoff - close "
+                    "to the final line, but not exact. If nobody opened the app between the pick and "
+                    "kickoff, that pick has no CLV.",
+                    label="ℹ️ About CLV", use_container_width=True,
+                )
 
         st.divider()
 
-        # ---- Trend + breakdown charts ----
-        # Built from resolved_picks only (Push excluded from the hit-rate
-        # line the same way compute_hit_rate excludes it everywhere else;
-        # the breakdown bar shows all three outcomes since that one IS
-        # about composition, not a rate).
-        chart_col1, chart_col2 = st.columns(2)
-        with chart_col1:
-            st.markdown("###### Hit rate by week")
-            scored_picks = [p for p in resolved_picks if p["status"] in ("Hit", "Miss")]
-            if not scored_picks:
-                st.caption("Not enough resolved picks yet to chart a trend.")
-            else:
-                trend_src = pd.DataFrame([
-                    {
-                        "season": p["season"], "week": p["week"],
-                        "period": f"{p['season']} Wk {p['week']}",
-                        "category": category_labels.get(p["category"], p["category"]),
-                        "hit": 1 if p["status"] == "Hit" else 0,
-                    }
-                    for p in scored_picks
-                ])
-                period_order = (
-                    trend_src[["season", "week", "period"]].drop_duplicates()
-                    .sort_values(["season", "week"])["period"].tolist()
-                )
-                trend_df = trend_src.groupby(["period", "category"], as_index=False).agg(hits=("hit", "sum"), n=("hit", "count"))
-                trend_df["hit_rate"] = trend_df["hits"] / trend_df["n"] * 100
-                trend_line = alt.Chart(trend_df).mark_line(point=alt.OverlayMarkDef(size=60), strokeWidth=2).encode(
-                    x=alt.X("period:N", title=None, sort=period_order),
-                    y=alt.Y("hit_rate:Q", title="Hit rate", scale=alt.Scale(domain=[0, 100])),
-                    color=alt.Color(
-                        "category:N", title=None, sort=category_order,
-                        scale=alt.Scale(domain=category_order, range=[category_colors[c] for c in category_order]),
-                        legend=alt.Legend(orient="top"),
-                    ),
-                    tooltip=[
-                        alt.Tooltip("period:N", title="Week"), alt.Tooltip("category:N", title="Category"),
-                        alt.Tooltip("hit_rate:Q", title="Hit rate", format=".0f"),
-                        alt.Tooltip("n:Q", title="Resolved picks"),
-                    ],
-                ).properties(height=260)
-                st.altair_chart(trend_line, use_container_width=True)
+        # ---- Historical views ----
+        running = compute_running_by_week(view_picks)
+        h_tabs = st.tabs(["📈 Season so far", "📅 Week by week", "🎯 By position", "🗂️ Season by season"])
 
-        with chart_col2:
-            st.markdown("###### Results by category")
-            breakdown_src = pd.DataFrame([
-                {"category": category_labels.get(p["category"], p["category"]), "Result": p["status"]}
-                for p in all_picks if p["status"] in ("Hit", "Miss", "Push")
-            ])
-            if breakdown_src.empty:
-                st.caption("Not enough resolved picks yet to chart a breakdown.")
+        with h_tabs[0]:
+            if running.empty:
+                st.caption("Charts appear once the first picks are graded.")
             else:
-                breakdown_df = breakdown_src.groupby(["category", "Result"], as_index=False).size().rename(columns={"size": "count"})
-                # Status colors (reserved - never reused for identity elsewhere
-                # on this page), same green/red the rest of the app already
-                # uses for Hit/Miss-shaped outcomes (delta-up/down, confidence
-                # badges), plus a neutral gray for Push.
-                breakdown_bar = alt.Chart(breakdown_df).mark_bar(cornerRadiusEnd=3).encode(
-                    x=alt.X("category:N", title=None, sort=category_order),
-                    y=alt.Y("count:Q", title="Resolved picks"),
-                    color=alt.Color(
-                        "Result:N", title=None, sort=["Hit", "Miss", "Push"],
-                        scale=alt.Scale(domain=["Hit", "Miss", "Push"], range=[theme.GOOD, theme.BAD, theme.SUB]),
-                        legend=alt.Legend(orient="top"),
-                    ),
-                    order=alt.Order("Result:N", sort="ascending"),
-                    tooltip=[alt.Tooltip("category:N", title="Category"), alt.Tooltip("Result:N", title="Result"), alt.Tooltip("count:Q", title="Count")],
-                ).properties(height=260)
-                breakdown_text = breakdown_bar.mark_text(color=theme.INK, fontWeight=600, dy=2).encode(
-                    text=alt.Text("count:Q"),
-                    order=alt.Order("Result:N", sort="ascending"),
+                period_order = running[["season", "week", "period"]].drop_duplicates().sort_values(["season", "week"])["period"].tolist()
+                cat_scale = alt.Scale(domain=category_order, range=[category_colors[c] for c in category_order])
+                x_enc = alt.X("period:N", title=None, sort=period_order, axis=alt.Axis(labelAngle=0 if len(period_order) <= 10 else -45))
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    st.markdown("###### Hit rate so far")
+                    rate_src = running[running["cum_n"] > 0]
+                    rate_line = alt.Chart(rate_src).mark_line(point=alt.OverlayMarkDef(size=60), strokeWidth=2).encode(
+                        x=x_enc,
+                        y=alt.Y("cum_rate:Q", title="Hit rate so far (%)", scale=alt.Scale(domain=[0, 100])),
+                        color=alt.Color("category:N", title=None, sort=category_order, scale=cat_scale, legend=alt.Legend(orient="top")),
+                        detail="season:N",
+                        tooltip=[
+                            alt.Tooltip("period:N", title="Through"), alt.Tooltip("category:N", title="Category"),
+                            alt.Tooltip("cum_rate:Q", title="Hit rate so far", format=".0f"),
+                            alt.Tooltip("cum_hits:Q", title="Hits so far"), alt.Tooltip("cum_n:Q", title="Graded so far"),
+                            alt.Tooltip("week_hits:Q", title="Hits this week"), alt.Tooltip("week_n:Q", title="Graded this week"),
+                        ],
+                    ).properties(height=280)
+                    fifty = alt.Chart(pd.DataFrame({"y": [50]})).mark_rule(color=theme.SUB, strokeDash=[4, 4]).encode(y="y:Q")
+                    st.altair_chart(fifty + rate_line, use_container_width=True)
+                with rc2:
+                    st.markdown(f"###### Running profit at ${PROFIT_STAKE:.0f} a pick")
+                    bet_labels = [category_labels[c] for c in BET_CATEGORIES]
+                    prof_src = running[running["category"].isin(bet_labels) & (running["cum_priced"] > 0)]
+                    if prof_src.empty:
+                        st.caption("No priced results yet - profit starts with picks saved after prices were recorded.")
+                    else:
+                        prof_line = alt.Chart(prof_src).mark_line(point=alt.OverlayMarkDef(size=60), strokeWidth=2).encode(
+                            x=x_enc,
+                            y=alt.Y("cum_profit:Q", title="Profit so far ($)"),
+                            color=alt.Color("category:N", title=None, sort=bet_labels,
+                                            scale=alt.Scale(domain=bet_labels, range=[category_colors[c] for c in bet_labels]),
+                                            legend=alt.Legend(orient="top")),
+                            detail="season:N",
+                            tooltip=[
+                                alt.Tooltip("period:N", title="Through"), alt.Tooltip("category:N", title="Category"),
+                                alt.Tooltip("cum_profit:Q", title="Profit so far", format="$,.2f"),
+                                alt.Tooltip("week_profit:Q", title="This week", format="$,.2f"),
+                            ],
+                        ).properties(height=280)
+                        zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=theme.SUB, strokeDash=[4, 4]).encode(y="y:Q")
+                        st.altair_chart(zero + prof_line, use_container_width=True)
+                st.caption(
+                    "Each point is the **running total up to that week**, so one bad week doesn't swing the line "
+                    "much once a few weeks are in. The dashed line is 50% (left) and break-even (right). Totals "
+                    "start over each season. Hover a point to see that week on its own."
                 )
-                st.altair_chart(breakdown_bar + breakdown_text, use_container_width=True)
+
+        with h_tabs[1]:
+            weekly = compute_weekly_table(view_picks)
+            if weekly.empty:
+                st.caption("Nothing graded yet.")
+            else:
+                weekly[f"Week $"] = weekly["Week $"].map(_money_text)
+                st.dataframe(
+                    weekly.rename(columns={"Week $": f"Week's ${PROFIT_STAKE:.0f}-a-pick total"}),
+                    hide_index=True, width="content", height=_table_height(len(weekly)),
+                    column_config={"Season": st.column_config.NumberColumn(format="%d")},
+                )
+                st.caption("Each cell is that week's record (hits-misses) and hit rate. The last column is what "
+                           "every bet that week would have won or lost together. Safe Plays aren't bets, so they "
+                           "aren't in it.")
+
+        with h_tabs[2]:
+            scorecard = compute_position_scorecard(view_picks)
+            if scorecard.empty:
+                st.caption("Nothing graded yet.")
+            else:
+                tier_text = {"high": "🔥 Hot", "neutral": "➖ Even", "low": "🧊 Cold", "new": f"🆕 Needs {CONFIDENCE_MIN_N}+"}
+                sc_display = pd.DataFrame({
+                    "Category": scorecard["category"], "Pos": scorecard["position"],
+                    "Record": scorecard["record"], "Hit %": scorecard["hit_pct"],
+                    f"${PROFIT_STAKE:.0f} P/L": scorecard["profit"].map(_money_text),
+                    "Return": scorecard["roi"].map(_pct_text),
+                    "Badge": scorecard["tier"].map(lambda t: tier_text.get(t, "—") if isinstance(t, str) else "—"),
+                })
+                st.dataframe(
+                    sc_display, hide_index=True, width="content", height=_table_height(len(sc_display)),
+                    column_config={
+                        "Hit %": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f%%"),
+                    },
+                )
+                st.caption(
+                    f"How each kind of pick has done at each position. This is where the **Confidence** badges on "
+                    f"Hot Picks come from: {CONFIDENCE_HIGH_PCT:.0f}%+ is Hot, {CONFIDENCE_LOW_PCT:.0f}% or less is "
+                    f"Cold, and a group needs {CONFIDENCE_MIN_N}+ graded picks before it gets a badge. Hot Picks "
+                    f"uses the current season only. Record is hits-misses(-pushes)."
+                )
+
+        with h_tabs[3]:
+            season_summary = compute_season_summary(all_picks)
+            if season_summary.empty:
+                st.caption("Nothing graded yet.")
+            else:
+                ss_display = pd.DataFrame({
+                    "Season": season_summary["season"].astype(int), "Category": season_summary["category"],
+                    "Record": season_summary["record"], "Hit %": season_summary["hit_pct"],
+                    f"${PROFIT_STAKE:.0f} P/L": season_summary["profit"].map(_money_text),
+                    "Return": season_summary["roi"].map(_pct_text),
+                })
+                st.dataframe(
+                    ss_display, hide_index=True, width="content", height=_table_height(len(ss_display)),
+                    column_config={
+                        "Season": st.column_config.NumberColumn(format="%d"),
+                        "Hit %": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f%%"),
+                    },
+                )
+                n_seasons = season_summary["season"].nunique()
+                st.caption(
+                    "Every season side by side (this table ignores the season picker)."
+                    + ("" if n_seasons > 1 else " It fills in as more seasons are tracked.")
+                )
 
         st.divider()
 
-        # ---- Most Recent Picks: headshot + team-logo cards, same large-card
-        # component (render_hotpick_cards/player_avatar_html) used on Hot
-        # Picks, Game Center, Lineup Optimizer and the First TD podium - so a
-        # tracked pick looks like the same site everywhere, per the standing
-        # "large card + headshot" consistency rule. Capped at 8 (2 rows of
-        # 4) and sorted most-recent-first; the full unfiltered list is still
-        # the History table below.
+        # ---- Most Recent Picks (cards) ----
+        def _pick_texts(p):
+            detail = p.get("detail", {}) or {}
+            actual = p.get("actual", {}) or {}
+            cat = p["category"]
+            if cat == "edge":
+                prediction = f"{detail.get('direction', '')} {detail.get('prop_line', '')} {detail.get('stat', '')}"
+                actual_text = f"{actual['actual_value']:.1f}" if "actual_value" in actual else "—"
+            elif cat == "td_anytime":
+                prediction = f"Anytime TD ({detail.get('predicted_pct', 0):.0f}% implied)"
+                actual_text = (f"{actual['actual_tds']} TD{'s' if actual['actual_tds'] != 1 else ''}"
+                               if "actual_tds" in actual else "—")
+            elif cat == "safe":
+                prediction = f"Safe Play: {detail.get('floor_ppr', 0):.1f}+ pts (avg {detail.get('season_avg_ppr', 0):.1f})"
+                actual_text = (f"{actual['actual_ppr']:.1f} pts" if "actual_ppr" in actual
+                               else actual.get("note", "—"))
+            else:
+                prediction = f"First TD ({detail.get('predicted_pct', 0):.0f}% implied)"
+                actual_text = {"Hit": "Scored first", "Miss": "Did not score first"}.get(p["status"], "—")
+            return prediction, actual_text
+
         st.markdown("###### 🕒 Most Recent Picks")
-        recent_source = sorted(all_picks, key=lambda x: (x["season"], x["week"]), reverse=True)[:8]
+        recent_source = sorted(view_picks, key=lambda x: (x["season"], x["week"]), reverse=True)[:8]
         recent_rows = []
         for p in recent_source:
             meta_row = tr_meta.loc[p["player"]] if p["player"] in tr_meta.index else None
-            detail = p.get("detail", {})
-            actual = p.get("actual", {})
-            if p["category"] == "edge":
-                prediction = f"{detail.get('direction', '')} {detail.get('prop_line', '')} {detail.get('stat', '')}"
-                actual_text = f"Actual: {actual['actual_value']:.1f}" if "actual_value" in actual else "Actual: —"
-            elif p["category"] == "td_anytime":
-                prediction = f"Anytime TD ({detail.get('predicted_pct', 0):.0f}% implied)"
-                actual_text = f"Actual: {actual['actual_tds']} TD{'s' if actual.get('actual_tds') != 1 else ''}" if "actual_tds" in actual else "Actual: —"
-            else:
-                prediction = f"First TD ({detail.get('predicted_pct', 0):.0f}% implied)"
-                actual_text = {"Hit": "Actual: Scored first", "Miss": "Actual: Did not score first"}.get(p["status"], "Actual: —")
-            result_cls = {"Hit": "result-hit", "Miss": "result-miss", "Push": "result-push", "Pending": "result-pending"}[p["status"]]
-            result_icon = {"Hit": "✅", "Miss": "❌", "Push": "➖", "Pending": "⏳"}[p["status"]]
+            prediction, actual_text = _pick_texts(p)
             recent_rows.append({
                 "player": p["player"], "team": p["team"], "position": p.get("position", ""),
                 "headshot_url": meta_row.get("headshot_url") if meta_row is not None else None,
                 "team_color": (meta_row.get("team_color") if meta_row is not None else None) or "#444444",
-                "_prediction": prediction, "_actual": actual_text, "_result_cls": result_cls, "_result_icon": result_icon,
+                "_prediction": prediction, "_actual": f"Actual: {actual_text}",
+                "_result_cls": {"Hit": "result-hit", "Miss": "result-miss", "Push": "result-push", "Pending": "result-pending"}[p["status"]],
+                "_result_icon": {"Hit": "✅", "Miss": "❌", "Push": "➖", "Pending": "⏳"}[p["status"]],
                 "_result": p["status"], "_week_label": f"{p['season']} Wk {p['week']}",
             })
 
@@ -4309,15 +4566,10 @@ else:
         with clear_col:
             if active_category:
                 st.button("✕ Clear filter", key="tr_clear_category", on_click=_toggle_category_filter, args=(active_category,))
-        # Opponent lookup for the History table's "Opp" logo column. Every
-        # tracked pick stores its nflverse game_id, so the opponent comes
-        # straight from the schedule - which means picks saved BEFORE this
-        # column existed get an opponent too, with no change to stored data.
-        # Fallback: nflverse game_ids are "{season}_{week}_{away}_{home}",
-        # so the teams can be read from the id itself if the schedule
-        # doesn't have that game for any reason.
+        # Opponent for the "Opp" logo column comes from each pick's game_id
+        # via the schedule (fallback: parse "{season}_{week}_{away}_{home}").
         try:
-            _hist_sched = get_schedule()
+            _hist_sched = get_all_seasons_schedule()
             _game_teams = {
                 g["game_id"]: (g["away_team"], g["home_team"])
                 for _, g in _hist_sched[["game_id", "away_team", "home_team"]].iterrows()
@@ -4337,30 +4589,14 @@ else:
             return home if pick.get("team") == away else away if pick.get("team") == home else None
 
         hist_rows = []
-        for p in sorted(all_picks, key=lambda x: (x["season"], x["week"], x["player"]), reverse=True):
-            detail = p.get("detail", {})
-            actual = p.get("actual", {})
-            if p["category"] == "edge":
-                prediction = f"{detail.get('direction', '')} {detail.get('prop_line', '')} {detail.get('stat', '')}"
-                actual_text = f"{actual['actual_value']:.1f}" if "actual_value" in actual else "—"
-            elif p["category"] == "td_anytime":
-                prediction = f"Anytime TD ({detail.get('predicted_pct', 0):.0f}% implied)"
-                actual_text = (
-                    f"{actual['actual_tds']} TD{'s' if actual['actual_tds'] != 1 else ''}"
-                    if "actual_tds" in actual else "—"
-                )
-            else:
-                prediction = f"First TD ({detail.get('predicted_pct', 0):.0f}% implied)"
-                if p["status"] == "Hit":
-                    actual_text = "Scored first"
-                elif p["status"] == "Miss":
-                    actual_text = "Did not score first"
-                else:
-                    actual_text = "—"
+        for p in sorted(view_picks, key=lambda x: (x["season"], x["week"], x["player"]), reverse=True):
+            prediction, actual_text = _pick_texts(p)
             meta_row = tr_meta.loc[p["player"]] if p["player"] in tr_meta.index else None
             raw_headshot = meta_row.get("headshot_url") if meta_row is not None else None
             pick_clv = compute_clv(p)
             clv_unit = "pts" if p["category"] == "edge" else "pp"
+            price = (p.get("detail") or {}).get("price")
+            pl = pick_profit(p) if p["category"] in BET_CATEGORIES else None
             hist_rows.append({
                 "Season": p["season"], "Week": p["week"], "Category": category_labels.get(p["category"], p["category"]),
                 "Headshot": raw_headshot if isinstance(raw_headshot, str) else None,
@@ -4368,12 +4604,9 @@ else:
                 "Team": p["team"],
                 "Opp": _pick_opponent(p),
                 "Prediction": prediction,
-                "Odds": f"{int(p['detail']['price']):+d}" if (p.get("detail") or {}).get("price") is not None else "—",
+                "Odds": f"{int(price):+d}" if price is not None else "—",
                 "Actual": actual_text, "Result": p["status"],
-                f"${PROFIT_STAKE:.0f} P/L": (
-                    "—" if pick_profit(p) is None
-                    else f"{'+' if pick_profit(p) >= 0 else '−'}${abs(pick_profit(p)):.2f}"
-                ),
+                f"${PROFIT_STAKE:.0f} P/L": "—" if pl is None else f"{'+' if pl >= 0 else '−'}${abs(pl):.2f}",
                 "CLV": f"{pick_clv:+.1f} {clv_unit}" if pick_clv is not None else "—",
             })
         hist_df = pd.DataFrame(hist_rows)

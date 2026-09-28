@@ -75,6 +75,7 @@ CATEGORY_COLORS = {
     "Prop Edge": "#B08820",    # deep gold
     "Anytime TD": "#2E9E90",   # teal
     "First TD": "#8266D4",     # violet
+    "Safe Play": "#C25A7C",    # rose (Sep 2026; 4-color set re-validated on SURFACE)
 }
 
 # Matchup-difficulty gradient endpoints (toughest -> easiest), used by
