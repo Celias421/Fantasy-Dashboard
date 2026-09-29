@@ -65,7 +65,7 @@ def test_running_line_accumulates_and_restarts_each_season():
     assert "2026 Wk 3" not in edge.index
 
 
-def test_safe_plays_count_for_hit_rate_but_never_profit():
+def test_unpriced_picks_count_for_hit_rate_but_not_profit():
     wk = g["compute_running_by_week"](PICKS)
     safe = wk[wk["category"] == "Safe Play"].iloc[0]
     assert safe["cum_rate"] == 50 and safe["cum_profit"] == 0 and safe["cum_priced"] == 0
@@ -82,7 +82,7 @@ def test_weekly_table():
     assert wk2["Anytime TD"] == "0-1 (0%)"
     assert wk2["Safe Play"] == "1-1 (50%)"
     assert wk2["First TD"] == "—"
-    assert wk2["Week $"] == pytest.approx(9.09 * 2 - 10, abs=0.02)   # safe plays excluded
+    assert wk2["Week $"] == pytest.approx(9.09 * 2 - 10, abs=0.02)   # unpriced safe plays add nothing
 
 
 def test_position_scorecard():
@@ -95,7 +95,7 @@ def test_position_scorecard():
     # ordered by category then QB/RB/WR/TE
     assert list(sc["category"])[:2] == ["Prop Edge", "Prop Edge"]
     assert list(sc[sc["category"] == "Prop Edge"]["position"]) == ["RB", "WR"]
-    assert sc[sc["category"] == "Safe Play"]["tier"].isna().all()
+    assert (sc[sc["category"] == "Safe Play"]["tier"] == "new").all()   # Safe Plays get their own badge
 
 
 def test_empty_inputs():

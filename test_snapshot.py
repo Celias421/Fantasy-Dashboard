@@ -46,8 +46,13 @@ def _run(tracked, now):
     exec(compile(ast.Module(body=_nodes, type_ignores=[]), "x", "exec"), ns)
     edge = [{"player": "Lamar Jackson", "team": "BAL", "position": "QB", "stat": "Pass Yds", "stat_col": "passing_yards",
              "prop_line": 220.5, "season_avg": 250.0, "direction": "▲ Over", "typical_price": -110}]
-    safe = [{"player": "Derrick Henry", "team": "BAL", "position": "RB", "season_avg_ppr": 18.4, "cv": 0.14},
-            {"player": "CeeDee Lamb", "team": "DAL", "position": "WR", "season_avg_ppr": 17.0, "cv": 0.18}]
+    def _safe(player, team, pos, stat_col, line):
+        return {"player": player, "team": team, "position": pos, "stat": stat_col.replace("_", " ").title(),
+                "stat_col": stat_col, "prop_line": line, "direction": "▲ Over", "hits": 9, "n_games": 10,
+                "recent_avg": line + 20, "line_type": "Alt", "break_even": 0.737, "typical_price": -280,
+                "best_price": -250, "best_book": "draftkings"}
+    safe = [_safe("Derrick Henry", "BAL", "RB", "rushing_yards", 49.5),
+            _safe("CeeDee Lamb", "DAL", "WR", "receiving_yards", 39.5)]
     ns["snapshot_hotpicks_for_tracking"](edge, [], sched, safe)
     return store.added
 
@@ -56,7 +61,9 @@ def test_safe_plays_added_mid_week_without_resaving_edges():
     added = _run(tracked={"edge", "td_anytime", "td_first"}, now="2026-10-01 12:00")
     assert {p["category"] for p in added} == {"safe"}
     henry = next(p for p in added if p["player"] == "Derrick Henry")
-    assert henry["detail"]["floor_ppr"] == 9.2 and henry["week"] == 5 and henry["game_id"] == "2026_05_KC_BAL"
+    d = henry["detail"]
+    assert d["prop_line"] == 49.5 and d["direction"] == "▲ Over" and d["price"] == -280 and d["line_type"] == "Alt"
+    assert henry["week"] == 5 and henry["game_id"] == "2026_05_KC_BAL"
 
 
 def test_games_already_under_way_are_skipped():

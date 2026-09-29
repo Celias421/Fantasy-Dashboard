@@ -32,9 +32,10 @@ from data_loader import (
     load_starter_stats, load_player_meta, load_team_meta, load_defense_ranks, load_schedule,
     load_current_injuries, load_prop_lines_with_cache, geocode_city, load_game_weather,
     load_all_seasons_schedule, clear_nflverse_cache, load_first_td_scorers, load_snap_counts,
+    ALT_COLUMNS,
 )
 import pick_tracker_store
-from odds_math import expected_value, break_even_prob, profit_on_stake, book_name
+from odds_math import expected_value, break_even_prob, profit_on_stake, book_name, american_to_decimal
 
 st.set_page_config(page_title="The Prop Shop", layout="wide", page_icon="🏈")
 
@@ -46,11 +47,12 @@ st.set_page_config(page_title="The Prop Shop", layout="wide", page_icon="🏈")
 theme.inject_css()
 theme.render_header()
 
+# Prop-bet stats only - fantasy points (PPR) live on the Lineups side.
 PROP_STATS_BY_POSITION = {
-    "QB": ["passing_yards", "passing_tds", "rushing_yards", "fantasy_points_ppr"],
-    "RB": ["rushing_yards", "rushing_tds", "receiving_yards", "receptions", "fantasy_points_ppr"],
-    "WR": ["receiving_yards", "receptions", "receiving_tds", "fantasy_points_ppr"],
-    "TE": ["receiving_yards", "receptions", "receiving_tds", "fantasy_points_ppr"],
+    "QB": ["passing_yards", "passing_tds", "rushing_yards"],
+    "RB": ["rushing_yards", "rushing_tds", "receiving_yards", "receptions"],
+    "WR": ["receiving_yards", "receptions", "receiving_tds"],
+    "TE": ["receiving_yards", "receptions", "receiving_tds"],
 }
 
 # Fixed-order categorical colors for the 4 offensive positions, used on the
@@ -135,7 +137,7 @@ def _get_prop_lines_with_timestamp():
     path so a normal page rerun doesn't even need to re-read that file."""
     empty_quota = {"remaining": None, "used": None, "skipped": False}
     try:
-        props_df, td_df, first_td_df, quota, pulled_at, stale = load_prop_lines_with_cache(ODDS_API_KEY)
+        props_df, td_df, first_td_df, quota, pulled_at, stale, alt_df = load_prop_lines_with_cache(ODDS_API_KEY)
     except Exception:
         # Belt-and-suspenders: load_prop_lines_with_cache is written to
         # never raise, but this function runs at the top of every single
@@ -147,11 +149,17 @@ def _get_prop_lines_with_timestamp():
         quota = empty_quota
         pulled_at = datetime.datetime.now()
         stale = False
-    return props_df, td_df, first_td_df, quota, pulled_at, stale
+        alt_df = pd.DataFrame(columns=ALT_COLUMNS)
+    return props_df, td_df, first_td_df, quota, pulled_at, stale, alt_df
+
+
+def get_alt_lines() -> pd.DataFrame:
+    """Alternate lines (see data_loader.ALT_COLUMNS) - Safe Plays' source."""
+    return _get_prop_lines_with_timestamp()[6]
 
 
 def get_prop_lines() -> pd.DataFrame:
-    df, _, _, _, _, _ = _get_prop_lines_with_timestamp()
+    df, _, _, _, _, _, _ = _get_prop_lines_with_timestamp()
     return df
 
 
@@ -159,7 +167,7 @@ def get_anytime_td_odds() -> pd.DataFrame:
     """player -> implied_prob (0-100): the market's implied chance a
     player scores any touchdown this week. See load_prop_lines for why
     this is kept separate from get_prop_lines()."""
-    _, td_df, _, _, _, _ = _get_prop_lines_with_timestamp()
+    _, td_df, _, _, _, _, _ = _get_prop_lines_with_timestamp()
     return td_df
 
 
@@ -169,12 +177,12 @@ def get_first_td_odds() -> pd.DataFrame:
     narrower bet than get_anytime_td_odds(), and the market behind the
     First TD tab. See load_prop_lines for why this is kept separate from
     both get_prop_lines() and get_anytime_td_odds()."""
-    _, _, first_td_df, _, _, _ = _get_prop_lines_with_timestamp()
+    _, _, first_td_df, _, _, _, _ = _get_prop_lines_with_timestamp()
     return first_td_df
 
 
 def get_prop_lines_updated_at() -> datetime.datetime:
-    _, _, _, _, updated_at, _ = _get_prop_lines_with_timestamp()
+    _, _, _, _, updated_at, _, _ = _get_prop_lines_with_timestamp()
     return updated_at
 
 
@@ -183,14 +191,14 @@ def get_odds_api_quota() -> dict:
     Odds API's own usage-credit counters as of the last refresh, plus
     whether that refresh skipped pulling odds to protect the safety
     buffer (see ODDS_API_SAFETY_BUFFER in config.py)."""
-    _, _, _, quota, _, _ = _get_prop_lines_with_timestamp()
+    _, _, _, quota, _, _, _ = _get_prop_lines_with_timestamp()
     return quota
 
 
 def get_prop_lines_are_stale() -> bool:
     """True if what's showing is a fallback to the last known good pull
     (because a fresh one was skipped or failed), not today's actual pull."""
-    _, _, _, _, _, stale = _get_prop_lines_with_timestamp()
+    _, _, _, _, _, stale, _ = _get_prop_lines_with_timestamp()
     return stale
 
 
@@ -954,10 +962,61 @@ def render_hotpick_cards(rows: list, body_fn, cols_per_row: int = 4, headshot_px
                 st.markdown(card_html, unsafe_allow_html=True)
 
 
-# Safe Plays are scored "no disaster week": a Hit when the player scores at
-# least this share of his season average (PPR) at the time of the pick -
-# the same no_bust test the 2025 walk-forward backtest used.
+# LEGACY (Sep 28-29 2026 only): the first version of Safe Plays was scored
+# on fantasy points ("no disaster week" - at least this share of his PPR
+# average). Kept so those few saved picks still grade; countable_picks
+# leaves them out of the numbers. Safe Plays are prop bets now (below).
 SAFE_PLAY_FLOOR_PCT = 0.5
+
+# ---- Safe Plays = "sure thing" prop bets, alt lines first (Sep 2026) ----
+# For every prop the books offer on a player - the main line AND every
+# alternate line - check his most recent games (this season first,
+# reaching back into last season to fill the window) and count how often
+# he cleared that exact line. A Safe Play is the BEST-PAYING line he's
+# cleared in at least SAFE_MIN_HIT_RATE of those games, as long as the
+# price isn't worse than SAFE_MAX_FAVORITE. Honest caveat, shown in the
+# app: a great recent record is not a guarantee - Track Record keeps score.
+SAFE_LOOKBACK_GAMES = 10   # most recent games checked against each line
+SAFE_MIN_GAMES = 5         # need at least this many games to judge
+SAFE_MIN_HIT_RATE = 0.9    # cleared it in 90%+ of them (9 of 10, or 5 of 5...)
+SAFE_MAX_FAVORITE = -400   # never lay more than $40 to win $10
+SAFE_TOP_N = 10            # shown and tracked each week, league-wide
+
+
+def best_safe_line(values, lines: list):
+    """The Safe Play for one player/stat, or None.
+    values: his most recent games' stat values. lines: candidate bets,
+    each {"point", "side" ("Over"/"Under"), "price" (typical American),
+    "best_price", "best_book", "kind" ("Alt"/"Main")}.
+    Keeps lines he cleared in >= SAFE_MIN_HIT_RATE of games (landing
+    exactly on the line doesn't count) at a price no worse than
+    SAFE_MAX_FAVORITE, then returns the one that pays best (ties: higher
+    hit rate). Adds hits, n, hit_rate, break_even, room (hit rate minus
+    break-even) and avg."""
+    vals = [float(v) for v in values if v is not None and not pd.isna(v)]
+    n = len(vals)
+    if n < SAFE_MIN_GAMES:
+        return None
+    best = None
+    for ln in lines:
+        price, point = _num(ln.get("price")), _num(ln.get("point"))
+        if price is None or point is None or price < SAFE_MAX_FAVORITE:
+            continue
+        over = ln.get("side") == "Over"
+        hits = sum((v > point) if over else (v < point) for v in vals)
+        rate = hits / n
+        if rate < SAFE_MIN_HIT_RATE:
+            continue
+        be = break_even_prob(price)
+        cand = {**ln, "point": point, "price": int(price), "hits": hits, "n": n, "hit_rate": rate,
+                "break_even": be, "room": rate - be, "avg": sum(vals) / n,
+                "direction": "▲ Over" if over else "▼ Under"}
+        key = (american_to_decimal(price), rate)
+        if best is None or key > best["_key"]:
+            best = {**cand, "_key": key}
+    if best:
+        best.pop("_key")
+    return best
 
 
 def snapshot_hotpicks_for_tracking(edge_rows: list, td_rows: list, schedule_df: pd.DataFrame, safe_rows: list = ()) -> None:
@@ -971,10 +1030,9 @@ def snapshot_hotpicks_for_tracking(edge_rows: list, td_rows: list, schedule_df: 
     check is per CATEGORY (pick_tracker_store.tracked_categories), so a
     category added later starts tracking without re-saving the others.
 
-    Safe Plays (Sep 2026) are tracked too, scored on the same "no disaster
-    week" test the 2025 backtest used: a Hit if the player scores at least
-    SAFE_PLAY_FLOOR_PCT of his season average at the time of the pick.
-    They carry no price (not a bet), so they never enter profit.
+    Safe Plays (Sep 2026) are tracked too: prop bets graded exactly like
+    Prop Edges (did he clear the line on the picked side), with a price,
+    so they count toward profit.
 
     `edge_rows`/`td_rows` must be the FULL, unfiltered set (every
     position/team) - see the call site's comment for why a
@@ -1046,15 +1104,20 @@ def snapshot_hotpicks_for_tracking(edge_rows: list, td_rows: list, schedule_df: 
 
     for row in safe_rows:
         game = team_game.get(row["team"])
-        if not game or row.get("season_avg_ppr") is None:
+        if not game or row.get("prop_line") is None:
             continue
-        avg = float(row["season_avg_ppr"])
         new_picks.append({
             "id": str(uuid.uuid4()), "season": season, "week": week, "category": "safe",
             "player": row["player"], "player_id": row.get("player_id", ""),
             "team": row["team"], "position": row["position"],
-            "detail": {"season_avg_ppr": round(avg, 1), "floor_ppr": round(avg * SAFE_PLAY_FLOOR_PCT, 1),
-                       "cv": round(float(row["cv"]), 3) if row.get("cv") is not None else None},
+            "detail": {
+                "stat": row["stat"], "stat_col": row["stat_col"], "prop_line": row["prop_line"],
+                "direction": row["direction"], "hits": int(row["hits"]), "n_games": int(row["n_games"]),
+                "recent_avg": row["recent_avg"], "line_type": row.get("line_type"),
+                "break_even": row.get("break_even"),
+                "price": row.get("typical_price"), "best_price": row.get("best_price"),
+                "best_book": row.get("best_book"),
+            },
             "game_id": game[0], "kickoff": game[1], "status": "Pending", "actual": {}, "resolved_at": "",
         })
 
@@ -1231,7 +1294,7 @@ def resolve_pending_picks() -> tuple:
             & (stats_df["season"] == pick.get("season", CURRENT_SEASON))
         ] if pick.get("player_id") else pd.DataFrame()
 
-        if pick["category"] == "edge":
+        if pick["category"] == "edge" or (pick["category"] == "safe" and "prop_line" in (pick.get("detail") or {})):
             if actual_row.empty or pick["detail"]["stat_col"] not in actual_row.columns:
                 status, actual = "Miss", {"note": "No stat line found for this player/week"}
             else:
@@ -1254,7 +1317,7 @@ def resolve_pending_picks() -> tuple:
                 status = "Hit" if tds > 0 else "Miss"
                 actual = {"actual_tds": tds}
 
-        elif pick["category"] == "safe":
+        elif pick["category"] == "safe":  # legacy fantasy-points version
             floor = (pick.get("detail") or {}).get("floor_ppr")
             if actual_row.empty or "fantasy_points_ppr" not in actual_row.columns or floor is None:
                 # Team's stats are in but he has no line: he didn't play.
@@ -1390,8 +1453,8 @@ def compute_clv_summary(picks: list) -> dict:
 # and season comparison all come from these. Kept free of Streamlit so
 # they're unit-tested (tests/test_history.py).
 CATEGORY_LABELS = {"edge": "Prop Edge", "td_anytime": "Anytime TD", "td_first": "First TD", "safe": "Safe Play"}
-BET_CATEGORIES = ("edge", "td_anytime", "td_first")   # have prices -> profit
-ALL_CATEGORIES = BET_CATEGORIES + ("safe",)
+BET_CATEGORIES = ("edge", "td_anytime", "td_first", "safe")   # have prices -> profit
+ALL_CATEGORIES = BET_CATEGORIES
 POSITION_ORDER = ["QB", "RB", "WR", "TE"]
 
 
@@ -1462,7 +1525,14 @@ def countable_picks(picks: list) -> list:
         keep_ids |= _top_ids(((p["id"], p) for p in group),
                              lambda p: (p.get("detail") or {}).get("predicted_pct"),
                              lambda p: p.get("game_id") or p.get("team"), top_n, per_game)
-    return [p for p in picks if p.get("category") not in ("td_anytime", "td_first") or p["id"] in keep_ids]
+    def _counts(p):
+        cat = p.get("category")
+        if cat in ("td_anytime", "td_first"):
+            return p["id"] in keep_ids
+        if cat == "safe":  # the short-lived fantasy-points version doesn't count
+            return "prop_line" in (p.get("detail") or {})
+        return True
+    return [p for p in picks if _counts(p)]
 
 
 def filter_picks_by_season(picks: list, season) -> list:
@@ -1533,7 +1603,7 @@ def compute_position_scorecard(picks: list) -> pd.DataFrame:
     for (cat, pos), group in buckets.items():
         st_ = _group_stats(group)
         rows.append({"category": CATEGORY_LABELS[cat], "position": pos,
-                     "tier": confidence_tier(st_["hit_pct"] or 0, st_["n"]) if cat != "safe" else None,
+                     "tier": confidence_tier(st_["hit_pct"] or 0, st_["n"]),
                      **st_})
     cols = ["category", "position", "record", "hits", "misses", "pushes", "n", "hit_pct", "profit", "roi", "tier"]
     if not rows:
@@ -3253,13 +3323,17 @@ elif tab_side == "🎯 Props":
             # without Overview (on the Fantasy Lineups side) ever having run
             # this pass, so it can't rely on Overview having set a shared
             # variable. Same "pull every numeric stat automatically" logic.
+            # Prop stats only - fantasy points belong to the Lineups side.
             gc_sort_options = [
                 c for c in current_season_df.columns
                 if pd.api.types.is_numeric_dtype(current_season_df[c]) and c not in ("season", "week")
+                and not c.startswith("fantasy_points")
             ]
-            if "fantasy_points_ppr" in gc_sort_options:
-                gc_sort_options.remove("fantasy_points_ppr")
-                gc_sort_options.insert(0, "fantasy_points_ppr")
+            for _pref in ("receiving_yards", "rushing_yards"):
+                if _pref in gc_sort_options:
+                    gc_sort_options.remove(_pref)
+                    gc_sort_options.insert(0, _pref)
+                    break
             sort_stat = st.selectbox("Rank player cards by", gc_sort_options, index=0, key="game_center_sort_stat")
 
             gm1, gm2, gm3, gm4 = st.columns(4)
@@ -3618,7 +3692,7 @@ elif tab_side == "🔥 Hot Picks":
         f"➖ **Even** = in between. Under {CONFIDENCE_MIN_N} finished picks it shows 🆕 **New** - too early to "
         f"judge. Hot groups move up the lists and cold ones move down, but **nothing is ever hidden**. Only "
         f"**this season's** picks count, so each new season starts fresh. The full breakdown is on Track "
-        f"Record → **By position**. Safe Plays are tracked there too, but don't get this badge."
+        f"Record → **By position**. Safe Plays get their own badge from their own record."
     )
     )
     _guide_1 = (
@@ -3671,7 +3745,7 @@ elif tab_side == "🔥 Hot Picks":
     st.caption(
         "This week's best opportunities across the whole league, in three lists: **Prop-Line Edges** "
         "(where a player's season average is far from the sportsbook's line), **TD Scoring Chances** "
-        "(who's most likely to score), and **Safe Plays** (the steadiest scorers). Each one is covered "
+        "(who's most likely to score), and **Safe Plays** (the lines - often alternate lines - a player keeps clearing). Each one is covered "
         "in more detail elsewhere in the app."
     )
 
@@ -3710,7 +3784,11 @@ elif tab_side == "🔥 Hot Picks":
 
     edge_rows = []
     td_rows = []
-    matchup_rows = []
+    matchup_rows = []   # Safe Plays
+    hp_alt_lines = get_alt_lines()
+    # Each player's games in order (last season, then this one) - Safe
+    # Plays checks the most recent SAFE_LOOKBACK_GAMES against each line.
+    hp_recent_games = {name: g for name, g in stats_df.sort_values(["season", "week"]).groupby("player")}
 
     # Deliberately iterates the FULL player universe (current_season_df),
     # not a position/team-filtered view - the position/team multiselects
@@ -3810,34 +3888,49 @@ elif tab_side == "🔥 Hot Picks":
                 "opportunity_trend": compute_opportunity_trend(stats_df, hp_snap_counts, player, td_trend_stat, CURRENT_SEASON),
             })
 
-        # ---- Safe plays: High consistency + an upcoming game ----
-        # Matchup difficulty is shown on the card as CONTEXT but no longer
-        # gates or ranks this list - a walk-forward backtest against the
-        # real 2025 season tested it every way (as the primary sort, as a
-        # stricter cutoff at various thresholds, as a "no really bad
-        # matchup" exclusion filter) and it never separated winners from
-        # losers by more than noise. Consistency itself is where the real,
-        # backtest-confirmed edge lives (see CONSISTENCY_HIGH_CV's
-        # docstring), so that's now both the filter AND the sort key -
-        # most consistent player first, not easiest matchup first.
-        avg_fp, _, _, consistency, cv = compute_summary(pdf, "fantasy_points_ppr")
-        # plain=True: this lands in a st.dataframe cell below, which shows
-        # HTML source literally instead of rendering it (same reasoning as
-        # add_matchup_display's separate plain-text column elsewhere).
-        matchup_result = _matchup_label(team, position, "fantasy_points_ppr", hp_next_opp_map, hp_defense_ranks, plain=True)
-        if consistency == "High" and matchup_result:
-            matchup_label, matchup_rank = matchup_result
-            safe_trend_stat = "receiving_yards" if position in ("WR", "TE") else "rushing_yards"
+        # ---- Safe Plays: the best-paying line (alt or main) he's cleared
+        # in 9 of his last 10 games or better - see best_safe_line. One
+        # per player: his best across all his props. ----
+        hist = hp_recent_games.get(player)
+        best_safe = None
+        if hist is not None and not hp_prop_lines.empty:
+            for stat in PROP_STATS_BY_POSITION.get(position, []):
+                market = PROP_MARKET_MAP.get(stat)
+                if not market or stat not in hist.columns:
+                    continue
+                cand_lines = []
+                main = hp_prop_lines[(hp_prop_lines["player"] == player) & (hp_prop_lines["market"] == market)]
+                if not main.empty:
+                    m = main.iloc[0]
+                    for side, pfx in (("Over", "over"), ("Under", "under")):
+                        cand_lines.append({"point": m["point"], "side": side, "kind": "Main",
+                                           "price": m.get(f"typical_{pfx}_price"),
+                                           "best_price": m.get(f"best_{pfx}_price"), "best_book": m.get(f"best_{pfx}_book")})
+                if not hp_alt_lines.empty:
+                    alts = hp_alt_lines[(hp_alt_lines["player"] == player) & (hp_alt_lines["market"] == market)]
+                    for _, a in alts.iterrows():
+                        cand_lines.append({"point": a["point"], "side": a["side"], "kind": "Alt",
+                                           "price": a["typical_price"], "best_price": a["best_price"],
+                                           "best_book": a["best_book"]})
+                if not cand_lines:
+                    continue
+                pick = best_safe_line(hist[stat].tail(SAFE_LOOKBACK_GAMES).tolist(), cand_lines)
+                if pick and (best_safe is None or (pick["hit_rate"], pick["room"]) > (best_safe["hit_rate"], best_safe["room"])):
+                    best_safe = {**pick, "stat_col": stat}
+        if best_safe:
+            safe_trend_stat = best_safe["stat_col"]
             matchup_rows.append({
                 "player": player, "player_id": player_id, "team": team, "position": position,
                 "headshot_url": headshot_url, "team_color": team_color,
-                "matchup_label": matchup_label, "matchup_rank": matchup_rank, "cv": cv,
-                "season_avg_ppr": round(avg_fp, 1),
+                "stat": best_safe["stat_col"].replace("_", " ").title(), "stat_col": best_safe["stat_col"],
+                "prop_line": round(best_safe["point"], 1), "direction": best_safe["direction"],
+                "line_type": best_safe["kind"], "hits": best_safe["hits"], "n_games": best_safe["n"],
+                "hit_rate": best_safe["hit_rate"], "break_even": best_safe["break_even"], "room": best_safe["room"],
+                "recent_avg": round(best_safe["avg"], 1),
+                "typical_price": best_safe["price"],
+                "best_price": int(_num(best_safe.get("best_price"))) if _num(best_safe.get("best_price")) is not None else None,
+                "best_book": best_safe.get("best_book") if isinstance(best_safe.get("best_book"), str) else None,
                 "implied_total": hp_implied_totals.get(team),
-                # A "High consistency" verdict is itself a look backward
-                # over the whole season - if the role behind that
-                # consistency is now trending down, that's exactly the
-                # kind of thing worth flagging on a "safe" pick.
                 "opportunity_trend": compute_opportunity_trend(stats_df, hp_snap_counts, player, safe_trend_stat, CURRENT_SEASON),
             })
 
@@ -3846,7 +3939,10 @@ elif tab_side == "🔥 Hot Picks":
     # comment above for why. A no-op after the first page load of the
     # week (season_week_already_tracked short-circuits it).
     # Safe Plays: the same top-15 list the page shows (steadiest first).
-    safe_track_rows = sorted(matchup_rows, key=lambda r: r["cv"] if r.get("cv") is not None else 9)[:15]
+    # Safe Plays: most reliable first (hit rate), then most room over the
+    # price's break-even. The same top SAFE_TOP_N are shown and tracked.
+    matchup_rows = sorted(matchup_rows, key=lambda r: (-r["hit_rate"], -r["room"], r["player"]))[:SAFE_TOP_N]
+    safe_track_rows = matchup_rows
     # TD: only the top picks (see select_top_td_rows) - chosen from the
     # full league before any display filter, and the same set is shown
     # below and tracked.
@@ -3881,7 +3977,7 @@ elif tab_side == "🔥 Hot Picks":
     section1, section2, section3 = st.columns(3)
     section1.metric("Prop Edges Found", len(edge_rows))
     section2.metric("Top TD Picks", len(td_rows))
-    section3.metric("High-Consistency Safe Plays", len(matchup_rows))
+    section3.metric("Safe Plays", len(matchup_rows))
 
     # ---- Position mix donut: the one place on this page a donut earns its
     # keep - a real part-to-whole with only 4 possible slices (QB/RB/WR/TE),
@@ -3987,17 +4083,22 @@ elif tab_side == "🔥 Hot Picks":
                     badges_html += anytime_td_badge_html(td["anytime_td_pct"])
                 if td["first_td_pct"] is not None:
                     badges_html += first_td_badge_html(td["first_td_pct"])
-            if matchup:
-                badges_html += matchup_badge_html(matchup["matchup_label"], matchup["matchup_rank"])
-                badges_html += f'<div class="stat-label" style="margin-top:4px;">{matchup["season_avg_ppr"]:.1f} avg PPR</div>'
+            if matchup:  # Safe Play
+                s_cls = "delta-up" if matchup["direction"] == "▲ Over" else "delta-down"
+                badges_html += (
+                    f'<div style="margin-top:6px;">🛡️ <span class="{s_cls}">{matchup["direction"]} '
+                    f'{matchup["prop_line"]:.1f} {matchup["stat"]}</span> '
+                    f'<span class="stat-label">({matchup["line_type"]}, {matchup["typical_price"]:+d}, cleared '
+                    f'{matchup["hits"]}/{matchup["n_games"]})</span></div>'
+                )
             if not badges_html:
                 badges_html = '<div class="stat-label" style="margin-top:8px;">No specific angle this week</div>'
 
             # Confidence badge: edge's segment takes priority (it's the
             # more specific claim - an exact stat line vs. a TD market),
             # then TD's driving category, then none for a matchup-only row
-            # (Safe Plays are tracked, but aren't a bet type and never
-            # get a Confidence badge). Informational only - this panel keeps
+            # (a Safe-Play-only row shows its bet line above but no badge
+            # here, to keep one badge per card). Informational only - this panel keeps
             # its existing alphabetical (position, player) sort below.
             conf_segment = None
             if edge:
@@ -4237,64 +4338,81 @@ elif tab_side == "🔥 Hot Picks":
 
     st.divider()
 
-    # ---- Section 3: Safe Plays (High Consistency, ranked by consistency) ----
-    st.markdown("##### 🛡️ Safe Plays — High Consistency")
-    st.caption(
-        f"Players whose fantasy scores barely change from week to week - they rarely have a disaster "
-        f"game. To make the list, a player's weekly score typically stays within about "
-        f"{CONSISTENCY_HIGH_CV:.0%} of his average, over at least {MIN_GAMES_FOR_CONSISTENCY} games. Steadiest "
-        f"first. The matchup is shown for context only - when we tested this against the entire 2025 "
-        f"season, the matchup didn't help predict who would come through. These are tracked on Track "
-        f"Record: a Safe Play counts as a hit if he scores at least {SAFE_PLAY_FLOOR_PCT:.0%} of his "
-        f"season average (no disaster week)."
-    )
+    # ---- Section 3: Safe Plays - "sure thing" props, alt lines first ----
+    st.markdown("##### 🛡️ Safe Plays — Lines He Keeps Clearing")
+    sp_cap, sp_info = st.columns([5, 1], vertical_alignment="center")
+    with sp_cap:
+        st.caption(
+            f"For every line the books offer on a player - including **alternate lines** - we check his last "
+            f"{SAFE_LOOKBACK_GAMES} games and keep the **best-paying line he cleared at least "
+            f"{SAFE_MIN_HIT_RATE:.0%} of the time**. Most reliable first."
+        )
+    with sp_info:
+        theme.info_popover(
+            f"**How Safe Plays are picked**\n\n"
+            f"- We look at every line the sportsbooks offer on each player's props - the main line and the "
+            f"alternate lines (like *Over 29.5 receiving yards* when the main line is 45.5).\n"
+            f"- For each line we count how many of his last {SAFE_LOOKBACK_GAMES} games cleared it (last season's "
+            f"games fill in early in the year). Landing exactly on the line doesn't count.\n"
+            f"- A line qualifies if he cleared it in at least **{SAFE_MIN_HIT_RATE:.0%}** of those games and the "
+            f"price is no worse than **{SAFE_MAX_FAVORITE}** (never risk more than $40 to win $10).\n"
+            f"- Of the lines that qualify, we pick the one that **pays the most**.\n\n"
+            f"**Break-even** is how often a bet at that price has to win just to not lose money. "
+            f"\"Cleared 10 of 10\" at a 74% break-even means he's been well above what the price needs.\n\n"
+            f"**Be careful:** these are heavy favorites. At -300 one miss wipes out three wins, and "
+            f"{SAFE_LOOKBACK_GAMES} games is a small sample - a great record is not a guarantee. Every Safe "
+            f"Play is saved to Track Record at its price, so the profit there shows whether they really pay.",
+            label="ℹ️ How it works", use_container_width=True,
+        )
     if not matchup_rows:
-        st.info("No players currently have a High consistency rating with an upcoming game.")
+        st.info("No lines qualify right now - either no player has cleared a line often enough, or prop lines "
+                "haven't loaded (try \"Refresh prop lines now\" at the top of the page).")
     else:
-        matchup_df = pd.DataFrame(matchup_rows).sort_values("cv", ascending=True).head(15)
+        safe_df = pd.DataFrame(matchup_rows)
+        safe_df["confidence"] = safe_df["position"].apply(lambda pos: hp_segment_confidence.get(("safe", pos)))
 
         st.markdown("###### This week's safest plays")
-        safe_card_rows = matchup_df.head(3).to_dict("records")
 
         def _safe_card_body(row: dict) -> str:
             # Single-line HTML - see _edge_card_body's comment above for why.
-            badge = matchup_badge_html(row["matchup_label"], row["matchup_rank"]) if row.get("matchup_label") else ""
+            delta_cls = "delta-up" if row["direction"] == "▲ Over" else "delta-down"
+            price = f'{row["typical_price"]:+d}'
+            best = (f' · best {row["best_price"]:+d} {book_name(row["best_book"])}'
+                    if row.get("best_price") is not None and row.get("best_book") else "")
             return (
-                f'<div class="stat-big">{row["season_avg_ppr"]:.1f}</div>'
-                f'<div class="stat-label">avg PPR</div>'
-                f'<div style="margin-top:2px;">{badge}</div>'
-                f'{implied_total_badge_html(row.get("implied_total"))}'
+                f'<div class="stat-big">{row["hits"]}/{row["n_games"]}</div>'
+                f'<div class="stat-label">games cleared</div>'
+                f'<div style="margin-top:6px;"><span class="{delta_cls}">{row["direction"]} {row["prop_line"]:.1f} '
+                f'{row["stat"]}</span> <span class="stat-label">({row["line_type"]} line)</span></div>'
+                f'<div class="stat-label" style="margin-top:2px; text-transform:none;">{price}{best} · '
+                f'break-even {row["break_even"] * 100:.0f}%</div>'
+                f'{confidence_badge_html(row.get("confidence"))}'
                 f'{opportunity_trend_badge_html(row.get("opportunity_trend"))}'
             )
 
-        render_hotpick_cards(safe_card_rows, body_fn=_safe_card_body, cols_per_row=3, headshot_px=128, medals=True)
+        render_hotpick_cards(safe_df.head(3).to_dict("records"), body_fn=_safe_card_body, cols_per_row=3, headshot_px=128, medals=True)
 
-        safe_chart_df = matchup_df.head(10)
-        safe_bar = alt.Chart(safe_chart_df).mark_bar(cornerRadiusEnd=4).encode(
-            x=alt.X("season_avg_ppr:Q", title=f"{CURRENT_SEASON} Avg Fantasy Points (PPR)"),
-            y=alt.Y("player:N", sort="-x", title=None),
-            color=alt.Color(
-                "position:N", title="Position",
-                scale=alt.Scale(domain=list(POSITION_COLORS.keys()), range=list(POSITION_COLORS.values())),
-                legend=alt.Legend(orient="top"),
-            ),
-            tooltip=[
-                alt.Tooltip("player:N", title="Player"), alt.Tooltip("team:N", title="Team"),
-                alt.Tooltip("matchup_label:N", title="Matchup"),
-                alt.Tooltip("season_avg_ppr:Q", title=f"{CURRENT_SEASON} Avg PPR", format=".1f"),
-            ],
-        ).properties(height=max(220, 28 * len(safe_chart_df)))
-        st.altair_chart(safe_bar, use_container_width=True)
-
-        matchup_df["Implied Total"] = matchup_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
-        matchup_df["Opportunity"] = matchup_df["opportunity_trend"].apply(opportunity_trend_text)
-        matchup_df["Consistency (CV)"] = matchup_df["cv"].apply(lambda c: f"{c:.2f}" if pd.notna(c) else "—")
-        matchup_df["opp"] = matchup_df["team"].map(hp_opp_lookup)
-        matchup_display = matchup_df[["headshot_url", "player", "position", "team", "opp", "Consistency (CV)", "matchup_label", "season_avg_ppr", "Implied Total", "Opportunity"]].rename(columns={
+        safe_df["Bet"] = safe_df["direction"] + " " + safe_df["prop_line"].map("{:.1f}".format) + " " + safe_df["stat"]
+        safe_df["Line"] = safe_df["line_type"]
+        safe_df["Cleared"] = safe_df.apply(lambda r: f'{r["hits"]} of {r["n_games"]}', axis=1)
+        safe_df["Break-even"] = (safe_df["break_even"] * 100).round(0)
+        safe_df["Price"] = safe_df["typical_price"].map(lambda p: f"{int(p):+d}")
+        safe_df["Best price"] = safe_df.apply(
+            lambda r: f'{int(r["best_price"]):+d} {book_name(r["best_book"])}' if pd.notna(r.get("best_price")) and r.get("best_book") else "—", axis=1)
+        safe_df["Last-10 avg"] = safe_df["recent_avg"]
+        safe_df["Confidence"] = safe_df["confidence"].apply(_confidence_label_text)
+        safe_df["Implied Total"] = safe_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
+        safe_df["Opportunity"] = safe_df["opportunity_trend"].apply(opportunity_trend_text)
+        safe_df["opp"] = safe_df["team"].map(hp_opp_lookup)
+        safe_display = safe_df[["headshot_url", "player", "position", "team", "opp", "Bet", "Line", "Cleared",
+                                "Break-even", "Price", "Best price", "Last-10 avg", "Confidence", "Implied Total",
+                                "Opportunity"]].rename(columns={
             "headshot_url": "Headshot", "player": "Player", "team": "Team", "opp": "Opp", "position": "Pos",
-            "matchup_label": "Matchup", "season_avg_ppr": f"{CURRENT_SEASON} Avg PPR",
         })
-        render_player_table(matchup_display)
+        render_player_table(safe_display, column_config={
+            "Break-even": st.column_config.NumberColumn(format="%.0f%%"),
+            "Last-10 avg": st.column_config.NumberColumn(format="%.1f"),
+        })
 
     st.caption(
         "Betting lines and prices come straight from the sportsbooks - each line shown is the one most "
@@ -4362,8 +4480,9 @@ else:
     else:
         if hidden_td_n:
             st.caption(
-                f"{hidden_td_n} older TD pick(s) outside the top-picks rule (top {TD_ANYTIME_TOP_N} Anytime, "
-                f"top {TD_FIRST_TOP_N} First TD each week) are left out of these numbers. They're still saved."
+                f"{hidden_td_n} older pick(s) made under earlier rules are left out of these numbers (TD picks "
+                f"outside the weekly top {TD_ANYTIME_TOP_N} Anytime / top {TD_FIRST_TOP_N} First TD, and the first "
+                f"fantasy-points version of Safe Plays). They're still saved."
             )
         resolved_picks = [p for p in view_picks if p["status"] != "Pending"]
         pending_count = len(view_picks) - len(resolved_picks)
@@ -4408,10 +4527,11 @@ else:
 
         # ---- Profit at a flat $10 a pick ----
         # Hit rate alone can mislead (55% at -130 still loses money). Safe
-        # Plays aren't bets, so they have no profit.
+        # Plays are priced bets too (Sep 2026).
         st.markdown(f"###### 💵 Profit at ${PROFIT_STAKE:.0f} a pick")
-        pf1, pf2, pf3, pf_info = st.columns([1, 1, 1, 1], vertical_alignment="center")
-        for col, cat, label in ((pf1, "edge", "Prop Edges"), (pf2, "td_anytime", "Anytime TD"), (pf3, "td_first", "First TD")):
+        pf1, pf2, pf3, pf4, pf_info = st.columns(5, vertical_alignment="center")
+        for col, cat, label in ((pf1, "edge", "Prop Edges"), (pf2, "td_anytime", "Anytime TD"), (pf3, "td_first", "First TD"),
+                                (pf4, "safe", "Safe Plays")):
             with col:
                 pr = compute_profit(view_picks, cat)
                 if pr["n"]:
@@ -4431,7 +4551,8 @@ else:
                 f"- **Return** is profit ÷ total bet. Anything above 0% beat the sportsbooks' built-in cut.\n\n"
                 f"Why this matters: hit rate alone can fool you. At -130 odds you need to win 56.5% just to "
                 f"break even, so a 55% hit rate would still lose money.\n\n"
-                f"Safe Plays aren't bets, so they don't have a profit number - just a hit rate.\n\n"
+                f"Safe Plays are usually heavy favorites (like -300), so they win often but pay little - a single "
+                f"miss can erase several wins. Profit is the real test for them.\n\n"
                 f"TD picks: only the top {TD_ANYTIME_TOP_N} Anytime and top {TD_FIRST_TOP_N} First TD picks each "
                 f"week count. They're the favorites, so they cost more to bet - profit shows whether that's "
                 f"worth it.",
@@ -4542,8 +4663,7 @@ else:
                     column_config={"Season": st.column_config.NumberColumn(format="%d")},
                 )
                 st.caption("Each cell is that week's record (hits-misses) and hit rate. The last column is what "
-                           "every bet that week would have won or lost together. Safe Plays aren't bets, so they "
-                           "aren't in it.")
+                           "every pick that week would have won or lost together at $10 each.")
 
         with h_tabs[2]:
             scorecard = compute_position_scorecard(view_picks)
@@ -4609,7 +4729,11 @@ else:
                 prediction = f"Anytime TD ({detail.get('predicted_pct', 0):.0f}% implied)"
                 actual_text = (f"{actual['actual_tds']} TD{'s' if actual['actual_tds'] != 1 else ''}"
                                if "actual_tds" in actual else "—")
-            elif cat == "safe":
+            elif cat == "safe" and "prop_line" in detail:
+                prediction = (f"{detail.get('direction', '')} {detail.get('prop_line', '')} {detail.get('stat', '')} "
+                              f"({detail.get('line_type') or 'Main'} line, cleared {detail.get('hits', '?')}/{detail.get('n_games', '?')})")
+                actual_text = f"{actual['actual_value']:.1f}" if "actual_value" in actual else "—"
+            elif cat == "safe":  # legacy fantasy-points version
                 prediction = f"Safe Play: {detail.get('floor_ppr', 0):.1f}+ pts (avg {detail.get('season_avg_ppr', 0):.1f})"
                 actual_text = (f"{actual['actual_ppr']:.1f} pts" if "actual_ppr" in actual
                                else actual.get("note", "—"))
