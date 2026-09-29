@@ -6,8 +6,16 @@ config.py
 # numbers show up in the Overview cards and Prop Comparator (since those
 # are about right-now decisions); every season in SEASONS shows up in the
 # Player Deep Dive trend charts for longer-term context.
-SEASONS = [2025, 2026]
-CURRENT_SEASON = max(SEASONS)
+#
+# Automatic (Sep 2026): the season rolls over by itself on the Thursday
+# after Labor Day (the NFL opener) - the same rule nflverse uses for its
+# own data, so the app never asks for a season nflverse doesn't have yet.
+# To pin a season by hand (e.g. testing), set SEASON_OVERRIDE = 2026.
+import nflreadpy as _nfl
+
+SEASON_OVERRIDE = None
+CURRENT_SEASON = SEASON_OVERRIDE or _nfl.get_current_season()
+SEASONS = [CURRENT_SEASON - 1, CURRENT_SEASON]
 
 # How many players per position count as "starters" to auto-track.
 # e.g. WR: 2 means each team's top 2 depth-chart wide receivers.
