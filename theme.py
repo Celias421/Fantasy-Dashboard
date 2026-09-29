@@ -215,6 +215,30 @@ def inject_css() -> None:
     .delta-up {{ color: {GOOD}; font-weight: 700; font-size: 15px; }}
     .delta-down {{ color: {BAD}; font-weight: 700; font-size: 15px; }}
     .delta-flat {{ color: {SUB}; font-weight: 600; font-size: 15px; }}
+    /* ---- Plain-English cards (Sep 2026): the bet, one line on why, then
+       a checklist of reasons with a tone marker. ---- */
+    .bet-line {{ font-family: {FONT_DISPLAY}; font-size: 20px; font-weight: 800; margin-top: 12px;
+                 line-height: 1.2; }}
+    .bet-over {{ color: {GOOD}; }}
+    .bet-under {{ color: {BAD}; }}
+    .bet-td {{ color: {INK}; }}
+    .bet-note {{ font-family: {FONT_BODY}; font-size: 13px; font-weight: 600; color: {SUB}; white-space: nowrap; }}
+    .bet-sub {{ font-size: 14.5px; color: {INK}; margin-top: 4px; line-height: 1.45; }}
+    .bet-sub b, .why-text b {{ font-weight: 700; }}
+    .why-list {{ margin-top: 10px; padding-top: 8px; border-top: 1px solid {LINE};
+                 display: flex; flex-direction: column; gap: 6px; }}
+    .why {{ display: flex; gap: 8px; align-items: flex-start; font-size: 14px; line-height: 1.4; color: {INK}; }}
+    .why-mark {{ flex: none; width: 18px; height: 18px; border-radius: 50%; font-size: 12px; font-weight: 800;
+                 display: inline-flex; align-items: center; justify-content: center; margin-top: 1px; }}
+    .why-good .why-mark {{ background: {GOOD_SOFT}; color: {GOOD}; border: 1px solid {GOOD_BORDER}; }}
+    .why-bad .why-mark {{ background: {BAD_SOFT}; color: {BAD}; border: 1px solid {BAD_BORDER}; }}
+    .why-neutral .why-mark, .why-info .why-mark {{ background: {SURFACE_2}; color: {SUB}; border: 1px solid {LINE}; }}
+    /* out-rank the global "stMarkdownContainer span = 1rem" rule */
+    [data-testid="stMarkdownContainer"] .why .why-text {{ font-size: inherit; }}
+    [data-testid="stMarkdownContainer"] .why .why-mark {{ font-size: 12px; }}
+    [data-testid="stMarkdownContainer"] .bet-line .bet-note {{ font-size: 13px; }}
+    .card-section {{ margin-top: 12px; }}
+    .card-section + .card-section {{ padding-top: 10px; border-top: 1px dashed {LINE}; }}
     .consistency-badge {{
         display: inline-block; font-size: 13px; padding: 4px 11px;
         border-radius: 4px; margin-top: 6px; margin-right: 4px;

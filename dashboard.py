@@ -35,6 +35,7 @@ from data_loader import (
     ALT_COLUMNS,
 )
 import pick_tracker_store
+import card_text as ct
 from odds_math import expected_value, break_even_prob, profit_on_stake, book_name, american_to_decimal
 
 st.set_page_config(page_title="The Prop Shop", layout="wide", page_icon="🏈")
@@ -832,28 +833,58 @@ def build_player_summary(view: pd.DataFrame, sort_stat: str) -> pd.DataFrame:
 
 
 def _summary_card_body(p, sort_stat: str) -> str:
-    """Single-line-safe stat/badge block for a build_player_summary() row -
-    shared by the Overview cards (render_player_cards) and every other
-    card that shows a summary row (currently the Matchups tab, via
-    render_hotpick_cards) so the same player is described identically no
-    matter which card frame it's shown in. `p` can be a pandas Series or a
-    plain dict - both support [] and .get()."""
-    badges = f'<div class="consistency-badge">Consistency: {p["consistency"]}</div>'
-    if pd.notna(p.get("matchup_label")):
-        badges += matchup_badge_html(p["matchup_label"], int(p["matchup_rank"]))
-    if pd.notna(p.get("td_odds_pct")):
-        badges += anytime_td_badge_html(p["td_odds_pct"])
-    if pd.notna(p.get("first_td_pct")):
-        badges += first_td_badge_html(p["first_td_pct"])
-    if pd.notna(p.get("injury_label")):
-        badges += f'<div class="injury-badge">{p["injury_label"]}</div>'
-    prop_line_text = f' (line {p["prop_line"]:.1f})' if p.get("has_prop") else ""
+    """Plain-English stat card body (Sep 2026) for a build_player_summary()
+    row - shared by Overview, Game Center and Matchups. The big number is
+    his per-game average; every line under it is a full sentence (see
+    card_text.py) so nothing needs decoding. `p` is a Series or dict."""
+    has_prop = bool(p.get("has_prop", False))
+    reasons = [
+        # fantasy points etc. never have a sportsbook line - skip the row
+        ct.line_vs_avg_sentence(p["avg"], p.get("prop_line") if has_prop else None, has_prop, sort_stat)
+        if PROP_MARKET_MAP.get(sort_stat) else None,
+        ct.matchup_reason(p.get("matchup_label"), p.get("matchup_rank"), p.get("position")),
+        ct.consistency_reason(p.get("consistency")),
+        ct.td_reason(p.get("td_odds_pct")),
+        ct.td_reason(p.get("first_td_pct"), first=True),
+        ct.injury_reason(p.get("injury_label")),
+    ]
     return (
         f'<div class="stat-big">{p["avg"]:.1f}</div>'
-        f'<div class="stat-label">avg {sort_stat.replace("_", " ")}{prop_line_text}</div>'
-        f'<div style="margin-top:4px;">{delta_html(p["delta"], p.get("has_prop", False))}</div>'
-        f"{badges}"
+        f'<div class="stat-label">{ct.stat_words(sort_stat)} per game ({CURRENT_SEASON})</div>'
+        f"{ct.reasons_html(reasons)}"
     )
+
+
+def _td_bet_block(row: dict) -> str:
+    """Headline + chances for a TD pick. The headline names the pick(s)
+    this player was chosen for (track_anytime / track_first)."""
+    a, f = _num(row.get("anytime_td_pct")), _num(row.get("first_td_pct"))
+    picks = []
+    if row.get("track_anytime", a is not None):
+        picks.append("Anytime TD")
+    if row.get("track_first", False):
+        picks.append("First TD")
+    head = ct.headline_html("🎯 " + " + ".join(picks or ["Anytime TD"]))
+    lines = []
+    if a is not None:
+        lines.append(f"Sportsbooks give him a <b>{a:.0f}%</b> chance to score a TD")
+    if f is not None:
+        lines.append(f"and a <b>{f:.0f}%</b> chance to score first" if lines else
+                     f"Sportsbooks give him a <b>{f:.0f}%</b> chance to score the game's first TD")
+    return head + (ct.sub_html(" ".join(lines) + ".") if lines else "")
+
+
+def _safe_bet_block(row: dict) -> str:
+    return (ct.bet_html(row["direction"], row["prop_line"], row["stat_col"], note=f'{row["line_type"]} line')
+            + ct.sub_html(ct.safe_sentence(row["hits"], row["n_games"], row["break_even"], row["typical_price"])))
+
+
+def _safe_price_reason(row: dict):
+    bp, bb = _num(row.get("best_price")), row.get("best_book")
+    if bp is None or not isinstance(bb, str):
+        return None
+    return ("info", f"Best price we found: <b>{int(bp):+d}</b> at {book_name(bb)} "
+                    f"(typical {int(row['typical_price']):+d}).")
 
 
 def render_player_cards(summary_df: pd.DataFrame, sort_stat: str, cols_per_row: int = 4):
@@ -874,7 +905,7 @@ def render_player_cards(summary_df: pd.DataFrame, sort_stat: str, cols_per_row: 
                 card_html = (
                     f'<div class="player-card" style="border-left: 4px solid {p["team_color"]};">'
                     f'<div style="display:flex; align-items:center; gap:12px;">'
-                    f"{player_avatar_html(p, 132)}"
+                    f"{player_avatar_html(p, 96)}"
                     f"<div>"
                     f'<div style="font-weight:600;">{p["player"]}</div>'
                     f'<div style="font-size:13px; color:{theme.SUB};">{team_logo_html(p["team"])}{p["position"]} · {p["team"]}</div>'
@@ -2202,32 +2233,28 @@ def render_lineup_tab():
         if row is None:
             st.markdown(f"**{slot_label}** — *no eligible player*")
             return
-        badge = ""
-        # Same NaN-vs-None trap as below: a bye-week player's matchup_rank
-        # comes back as NaN (not None) once it's passed through a
-        # DataFrame, and "is not None" doesn't catch that - int(nan)
-        # raises ValueError, which would crash this tab on any bye week.
-        if pd.notna(row["matchup_rank"]):
-            badge = matchup_badge_html(f"{row['opponent']}", int(row["matchup_rank"]), tag="span")
-        # pd.notna, not truthiness: a None injury_status becomes NaN once
-        # these rows pass through a DataFrame, and bool(float('nan')) is
-        # True in Python - a plain "if row['injury_status']" check would
-        # print the literal word "nan" for every healthy player.
-        inj = f" · {row['injury_status']}" if pd.notna(row["injury_status"]) else ""
+        # Plain-English (Sep 2026): projection sentence + checklist.
+        # pd.notna, not truthiness: NaN (bye / healthy) is truthy in Python.
+        rank = row["matchup_rank"] if pd.notna(row["matchup_rank"]) else None
+        adj = row["proj_points"] - row["season_avg"]
+        if abs(adj) < 0.05:
+            proj_note = "same as his season average"
+        else:
+            proj_note = f"{abs(adj):.1f} {'more' if adj > 0 else 'fewer'} than his season average of {row['season_avg']:.1f}"
+        reasons = ct.reasons_html([
+            ct.matchup_reason(row.get("opponent"), rank, row["position"]),
+            ct.injury_reason(row["injury_status"] if pd.notna(row["injury_status"]) else None),
+        ])
 
-        # Large Hot-Picks-style card (player_avatar_html gives the same
-        # 128px photo-or-initials-avatar treatment as every other large
-        # card on the site) and single-line HTML - a lineup is at most a
-        # handful of slots, never the "many players" case Overview exists
-        # for, so this always gets the large card.
+        # Large Hot-Picks-style card, single-line HTML (see render_hotpick_cards).
         card_html = (
-            f'<div class="player-card" style="display:flex; align-items:center; gap:16px;">'
+            f'<div class="player-card" style="display:flex; align-items:flex-start; gap:16px;">'
             f"{player_avatar_html(row, 128)}"
-            f"<div>"
+            f'<div style="flex:1;">'
             f'<div style="font-size:13px; color:{theme.SUB}; text-transform:uppercase; letter-spacing:.03em;">{slot_label}</div>'
             f'<div style="font-size:19px; font-weight:700;">{row["player"]} <span style="font-weight:400; color:{theme.SUB};">({team_logo_html(row["team"])}{row["team"]})</span></div>'
-            f'<div style="margin-top:4px;">{badge}</div>'
-            f'<div style="margin-top:4px; color:{theme.SUB};">Proj <b style="color:{theme.INK};">{row["proj_points"]}</b> pts · season avg {row["season_avg"]}{inj}</div>'
+            f'<div class="bet-sub">Projected <b>{row["proj_points"]:.1f} fantasy points</b> — {proj_note}.</div>'
+            f"{reasons}"
             f"</div>"
             f"</div>"
         )
@@ -2259,20 +2286,23 @@ def render_lineup_tab():
     )
     if "opp_team" not in display.columns:
         display["opp_team"] = None
+    _lineup_cols = ["in_lineup", "headshot_url", "player", "position", "team", "opp_team", "proj_points", "season_avg", "matchup_text", "injury_status", "note"]
+    if not display["note"].astype(str).str.strip().any():
+        _lineup_cols.remove("note")  # hide an all-empty column
     render_player_table(
-        display[["in_lineup", "headshot_url", "player", "position", "team", "opp_team", "proj_points", "season_avg", "opponent_plain", "matchup_rank", "injury_status", "note"]]
+        display.assign(matchup_text=display.apply(lambda r: ct.matchup_cell(r["matchup_rank"], r["position"]), axis=1))
+        [_lineup_cols]
         .rename(columns={
             "in_lineup": "Start", "headshot_url": "Headshot", "player": "Player", "position": "Pos",
-            "team": "Team", "opp_team": "Opp", "opponent_plain": "Matchup", "proj_points": "Proj",
-            "season_avg": "Szn avg", "matchup_rank": "Opp rank", "injury_status": "Injury", "note": "Note",
+            "team": "Team", "opp_team": "Opp", "proj_points": "Projected pts",
+            "season_avg": "Season avg", "matchup_text": "Matchup", "injury_status": "Injury", "note": "Note",
         }),
         lead_cols=["Start"],
         column_config={
             "Start": st.column_config.TextColumn(width="small"),
-            "Matchup": st.column_config.TextColumn(width=270),
-            "Proj": st.column_config.NumberColumn(width="small"),
-            "Szn avg": st.column_config.NumberColumn(width="small"),
-            "Opp rank": st.column_config.NumberColumn(width="small"),
+            "Matchup": st.column_config.TextColumn(width=230),
+            "Projected pts": st.column_config.NumberColumn(format="%.1f", help="This week's fantasy points projection (PPR)"),
+            "Season avg": st.column_config.NumberColumn(format="%.1f", help="Fantasy points (PPR) per game this season"),
             "Injury": st.column_config.TextColumn(width=140),
             "Note": st.column_config.TextColumn(width=200),
         },
@@ -2425,7 +2455,7 @@ if tab_side == "🏠 Dashboard":
     overall_pct, overall_hits, overall_n = compute_hit_rate(resolved_all)
     kc3.metric(
         "Overall hit rate", f"{overall_pct:.0f}%" if overall_pct is not None else "—",
-        f"{overall_hits}/{overall_n} resolved" if overall_n else "no picks yet", delta_color="off",
+        f"{overall_hits}/{overall_n} resolved" if overall_n else "no picks yet", delta_color="off", delta_arrow="off",
     )
 
     if not ODDS_API_KEY:
@@ -2452,7 +2482,7 @@ if tab_side == "🏠 Dashboard":
                 [spotlight_row],
                 body_fn=lambda row: (
                     f'<div class="stat-big">{row["implied_prob"]:.0f}%</div>'
-                    f'<div class="stat-label">Anytime TD chance — highest on the board right now</div>'
+                    f'<div class="bet-sub">Sportsbooks give him the best chance of anyone to score a TD this week.</div>'
                 ),
                 cols_per_row=1, headshot_px=128,
             )
@@ -2507,18 +2537,17 @@ elif tab_side == "🔍 Research":
                 st.caption(f"{len(summary_df)} players — {CURRENT_SEASON} season, ranked by {sort_stat.replace('_', ' ')}")
             with badge_info_col:
                 theme.info_popover(
-                    "**What the badges mean:**\n\n"
-                    "- **Matchup** - how tough this week's opponent is against this player's position. "
-                    "Red = one of the toughest defenses, green = one of the easiest.\n"
-                    "- **🎯 Anytime TD** - the sportsbooks' odds, turned into a percent, that this player "
-                    "scores a touchdown at any point in the game.\n"
-                    "- **🥇 First TD** - the chance he scores the game's very first touchdown (a much "
-                    "harder bet to win - see Props → First TD).\n\n"
-                    "Both percentages come from the sportsbooks, not The Prop Shop, and include the "
-                    "books' built-in profit, so they run slightly high. Hover over a badge for details.",
-                    label="ℹ️ Badge key",
+                    "**How to read a card:** the big number is his average per game this season. "
+                    "Under it, each line is a plain sentence with a marker: ✓ = in his favor, ! = against "
+                    "him, – = neutral, • = just information.\n\n"
+                    "- **Matchup** compares this week's opponent to the rest of the league against his "
+                    "position (1st-toughest to 32nd).\n"
+                    "- **Steady / Up-and-down** is how much his weekly numbers swing.\n"
+                    "- **TD chances** come from the sportsbooks' odds, include their built-in cut, and so "
+                    "run slightly high.",
+                    label="ℹ️ How to read",
                 )
-            render_player_cards(summary_df, sort_stat, cols_per_row=4)
+            render_player_cards(summary_df, sort_stat, cols_per_row=3)
 
     # ---------------- Player Deep Dive (full history) ----------------
     with tab_deep_dive:
@@ -3118,14 +3147,15 @@ elif tab_side == "🎯 Props":
                     pos_ranks[["team", rank_col]], left_on="opponent_team", right_on="team", how="left"
                 )
                 prop_pdf["matchup"] = prop_pdf.apply(
-                    lambda r: f"{r['opponent_team']} (#{int(r[rank_col])} toughest vs {position})"
-                    if pd.notna(r.get(rank_col)) else str(r["opponent_team"]),
-                    axis=1,
-                )
+                    lambda r: ct.matchup_cell(r[rank_col], position) if pd.notna(r.get(rank_col)) else "—", axis=1)
             else:
-                prop_pdf["matchup"] = prop_pdf.get("opponent_team", "")
+                prop_pdf["matchup"] = "—"
+            prop_pdf["opp_name"] = prop_pdf["opponent_team"] if "opponent_team" in prop_pdf.columns else "—"
 
-            display = prop_pdf[["week", "matchup", prop_stat, "result"]].rename(columns={prop_stat: "actual"})
+            display = prop_pdf[["week", "opp_name", "matchup", prop_stat, "result"]].rename(columns={
+                "week": "Week", "opp_name": "Opponent", "matchup": "How tough that defense is",
+                prop_stat: f"He had ({ct.stat_words(prop_stat)})", "result": "vs your line",
+            })
             st.dataframe(display, width="content", hide_index=True, row_height=38)
             st.caption(
                 f"Matchup rank goes from #1 to #32: #1 is the defense that has given up the least to this "
@@ -3239,7 +3269,7 @@ elif tab_side == "🎯 Props":
                     def _first_td_podium_body(row: dict) -> str:
                         return (
                             f'<div class="stat-big">{row["first_td_pct"]:.0f}%</div>'
-                            f'<div class="stat-label">First TD chance</div>'
+                            f'<div class="bet-sub">chance he scores the game\'s first touchdown (sportsbook odds)</div>'
                         )
 
                     # Same large Hot-Picks-style card (with the 🥇🥈🥉
@@ -3683,65 +3713,36 @@ elif tab_side == "🔥 Hot Picks":
     hp_title_col, hp_guide_col = st.columns([6, 1])
     with hp_title_col:
         st.subheader("🔥 Hot Picks")
-    _guide_0 = (
-        (
-        f"**🔥 Confidence - how our past picks of this kind have done.** Each week the app looks back at "
-        f"how its earlier picks turned out and groups them by type and position (for example, \"Prop Edges "
-        f"for RBs\"). Once a group has at least **{CONFIDENCE_MIN_N} finished picks** it gets a label: 🔥 **Hot** "
-        f"= hitting {CONFIDENCE_HIGH_PCT:.0f}% or more, 🧊 **Cold** = hitting {CONFIDENCE_LOW_PCT:.0f}% or less, "
-        f"➖ **Even** = in between. Under {CONFIDENCE_MIN_N} finished picks it shows 🆕 **New** - too early to "
-        f"judge. Hot groups move up the lists and cold ones move down, but **nothing is ever hidden**. Only "
-        f"**this season's** picks count, so each new season starts fresh. The full breakdown is on Track "
-        f"Record → **By position**. Safe Plays get their own badge from their own record."
-    )
-    )
-    _guide_1 = (
-        (
-        "**📈 Implied Total - how many points Vegas expects this team to score.** It's worked out from the "
-        "game's over/under and point spread. More expected points usually means more fantasy points to go "
-        "around. Teams expected to score **26 or more** move up the list; teams at **19 or fewer** move "
-        "down - again, nothing is hidden. Confidence is checked first; this only breaks ties. No badge just "
-        "means the betting line isn't posted yet, or the team is on a bye."
-    )
-    )
-    _guide_2 = (
-        (
-        "**💰 EV - is this bet actually worth making?** (Prop-Line Edges only.) EV combines two things "
-        "into one number:\n\n"
-        "1. **The real chance the pick wins.** Sportsbooks build a small profit into every line, so their "
-        "odds always add up to a bit over 100%. We take that profit back out to get the betting market's "
-        "honest estimate.\n"
-        "2. **The best price any sportsbook is offering** for that side (shown in the badge, e.g. "
-        "\"-105 FanDuel\").\n\n"
-        "EV is the average profit per $1 bet if that chance is right. Example: a 55% chance at -110 odds = "
-        "**+5.0%**. Every price has a break-even win rate (-110 needs 52.4%, +100 needs 50%, -150 needs 60%); "
-        "positive EV means the chance beats it. Negative EV means the sportsbook's cut outweighs the edge, "
-        "even if the edge looks big.\n\n"
-        "Good to know: real edges are usually small (+1-5%) and prices move, so refresh the odds right "
-        "before betting. The best price may be at a sportsbook you don't use; check your own book's price. "
-        "EV doesn't change the order of the list. No badge means the sportsbooks didn't post both sides."
-    )
-    )
-    _guide_3 = (
-        (
-        f"**📈/📉 Role Trending - is this player's role growing or shrinking?** We compare his share of "
-        f"the action over his last {OPPORTUNITY_TREND_LAST_N} games (share of his team's targets for pass "
-        f"catchers, share of snaps for everyone else) with his average for the whole {CURRENT_SEASON} season. "
-        f"A badge only appears when that's changed by **{OPPORTUNITY_TREND_THRESHOLD_PP:.0f}+ percentage points** "
-        f"and he's played at least 2 games. 📈 means his role is growing, so his season average may be "
-        f"*underselling* him; 📉 means the opposite. It's extra context only - it doesn't change the order "
-        f"of the list."
-    )
+    # Sep 2026: the cards now explain themselves in full sentences, so this
+    # is a short "how to read a card" note plus the detail behind each line.
+    _card_guide = (
+        "#### How to read a card\n\n"
+        "Every card says the same three things, top to bottom:\n\n"
+        "1. **The bet**, e.g. *▲ Over 45.5 receiving yards* (green = Over, red = Under).\n"
+        "2. **Why** in one sentence, e.g. *he's averaging 52.3, 6.8 more than the line.*\n"
+        "3. **A checklist of reasons.** ✓ = works in the bet's favor, ! = works against it, "
+        "– = neutral, • = just information.\n\n"
+        "---\n\n"
+        "**The checklist lines, in more detail**\n\n"
+        "- **Price (Good / Fair / Pricey):** sportsbooks build a small cut into every line. We take it out "
+        "to get the market's honest chance, then check it against the best price available. \"Worth about "
+        "4¢ per $1\" means that, over many bets like it, you'd expect to come out 4 cents ahead per dollar. "
+        "Real edges are usually small, and prices move, so check your own book before betting.\n"
+        "- **Scoring game (High / Average / Low):** how many points Vegas expects the team to score, worked "
+        "out from the spread and over/under. 26+ is high, 19 or less is low. High-scoring games float up "
+        "the list.\n"
+        f"- **Role (Bigger / Smaller):** his share of the team's targets (or snaps) over his last "
+        f"{OPPORTUNITY_TREND_LAST_N} games vs. the whole season. Only shown when it moved "
+        f"{OPPORTUNITY_TREND_THRESHOLD_PP:.0f}+ points.\n"
+        f"- **Our record (Hot / Even / Cold):** how this kind of pick has done at this position on Track "
+        f"Record this season. It needs {CONFIDENCE_MIN_N}+ results to count; {CONFIDENCE_HIGH_PCT:.0f}%+ is "
+        f"hot, {CONFIDENCE_LOW_PCT:.0f}% or less is cold. Hot groups move up the lists, cold ones move down; "
+        f"nothing is hidden.\n"
+        "- **TD chances:** straight from the sportsbooks' odds. They include the books' cut, so they run a "
+        "little high."
     )
     with hp_guide_col:
-        theme.info_popover(
-            "#### Badge guide\n\n"
-            + _guide_0 + "\n\n---\n\n"
-            + _guide_1 + "\n\n---\n\n"
-            + _guide_2 + "\n\n---\n\n"
-            + _guide_3,
-            label="ℹ️ Badge guide", use_container_width=True,
-        )
+        theme.info_popover(_card_guide, label="ℹ️ How to read", use_container_width=True)
     st.caption(
         "This week's best opportunities across the whole league, in three lists: **Prop-Line Edges** "
         "(where a player's season average is far from the sportsbook's line), **TD Scoring Chances** "
@@ -4068,50 +4069,32 @@ elif tab_side == "🔥 Hot Picks":
             if not source:
                 continue
 
-            badges_html = ""
+            # Plain-English (Sep 2026): one section per pick this player
+            # has (Prop Edge / TD / Safe Play), then the shared reasons once.
+            sections = []
             if edge:
-                delta_cls = "delta-up" if edge["direction"] == "▲ Over" else "delta-down"
-                badges_html += (
-                    f'<div style="margin-top:6px;"><span class="{delta_cls}">{edge["direction"]} '
-                    f'{edge["prop_line"]:.1f} {edge["stat"]}</span> '
-                    f'<span class="stat-label">({CURRENT_SEASON} avg {edge["season_avg"]:.1f}, '
-                    f'edge {edge["edge"]:+.1f})</span></div>'
+                sections.append(
+                    '<div class="stat-label">📈 Prop edge</div>'
+                    + ct.bet_html(edge["direction"], edge["prop_line"], edge["stat_col"])
+                    + ct.sub_html(ct.edge_sentence(edge["season_avg"], edge["prop_line"], edge["stat_col"], CURRENT_SEASON))
+                    + ct.reasons_html([ct.price_reason(edge.get("ev"), edge.get("best_price"), edge.get("best_book"))])
                 )
-                badges_html += ev_badge_html(edge.get("ev"), edge.get("best_price"), edge.get("best_book"))
             if td:
-                if td["anytime_td_pct"] is not None:
-                    badges_html += anytime_td_badge_html(td["anytime_td_pct"])
-                if td["first_td_pct"] is not None:
-                    badges_html += first_td_badge_html(td["first_td_pct"])
+                sections.append('<div class="stat-label">🎯 Touchdown</div>' + _td_bet_block(td))
             if matchup:  # Safe Play
-                s_cls = "delta-up" if matchup["direction"] == "▲ Over" else "delta-down"
-                badges_html += (
-                    f'<div style="margin-top:6px;">🛡️ <span class="{s_cls}">{matchup["direction"]} '
-                    f'{matchup["prop_line"]:.1f} {matchup["stat"]}</span> '
-                    f'<span class="stat-label">({matchup["line_type"]}, {matchup["typical_price"]:+d}, cleared '
-                    f'{matchup["hits"]}/{matchup["n_games"]})</span></div>'
-                )
-            if not badges_html:
-                badges_html = '<div class="stat-label" style="margin-top:8px;">No specific angle this week</div>'
-
-            # Confidence badge: edge's segment takes priority (it's the
-            # more specific claim - an exact stat line vs. a TD market),
-            # then TD's driving category, then none for a matchup-only row
-            # (a Safe-Play-only row shows its bet line above but no badge
-            # here, to keep one badge per card). Informational only - this panel keeps
-            # its existing alphabetical (position, player) sort below.
-            conf_segment = None
+                sections.append('<div class="stat-label">🛡️ Safe Play</div>' + _safe_bet_block(matchup))
             if edge:
-                conf_segment = hp_segment_confidence.get(("edge", position))
+                rec = ct.record_reason(hp_segment_confidence.get(("edge", position)), "edge", position, CONFIDENCE_MIN_N)
             elif td:
                 driving = "td_first" if (td["first_td_pct"] or -1) >= (td["anytime_td_pct"] or -1) else "td_anytime"
-                conf_segment = hp_segment_confidence.get((driving, position))
-            if edge or td:
-                badges_html += confidence_badge_html(conf_segment)
-            badges_html += implied_total_badge_html(hp_implied_totals.get(source["team"]))
-            trend_source = edge or td
-            if trend_source:
-                badges_html += opportunity_trend_badge_html(trend_source.get("opportunity_trend"))
+                rec = ct.record_reason(hp_segment_confidence.get((driving, position)), driving, position, CONFIDENCE_MIN_N)
+            else:
+                rec = ct.record_reason(hp_segment_confidence.get(("safe", position)), "safe", position, CONFIDENCE_MIN_N)
+            badges_html = "".join(f'<div class="card-section">{x}</div>' for x in sections) + ct.reasons_html([
+                ct.game_reason(source["team"], hp_implied_totals.get(source["team"])),
+                ct.role_reason(source.get("opportunity_trend")),
+                rec,
+            ])
 
             suggestion_rows.append({
                 "player": player,
@@ -4139,8 +4122,8 @@ elif tab_side == "🔥 Hot Picks":
     st.markdown("##### 📈 Biggest Prop-Line Edges")
     st.caption("Where a player's average this season is furthest from the line most sportsbooks are "
         "offering. A big gap is worth a look: ▲ **Over** if he's been beating the line, ▼ **Under** if he's "
-        "been falling short of it. **EV** then tells you whether it's actually worth betting at the best "
-        "price available - see ℹ️ Badge guide.")
+        "been falling short of it. Each card's checklist says whether the price is worth it - see "
+        "ℹ️ How to read.")
     if not edge_rows:
         st.info("No live prop lines available right now to compare against - try \"Refresh prop lines now\" at the top of the page.")
     else:
@@ -4163,24 +4146,18 @@ elif tab_side == "🔥 Hot Picks":
         edge_card_rows = edge_df.head(3).to_dict("records")
 
         def _edge_card_body(row: dict) -> str:
-            # Single-line HTML, no embedded newlines - matching every other
-            # HTML-returning helper in this file (pill_badge_html, delta_html,
-            # etc.). A multi-line triple-quoted string here breaks Streamlit's
-            # markdown-it HTML-block parsing when it's spliced into the
-            # outer card template (a blank/whitespace-only line acts as an
-            # HTML-block terminator), which showed up as a literal, visible
-            # "</div>" on the card instead of a closed tag - caught by
-            # actually rendering this with populated data before shipping.
-            delta_cls = "delta-up" if row["direction"] == "▲ Over" else "delta-down"
+            # Plain-English card (Sep 2026): the bet, why, then reasons.
+            # Single-line HTML only - a blank line inside breaks Streamlit's
+            # HTML block (see render_hotpick_cards).
             return (
-                f'<div class="stat-big">{row["edge"]:+.1f}</div>'
-                f'<div class="stat-label">{row["stat"]} edge</div>'
-                f'<div style="margin-top:6px;"><span class="{delta_cls}">{row["direction"]} '
-                f'{row["prop_line"]:.1f} (avg {row["season_avg"]:.1f})</span></div>'
-                f'{confidence_badge_html(row.get("confidence"))}'
-                f'{implied_total_badge_html(row.get("implied_total"))}'
-                f'{ev_badge_html(row.get("ev"), row.get("best_price"), row.get("best_book"))}'
-                f'{opportunity_trend_badge_html(row.get("opportunity_trend"))}'
+                ct.bet_html(row["direction"], row["prop_line"], row["stat_col"])
+                + ct.sub_html(ct.edge_sentence(row["season_avg"], row["prop_line"], row["stat_col"], CURRENT_SEASON))
+                + ct.reasons_html([
+                    ct.price_reason(row.get("ev"), row.get("best_price"), row.get("best_book")),
+                    ct.game_reason(row["team"], row.get("implied_total")),
+                    ct.role_reason(row.get("opportunity_trend")),
+                    ct.record_reason(row.get("confidence"), "edge", row["position"], CONFIDENCE_MIN_N),
+                ])
             )
 
         render_hotpick_cards(edge_card_rows, body_fn=_edge_card_body, cols_per_row=3, headshot_px=128, medals=True)
@@ -4230,19 +4207,22 @@ elif tab_side == "🔥 Hot Picks":
             use_container_width=True,
         )
 
-        edge_df["Confidence"] = edge_df["confidence"].apply(_confidence_label_text)
-        edge_df["Implied Total"] = edge_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
-        edge_df["EV"] = edge_df.apply(
-            lambda r: ev_text(_num(r.get("ev")), None if _num(r.get("best_price")) is None else int(r["best_price"]), r.get("best_book")),
-            axis=1,
-        )
-        edge_df["Opportunity"] = edge_df["opportunity_trend"].apply(opportunity_trend_text)
+        # Same wording and ✓ / ! / – markers as the cards (card_text.py).
+        edge_df["Bet"] = edge_df.apply(lambda r: ct.bet_text(r["direction"], r["prop_line"], r["stat_col"]), axis=1)
+        edge_df["Avg vs line"] = edge_df.apply(lambda r: ct.avg_vs_line_cell(r["season_avg"], r["prop_line"]), axis=1)
+        edge_df["Price"] = edge_df.apply(
+            lambda r: ct.price_cell(_num(r.get("ev")), _num(r.get("best_price")), r.get("best_book")), axis=1)
+        edge_df["Scoring game"] = edge_df["implied_total"].apply(ct.game_cell)
+        edge_df["Role"] = edge_df["opportunity_trend"].apply(ct.role_cell)
+        edge_df["Our record"] = edge_df["confidence"].apply(lambda seg: ct.record_cell(seg, CONFIDENCE_MIN_N))
         edge_df["opp"] = edge_df["team"].map(hp_opp_lookup)
-        edge_display = edge_df[["headshot_url", "player", "position", "team", "opp", "stat", "season_avg", "prop_line", "edge", "direction", "Confidence", "Implied Total", "EV", "Opportunity"]].rename(columns={
-            "headshot_url": "Headshot", "player": "Player", "team": "Team", "opp": "Opp", "position": "Pos", "stat": "Stat",
-            "season_avg": f"{CURRENT_SEASON} Avg", "prop_line": "Prop Line", "edge": "Edge", "direction": "Direction",
+        edge_display = edge_df[["headshot_url", "player", "position", "team", "opp", "Bet", "season_avg", "Avg vs line",
+                                "Price", "Scoring game", "Role", "Our record"]].rename(columns={
+            "headshot_url": "Headshot", "player": "Player", "team": "Team", "opp": "Opp", "position": "Pos",
+            "season_avg": f"His avg ({CURRENT_SEASON})",
         })
-        render_player_table(edge_display, column_config={"Edge": st.column_config.NumberColumn(format="%+.1f")})
+        render_player_table(edge_display, column_config={
+            f"His avg ({CURRENT_SEASON})": st.column_config.NumberColumn(format="%.1f")})
 
     st.divider()
 
@@ -4290,15 +4270,12 @@ elif tab_side == "🔥 Hot Picks":
         td_card_rows = td_df.head(3).to_dict("records")
 
         def _td_card_body(row: dict) -> str:
-            badges = ""
-            if pd.notna(row.get("anytime_td_pct")):
-                badges += anytime_td_badge_html(row["anytime_td_pct"])
-            if pd.notna(row.get("first_td_pct")):
-                badges += first_td_badge_html(row["first_td_pct"])
-            badges += confidence_badge_html(row.get("confidence"))
-            badges += implied_total_badge_html(row.get("implied_total"))
-            badges += opportunity_trend_badge_html(row.get("opportunity_trend"))
-            return badges
+            return _td_bet_block(row) + ct.reasons_html([
+                ct.game_reason(row["team"], row.get("implied_total")),
+                ct.role_reason(row.get("opportunity_trend")),
+                ct.record_reason(row.get("confidence"), row.get("_driving_category", "td_anytime"),
+                                 row["position"], CONFIDENCE_MIN_N),
+            ])
 
         render_hotpick_cards(td_card_rows, body_fn=_td_card_body, cols_per_row=3, headshot_px=128, medals=True)
 
@@ -4320,20 +4297,21 @@ elif tab_side == "🔥 Hot Picks":
         ).properties(height=max(220, 22 * td_chart_df["player"].nunique() * 2))
         st.altair_chart(td_bar, use_container_width=True)
 
-        td_df["Confidence"] = td_df["confidence"].apply(_confidence_label_text)
-        td_df["Implied Total"] = td_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
-        td_df["Opportunity"] = td_df["opportunity_trend"].apply(opportunity_trend_text)
+        td_df["Scoring game"] = td_df["implied_total"].apply(ct.game_cell)
+        td_df["Role"] = td_df["opportunity_trend"].apply(ct.role_cell)
+        td_df["Our record"] = td_df["confidence"].apply(lambda seg: ct.record_cell(seg, CONFIDENCE_MIN_N))
         td_df["opp"] = td_df["team"].map(hp_opp_lookup)
         td_df["Pick"] = td_df.apply(
-            lambda r: "Both" if r.get("track_anytime") and r.get("track_first")
+            lambda r: "Anytime TD + First TD" if r.get("track_anytime") and r.get("track_first")
             else ("First TD" if r.get("track_first") else "Anytime TD"), axis=1)
-        td_display = td_df[["headshot_url", "player", "position", "team", "opp", "Pick", "anytime_td_pct", "first_td_pct", "Confidence", "Implied Total", "Opportunity"]].rename(columns={
+        td_display = td_df[["headshot_url", "player", "position", "team", "opp", "Pick", "anytime_td_pct", "first_td_pct",
+                            "Scoring game", "Role", "Our record"]].rename(columns={
             "headshot_url": "Headshot", "player": "Player", "team": "Team", "opp": "Opp", "position": "Pos",
-            "anytime_td_pct": "Anytime TD %", "first_td_pct": "First TD %",
+            "anytime_td_pct": "Chance to score", "first_td_pct": "Chance to score first",
         })
         render_player_table(td_display, column_config={
-            "Anytime TD %": st.column_config.NumberColumn(format="%.0f%%"),
-            "First TD %": st.column_config.NumberColumn(format="%.0f%%"),
+            "Chance to score": st.column_config.NumberColumn(format="%.0f%%", help="From sportsbook odds (includes their cut, so a little high)"),
+            "Chance to score first": st.column_config.NumberColumn(format="%.0f%%", help="From sportsbook odds"),
         })
 
     st.divider()
@@ -4374,44 +4352,33 @@ elif tab_side == "🔥 Hot Picks":
         st.markdown("###### This week's safest plays")
 
         def _safe_card_body(row: dict) -> str:
-            # Single-line HTML - see _edge_card_body's comment above for why.
-            delta_cls = "delta-up" if row["direction"] == "▲ Over" else "delta-down"
-            price = f'{row["typical_price"]:+d}'
-            best = (f' · best {row["best_price"]:+d} {book_name(row["best_book"])}'
-                    if row.get("best_price") is not None and row.get("best_book") else "")
-            return (
-                f'<div class="stat-big">{row["hits"]}/{row["n_games"]}</div>'
-                f'<div class="stat-label">games cleared</div>'
-                f'<div style="margin-top:6px;"><span class="{delta_cls}">{row["direction"]} {row["prop_line"]:.1f} '
-                f'{row["stat"]}</span> <span class="stat-label">({row["line_type"]} line)</span></div>'
-                f'<div class="stat-label" style="margin-top:2px; text-transform:none;">{price}{best} · '
-                f'break-even {row["break_even"] * 100:.0f}%</div>'
-                f'{confidence_badge_html(row.get("confidence"))}'
-                f'{opportunity_trend_badge_html(row.get("opportunity_trend"))}'
-            )
+            return _safe_bet_block(row) + ct.reasons_html([
+                _safe_price_reason(row),
+                ct.game_reason(row["team"], row.get("implied_total")),
+                ct.role_reason(row.get("opportunity_trend")),
+                ct.record_reason(row.get("confidence"), "safe", row["position"], CONFIDENCE_MIN_N),
+            ])
 
         render_hotpick_cards(safe_df.head(3).to_dict("records"), body_fn=_safe_card_body, cols_per_row=3, headshot_px=128, medals=True)
 
-        safe_df["Bet"] = safe_df["direction"] + " " + safe_df["prop_line"].map("{:.1f}".format) + " " + safe_df["stat"]
-        safe_df["Line"] = safe_df["line_type"]
-        safe_df["Cleared"] = safe_df.apply(lambda r: f'{r["hits"]} of {r["n_games"]}', axis=1)
-        safe_df["Break-even"] = (safe_df["break_even"] * 100).round(0)
-        safe_df["Price"] = safe_df["typical_price"].map(lambda p: f"{int(p):+d}")
-        safe_df["Best price"] = safe_df.apply(
-            lambda r: f'{int(r["best_price"]):+d} {book_name(r["best_book"])}' if pd.notna(r.get("best_price")) and r.get("best_book") else "—", axis=1)
-        safe_df["Last-10 avg"] = safe_df["recent_avg"]
-        safe_df["Confidence"] = safe_df["confidence"].apply(_confidence_label_text)
-        safe_df["Implied Total"] = safe_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
-        safe_df["Opportunity"] = safe_df["opportunity_trend"].apply(opportunity_trend_text)
+        safe_df["Bet"] = safe_df.apply(
+            lambda r: f'{ct.bet_text(r["direction"], r["prop_line"], r["stat_col"])} ({r["line_type"]})', axis=1)
+        safe_df["Cleared"] = safe_df.apply(lambda r: f'{r["hits"]} of last {r["n_games"]}', axis=1)
+        safe_df["Needs to win"] = (safe_df["break_even"] * 100).round(0)
+        safe_df["Price"] = safe_df.apply(
+            lambda r: f'{int(r["typical_price"]):+d}'
+            + (f' (best {int(r["best_price"]):+d} {book_name(r["best_book"])})'
+               if pd.notna(r.get("best_price")) and isinstance(r.get("best_book"), str) else ""), axis=1)
+        safe_df["Scoring game"] = safe_df["implied_total"].apply(ct.game_cell)
+        safe_df["Role"] = safe_df["opportunity_trend"].apply(ct.role_cell)
+        safe_df["Our record"] = safe_df["confidence"].apply(lambda seg: ct.record_cell(seg, CONFIDENCE_MIN_N))
         safe_df["opp"] = safe_df["team"].map(hp_opp_lookup)
-        safe_display = safe_df[["headshot_url", "player", "position", "team", "opp", "Bet", "Line", "Cleared",
-                                "Break-even", "Price", "Best price", "Last-10 avg", "Confidence", "Implied Total",
-                                "Opportunity"]].rename(columns={
+        safe_display = safe_df[["headshot_url", "player", "position", "team", "opp", "Bet", "Cleared",
+                                "Needs to win", "Price", "Scoring game", "Role", "Our record"]].rename(columns={
             "headshot_url": "Headshot", "player": "Player", "team": "Team", "opp": "Opp", "position": "Pos",
         })
         render_player_table(safe_display, column_config={
-            "Break-even": st.column_config.NumberColumn(format="%.0f%%"),
-            "Last-10 avg": st.column_config.NumberColumn(format="%.1f"),
+            "Needs to win": st.column_config.NumberColumn(format="%.0f%%", help="How often a bet at this price has to win to break even"),
         })
 
     st.caption(
@@ -4573,9 +4540,9 @@ else:
                 with col:
                     seg = clv_summary.get(cat)
                     if seg:
-                        st.metric(f"{label} avg CLV", f"{seg['avg_clv']:+.1f} {unit}", f"{seg['n']} tracked", delta_color="off")
+                        st.metric(f"{label} avg CLV", f"{seg['avg_clv']:+.1f} {unit}", f"{seg['n']} tracked", delta_color="off", delta_arrow="off")
                     else:
-                        st.metric(f"{label} avg CLV", "—", "no closing lines captured yet", delta_color="off")
+                        st.metric(f"{label} avg CLV", "—", "no closing lines captured yet", delta_color="off", delta_arrow="off")
             with clv_info:
                 theme.info_popover(
                     "**Closing Line Value (CLV) - did the betting market end up agreeing with us?**\n\n"
@@ -4722,23 +4689,24 @@ else:
             detail = p.get("detail", {}) or {}
             actual = p.get("actual", {}) or {}
             cat = p["category"]
+            stat_w = ct.stat_words(detail.get("stat_col", "")) if detail.get("stat_col") else detail.get("stat", "")
             if cat == "edge":
-                prediction = f"{detail.get('direction', '')} {detail.get('prop_line', '')} {detail.get('stat', '')}"
-                actual_text = f"{actual['actual_value']:.1f}" if "actual_value" in actual else "—"
+                prediction = f"{detail.get('direction', '')} {detail.get('prop_line', '')} {stat_w}"
+                actual_text = f"{actual['actual_value']:g} {stat_w}" if "actual_value" in actual else "—"
             elif cat == "td_anytime":
-                prediction = f"Anytime TD ({detail.get('predicted_pct', 0):.0f}% implied)"
+                prediction = f"Anytime TD (sportsbooks: {detail.get('predicted_pct', 0):.0f}% chance)"
                 actual_text = (f"{actual['actual_tds']} TD{'s' if actual['actual_tds'] != 1 else ''}"
                                if "actual_tds" in actual else "—")
             elif cat == "safe" and "prop_line" in detail:
-                prediction = (f"{detail.get('direction', '')} {detail.get('prop_line', '')} {detail.get('stat', '')} "
-                              f"({detail.get('line_type') or 'Main'} line, cleared {detail.get('hits', '?')}/{detail.get('n_games', '?')})")
-                actual_text = f"{actual['actual_value']:.1f}" if "actual_value" in actual else "—"
+                prediction = (f"{detail.get('direction', '')} {detail.get('prop_line', '')} {stat_w} "
+                              f"({detail.get('line_type') or 'Main'} line, cleared {detail.get('hits', '?')} of {detail.get('n_games', '?')})")
+                actual_text = f"{actual['actual_value']:g} {stat_w}" if "actual_value" in actual else "—"
             elif cat == "safe":  # legacy fantasy-points version
                 prediction = f"Safe Play: {detail.get('floor_ppr', 0):.1f}+ pts (avg {detail.get('season_avg_ppr', 0):.1f})"
                 actual_text = (f"{actual['actual_ppr']:.1f} pts" if "actual_ppr" in actual
                                else actual.get("note", "—"))
             else:
-                prediction = f"First TD ({detail.get('predicted_pct', 0):.0f}% implied)"
+                prediction = f"First TD (sportsbooks: {detail.get('predicted_pct', 0):.0f}% chance)"
                 actual_text = {"Hit": "Scored first", "Miss": "Did not score first"}.get(p["status"], "—")
             return prediction, actual_text
 
@@ -4752,7 +4720,8 @@ else:
                 "player": p["player"], "team": p["team"], "position": p.get("position", ""),
                 "headshot_url": meta_row.get("headshot_url") if meta_row is not None else None,
                 "team_color": (meta_row.get("team_color") if meta_row is not None else None) or "#444444",
-                "_prediction": prediction, "_actual": f"Actual: {actual_text}",
+                "_prediction": prediction, "_actual": actual_text if p["status"] != "Pending" else "game not played yet",
+                "_category": category_labels.get(p["category"], p["category"]),
                 "_result_cls": {"Hit": "result-hit", "Miss": "result-miss", "Push": "result-push", "Pending": "result-pending"}[p["status"]],
                 "_result_icon": {"Hit": "✅", "Miss": "❌", "Push": "➖", "Pending": "⏳"}[p["status"]],
                 "_result": p["status"], "_week_label": f"{p['season']} Wk {p['week']}",
@@ -4760,9 +4729,9 @@ else:
 
         def _recent_pick_body(row: dict) -> str:
             return (
-                f'<div class="stat-label" style="margin-top:8px;">{row["_week_label"]}</div>'
-                f'<div style="margin-top:2px; font-size:14px;">{row["_prediction"]}</div>'
-                f'<div class="stat-label" style="margin-top:2px; text-transform:none;">{row["_actual"]}</div>'
+                f'<div class="stat-label" style="margin-top:10px;">{row["_week_label"]} · {row["_category"]}</div>'
+                f'<div class="bet-sub"><b>Bet:</b> {row["_prediction"]}</div>'
+                f'<div class="bet-sub"><b>Result:</b> {row["_actual"]}</div>'
                 f'<div class="result-badge {row["_result_cls"]}">{row["_result_icon"]} {row["_result"]}</div>'
             )
 
@@ -4815,11 +4784,11 @@ else:
                 "Player": p["player"],
                 "Team": p["team"],
                 "Opp": _pick_opponent(p),
-                "Prediction": prediction,
-                "Odds": f"{int(price):+d}" if price is not None else "—",
-                "Actual": actual_text, "Result": p["status"],
+                "Bet": prediction,
+                "Price": f"{int(price):+d}" if price is not None else "—",
+                "What happened": actual_text if p["status"] != "Pending" else "not played yet", "Result": p["status"],
                 f"${PROFIT_STAKE:.0f} P/L": "—" if pl is None else f"{'+' if pl >= 0 else '−'}${abs(pl):.2f}",
-                "CLV": f"{pick_clv:+.1f} {clv_unit}" if pick_clv is not None else "—",
+                "Line movement": ct.line_move_cell(pick_clv, clv_unit),
             })
         hist_df = pd.DataFrame(hist_rows)
 
