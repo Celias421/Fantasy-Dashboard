@@ -1025,7 +1025,7 @@ def snapshot_hotpicks_for_tracking(edge_rows: list, td_rows: list, schedule_df: 
         game = team_game.get(row["team"])
         if not game:
             continue
-        if row.get("anytime_td_pct") is not None:
+        if row.get("anytime_td_pct") is not None and row.get("track_anytime", True):
             new_picks.append({
                 "id": str(uuid.uuid4()), "season": season, "week": week, "category": "td_anytime",
                 "player": row["player"], "player_id": row.get("player_id", ""),
@@ -1034,7 +1034,7 @@ def snapshot_hotpicks_for_tracking(edge_rows: list, td_rows: list, schedule_df: 
                            "price": int(row["anytime_price"]) if row.get("anytime_price") is not None else None},
                 "game_id": game[0], "kickoff": game[1], "status": "Pending", "actual": {}, "resolved_at": "",
             })
-        if row.get("first_td_pct") is not None:
+        if row.get("first_td_pct") is not None and row.get("track_first", True):
             new_picks.append({
                 "id": str(uuid.uuid4()), "season": season, "week": week, "category": "td_first",
                 "player": row["player"], "player_id": row.get("player_id", ""),
@@ -1393,6 +1393,76 @@ CATEGORY_LABELS = {"edge": "Prop Edge", "td_anytime": "Anytime TD", "td_first": 
 BET_CATEGORIES = ("edge", "td_anytime", "td_first")   # have prices -> profit
 ALL_CATEGORIES = BET_CATEGORIES + ("safe",)
 POSITION_ORDER = ["QB", "RB", "WR", "TE"]
+
+
+# ---- Top TD picks only (Sep 2026) ----
+# Before this, every starter with TD odds was saved as a pick in both TD
+# markets - 10-18 "picks" from a single game, which measured the betting
+# market, not our suggestions. Now only the players the books rate most
+# likely to score are suggested and tracked, with a per-game cap so one
+# high-scoring game can't fill the list. Ranked by the market's chance
+# alone (never by our own Confidence badge), so a cold group can't lock
+# itself out of ever being tracked again.
+TD_ANYTIME_TOP_N = 10      # anytime TD picks per week, league-wide
+TD_ANYTIME_PER_GAME = 2    # ...and at most this many from one game
+TD_FIRST_TOP_N = 5         # first TD picks per week, league-wide
+TD_FIRST_PER_GAME = 1      # ...and at most one per game (only one player can score first)
+
+
+def _top_ids(items, pct_of, game_of, top_n: int, per_game: int) -> set:
+    """ids of the top_n items by pct (highest first), at most per_game
+    from any one game. items: iterable of (id, obj)."""
+    ranked = []
+    for item_id, obj in items:
+        pct = pct_of(obj)
+        if pct is None or pd.isna(pct):
+            continue
+        ranked.append((-float(pct), str(item_id), item_id, obj))
+    ranked.sort(key=lambda t: (t[0], t[1]))
+    chosen, per = set(), {}
+    for _, _, item_id, obj in ranked:
+        if len(chosen) >= top_n:
+            break
+        g = game_of(obj)
+        if per.get(g, 0) >= per_game:
+            continue
+        per[g] = per.get(g, 0) + 1
+        chosen.add(item_id)
+    return chosen
+
+
+def select_top_td_rows(td_rows: list, game_of) -> list:
+    """This week's TD suggestions: copies of the td_rows that make the top
+    list in at least one market, flagged track_anytime / track_first for
+    the market(s) they were picked in. game_of(row) -> a game key."""
+    items = list(enumerate(td_rows))
+    any_ids = _top_ids(items, lambda r: r.get("anytime_td_pct"), game_of, TD_ANYTIME_TOP_N, TD_ANYTIME_PER_GAME)
+    first_ids = _top_ids(items, lambda r: r.get("first_td_pct"), game_of, TD_FIRST_TOP_N, TD_FIRST_PER_GAME)
+    out = []
+    for i, r in items:
+        if i in any_ids or i in first_ids:
+            out.append({**r, "track_anytime": i in any_ids, "track_first": i in first_ids})
+    return out
+
+
+def countable_picks(picks: list) -> list:
+    """Saved picks that count toward Track Record stats and Confidence
+    badges. Applies the top-TD rule above to TD picks saved before it
+    existed (same rule, per season/week, from each pick's saved chance and
+    game), so old weeks are judged the same way as new ones. Nothing is
+    deleted - picks outside the rule are just left out of the numbers."""
+    keep_ids = set()
+    groups: dict = {}
+    for p in picks:
+        if p.get("category") in ("td_anytime", "td_first"):
+            groups.setdefault((p.get("season"), p.get("week"), p["category"]), []).append(p)
+    for (_, _, cat), group in groups.items():
+        top_n, per_game = ((TD_ANYTIME_TOP_N, TD_ANYTIME_PER_GAME) if cat == "td_anytime"
+                           else (TD_FIRST_TOP_N, TD_FIRST_PER_GAME))
+        keep_ids |= _top_ids(((p["id"], p) for p in group),
+                             lambda p: (p.get("detail") or {}).get("predicted_pct"),
+                             lambda p: p.get("game_id") or p.get("team"), top_n, per_game)
+    return [p for p in picks if p.get("category") not in ("td_anytime", "td_first") or p["id"] in keep_ids]
 
 
 def filter_picks_by_season(picks: list, season) -> list:
@@ -2219,7 +2289,7 @@ if tab_side == "🏠 Dashboard":
 
     home_schedule = get_schedule()
     home_rosters = roster_store.load_rosters(st.secrets)
-    home_picks = pick_tracker_store.load_picks(st.secrets)
+    home_picks = countable_picks(pick_tracker_store.load_picks(st.secrets))
 
     # severity: "bad" (red) > "warn" (amber) > "good" (green) - sorted so
     # the most urgent thing on the page is always the first thing seen.
@@ -3629,7 +3699,7 @@ elif tab_side == "🔥 Hot Picks":
     # Current season only (Sep 2026): last year's segments shouldn't carry
     # badges into a new year of rosters and roles.
     hp_segment_confidence = compute_segment_confidence(
-        filter_picks_by_season(pick_tracker_store.load_picks(st.secrets), CURRENT_SEASON)
+        filter_picks_by_season(countable_picks(pick_tracker_store.load_picks(st.secrets)), CURRENT_SEASON)
     )
     # Vegas-implied team totals for this week (see build_team_implied_totals'
     # docstring for the spread/total math) - a second re-ranking signal
@@ -3777,6 +3847,11 @@ elif tab_side == "🔥 Hot Picks":
     # week (season_week_already_tracked short-circuits it).
     # Safe Plays: the same top-15 list the page shows (steadiest first).
     safe_track_rows = sorted(matchup_rows, key=lambda r: r["cv"] if r.get("cv") is not None else 9)[:15]
+    # TD: only the top picks (see select_top_td_rows) - chosen from the
+    # full league before any display filter, and the same set is shown
+    # below and tracked.
+    td_candidates_n = len(td_rows)
+    td_rows = select_top_td_rows(td_rows, lambda r: frozenset((r["team"], hp_opp_lookup.get(r["team"]) or "")))
     snapshot_hotpicks_for_tracking(edge_rows, td_rows, get_schedule(), safe_track_rows)
 
     # Opportunistic Closing Line Value capture - re-stamps every still-
@@ -3805,7 +3880,7 @@ elif tab_side == "🔥 Hot Picks":
 
     section1, section2, section3 = st.columns(3)
     section1.metric("Prop Edges Found", len(edge_rows))
-    section2.metric("TD Chances Tracked", len(td_rows))
+    section2.metric("Top TD Picks", len(td_rows))
     section3.metric("High-Consistency Safe Plays", len(matchup_rows))
 
     # ---- Position mix donut: the one place on this page a donut earns its
@@ -4072,9 +4147,11 @@ elif tab_side == "🔥 Hot Picks":
 
     # ---- Section 2: Best TD Scoring Chances ----
     st.markdown("##### 🎯 Best TD Scoring Chances")
-    st.caption("The sportsbooks' odds, turned into percentages, that each player scores a touchdown this "
-        "week - at any point, and specifically the game's first TD. These include the books' built-in "
-        "profit, so they run a little high.")
+    st.caption(
+        f"Only the top picks: the **{TD_ANYTIME_TOP_N} players most likely to score** (no more than "
+        f"{TD_ANYTIME_PER_GAME} from one game) and the **{TD_FIRST_TOP_N} most likely to score first** (one per "
+        f"game), based on the sportsbooks' odds turned into percentages. These are the picks saved to Track "
+        f"Record. The percentages include the books' built-in profit, so they run a little high.")
     if not td_rows:
         st.info("No live TD odds available right now - try \"Refresh prop lines now\" at the top of the page.")
     else:
@@ -4146,7 +4223,10 @@ elif tab_side == "🔥 Hot Picks":
         td_df["Implied Total"] = td_df["implied_total"].apply(lambda t: f"{t:.1f}" if pd.notna(t) else "—")
         td_df["Opportunity"] = td_df["opportunity_trend"].apply(opportunity_trend_text)
         td_df["opp"] = td_df["team"].map(hp_opp_lookup)
-        td_display = td_df[["headshot_url", "player", "position", "team", "opp", "anytime_td_pct", "first_td_pct", "Confidence", "Implied Total", "Opportunity"]].rename(columns={
+        td_df["Pick"] = td_df.apply(
+            lambda r: "Both" if r.get("track_anytime") and r.get("track_first")
+            else ("First TD" if r.get("track_first") else "Anytime TD"), axis=1)
+        td_display = td_df[["headshot_url", "player", "position", "team", "opp", "Pick", "anytime_td_pct", "first_td_pct", "Confidence", "Implied Total", "Opportunity"]].rename(columns={
             "headshot_url": "Headshot", "player": "Player", "team": "Team", "opp": "Opp", "position": "Pos",
             "anytime_td_pct": "Anytime TD %", "first_td_pct": "First TD %",
         })
@@ -4239,7 +4319,8 @@ else:
         "Pick a season below to see how it's going - or **All seasons** for the long-run picture."
     )
 
-    all_picks = pick_tracker_store.load_picks(st.secrets)
+    saved_picks = pick_tracker_store.load_picks(st.secrets)
+    all_picks = countable_picks(saved_picks)
     category_labels = CATEGORY_LABELS
     category_order = list(CATEGORY_LABELS.values())
     category_colors = theme.CATEGORY_COLORS
@@ -4270,6 +4351,7 @@ else:
 
     view_season = None if season_choice == "All seasons" else int(season_choice)
     view_picks = filter_picks_by_season(all_picks, view_season)
+    hidden_td_n = len(filter_picks_by_season(saved_picks, view_season)) - len(view_picks)
     season_phrase = "across all seasons" if view_season is None else f"in {view_season}"
 
     if not view_picks:
@@ -4278,6 +4360,11 @@ else:
             f"is opened each week."
         )
     else:
+        if hidden_td_n:
+            st.caption(
+                f"{hidden_td_n} older TD pick(s) outside the top-picks rule (top {TD_ANYTIME_TOP_N} Anytime, "
+                f"top {TD_FIRST_TOP_N} First TD each week) are left out of these numbers. They're still saved."
+            )
         resolved_picks = [p for p in view_picks if p["status"] != "Pending"]
         pending_count = len(view_picks) - len(resolved_picks)
         # Player headshot + team lookups for the cards and History table.
@@ -4332,7 +4419,7 @@ else:
                     st.metric(label, f"{sign}${abs(pr['profit']):,.2f}",
                               f"{pr['roi']:+.1f}% return · {pr['n']} bet{'s' if pr['n'] != 1 else ''}", delta_color="normal")
                 else:
-                    st.metric(label, "—", "no priced results yet", delta_color="off")
+                    st.metric(label, "—", "no priced results yet", delta_color="off", delta_arrow="off")
         with pf_info:
             theme.info_popover(
                 f"**Profit** shows what you'd have won or lost betting **${PROFIT_STAKE:.0f} on every pick** in "
@@ -4345,8 +4432,9 @@ else:
                 f"Why this matters: hit rate alone can fool you. At -130 odds you need to win 56.5% just to "
                 f"break even, so a 55% hit rate would still lose money.\n\n"
                 f"Safe Plays aren't bets, so they don't have a profit number - just a hit rate.\n\n"
-                f"Note: every player with touchdown odds is tracked in the two TD categories, not just the best "
-                f"ones, so those mostly show how the betting market itself does - expect a small loss there.",
+                f"TD picks: only the top {TD_ANYTIME_TOP_N} Anytime and top {TD_FIRST_TOP_N} First TD picks each "
+                f"week count. They're the favorites, so they cost more to bet - profit shows whether that's "
+                f"worth it.",
                 label="ℹ️ About profit", use_container_width=True,
             )
         unpriced_total = sum(compute_profit(view_picks, c)["unpriced"] for c in BET_CATEGORIES)
